@@ -1,8 +1,7 @@
-# -*- coding: utf-8 -*-
-import os
+﻿import os
 from crewai import Agent, Crew, Process, Task, LLM
 
-# Anthropic API Key aus den Umgebungsvariablen prÃ¼fen
+# Anthropic API Key aus den Umgebungsvariablen prüfen
 ANTHROPIC_KEY = os.getenv("ANTHROPIC_API_KEY")
 
 if not ANTHROPIC_KEY:
@@ -10,7 +9,7 @@ if not ANTHROPIC_KEY:
 
 # Anthropic Claude 3.5 Sonnet als dediziertes LLM definieren
 claude_llm = LLM(
-    model="anthropic/claude-sonnet-5",
+    model="anthropic/claude-3-5-sonnet-20241022",
     api_key=ANTHROPIC_KEY
 )
 
@@ -63,5 +62,3 @@ if __name__ == "__main__":
     print("[Railway Worker] OpenCrew Autonomous Loop Started (Anthropic Claude)...")
     crew.kickoff()
     print("[Railway Worker] Execution finished.")
-
-
