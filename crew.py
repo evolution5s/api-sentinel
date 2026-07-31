@@ -1,4 +1,4 @@
-﻿import os
+import os
 from crewai import Agent, Crew, Process, Task, LLM
 
 # Anthropic API Key aus den Umgebungsvariablen prüfen
@@ -7,9 +7,9 @@ ANTHROPIC_KEY = os.getenv("ANTHROPIC_API_KEY")
 if not ANTHROPIC_KEY:
     print("[Error] ANTHROPIC_API_KEY fehlt in den Railway Environment Variables!")
 
-# Anthropic Claude 3.5 Sonnet als dediziertes LLM definieren
+# Anthropic Claude 5 Sonnet als dediziertes LLM definieren
 claude_llm = LLM(
-    model="anthropic/claude-3-5-sonnet-20241022",
+    model="anthropic/claude-5-sonnet",
     api_key=ANTHROPIC_KEY
 )
 
