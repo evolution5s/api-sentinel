@@ -1,7 +1,8 @@
+# -*- coding: utf-8 -*-
 import os
 from crewai import Agent, Crew, Process, Task, LLM
 
-# Anthropic API Key aus den Umgebungsvariablen prüfen
+# Anthropic API Key aus den Umgebungsvariablen prÃ¼fen
 ANTHROPIC_KEY = os.getenv("ANTHROPIC_API_KEY")
 
 if not ANTHROPIC_KEY:
@@ -62,3 +63,5 @@ if __name__ == "__main__":
     print("[Railway Worker] OpenCrew Autonomous Loop Started (Anthropic Claude)...")
     crew.kickoff()
     print("[Railway Worker] Execution finished.")
+
+
