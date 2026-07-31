@@ -1,3 +1,4 @@
-﻿crewai
+﻿crewai[anthropic]
+anthropic
 python-dotenv
 requests
