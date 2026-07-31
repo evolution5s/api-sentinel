@@ -10,7 +10,7 @@ if not ANTHROPIC_KEY:
 
 # Anthropic Claude 3.5 Sonnet als dediziertes LLM definieren
 claude_llm = LLM(
-    model="anthropic/claude-3-5-sonnet-latest",
+    model="anthropic/claude-sonnet-5",
     api_key=ANTHROPIC_KEY
 )
 
