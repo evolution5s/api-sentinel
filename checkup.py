@@ -347,23 +347,6 @@ def test_check_escalation_no_scores_yet():
     assert result["escalate"] is False
 
 
-# --- tools.py: classifier ---------------------------------------------------
-
-def test_save_alert_valid():
-    reset_state()
-    result = json.loads(tools.save_alert.run(exchange="binance", severity="breaking", endpoint="/api/v3/order", summary="test"))
-    assert "saved" in result
-    stored = tools._read_jsonl("alerts.jsonl")
-    assert len(stored) == 1 and stored[0]["severity"] == "breaking"
-
-
-def test_save_alert_invalid_severity():
-    reset_state()
-    result = json.loads(tools.save_alert.run(exchange="binance", severity="catastrophic", endpoint="/x", summary="test"))
-    assert "error" in result
-    assert tools._read_jsonl("alerts.jsonl") == []
-
-
 # --- tools.py: growth --------------------------------------------------------
 
 def test_read_channel_metrics_tool_reddit():
@@ -512,37 +495,6 @@ def test_open_pull_request_requires_token():
             os.environ["GITHUB_TOKEN"] = had_token
 
 
-# --- tools.py: watcher (network-dependent, must degrade gracefully) --------
-
-def test_http_status_handles_reachable_or_not():
-    result = json.loads(tools.http_status.run(url="https://api.github.com"))
-    assert "reachable" in result
-    if result["reachable"]:
-        assert isinstance(result["status_code"], int)
-    else:
-        assert "error" in result
-
-
-def test_http_status_bad_url_does_not_crash():
-    result = json.loads(tools.http_status.run(url="https://this-domain-should-not-exist-api-sentinel-checkup.invalid"))
-    assert result["reachable"] is False and "error" in result
-
-
-def test_fetch_and_diff_unknown_exchange():
-    reset_state()
-    result = json.loads(tools.fetch_and_diff.run(exchange="deribit"))
-    assert "error" in result
-
-
-def test_fetch_and_diff_binance_baseline_or_graceful_error():
-    reset_state()
-    result = json.loads(tools.fetch_and_diff.run(exchange="binance"))
-    assert "exchange" in result
-    assert "baseline" in result or "error" in result
-    if result.get("baseline"):
-        assert (SCRATCH_DIR / "snapshots" / "binance.txt").exists()
-
-
 def test_sync_signups_from_github_via_read_state():
     reset_state()
     state = json.loads(tools.read_state.run())
@@ -573,9 +525,9 @@ def test_approve_cli_flow():
 
 # --- crew.py: construction sanity (no kickoff, no API calls) ---------------
 
-def test_crew_has_five_agents_and_tasks():
-    assert len(crew.crew.agents) == 5
-    assert len(crew.crew.tasks) == 5
+def test_crew_has_three_agents_and_tasks():
+    assert len(crew.crew.agents) == 3
+    assert len(crew.crew.tasks) == 3
 
 
 def test_ceo_agent_tools_match_spec():
@@ -586,9 +538,7 @@ def test_ceo_agent_tools_match_spec():
     }, tool_names
 
 
-def test_watcher_classifier_growth_dev_tools():
-    assert {t.name for t in crew.watcher_agent.tools} == {"http_status", "fetch_and_diff"}
-    assert {t.name for t in crew.classifier_agent.tools} == {"save_alert"}
+def test_growth_dev_tools():
     assert {t.name for t in crew.growth_agent.tools} == {"request_approval", "read_channel_metrics"}
     assert {t.name for t in crew.dev_agent.tools} == {"open_pull_request"}
 

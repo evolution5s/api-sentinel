@@ -5,11 +5,9 @@ diffable. STATE_DIR defaults to /data (the Railway volume mount point) but
 can be overridden for local runs and tests.
 """
 import base64
-import difflib
 import json
 import os
 import re
-import time
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -26,17 +24,10 @@ GITHUB_API = "https://api.github.com"
 SIGNUP_TITLE_PREFIX = "[Signup]"
 
 APPROVAL_CATEGORIES = {"spend", "legal", "publish", "deploy", "pricing"}
-ALERT_SEVERITIES = {"breaking", "behavioral", "additive", "cosmetic"}
 REQUIRED_HYPOTHESIS_FIELDS = {
     "id", "statement", "category", "landing_page_variant_id",
     "failure_rate", "success_rate", "duration_days",
 }
-EXCHANGE_ENDPOINTS = {
-    "binance": "https://api.binance.com/api/v3/exchangeInfo",
-    "bybit": "https://api.bybit.com/v5/market/instruments-info?category=spot",
-    "kraken": "https://api.kraken.com/0/public/AssetPairs",
-}
-MAX_DIFF_LINES = 200
 
 
 # --------------------------------------------------------------------------
@@ -346,97 +337,6 @@ def check_escalation(hypothesis_id: str) -> str:
     avg = sum(chain_scores) / len(chain_scores)
     escalate = len(chain_scores) >= 3 and avg <= -0.5
     return json.dumps({"escalate": escalate, "rolling_average": round(avg, 3), "scores_used": chain_scores})
-
-
-# --------------------------------------------------------------------------
-# Watcher tools
-# --------------------------------------------------------------------------
-
-@tool("http_status")
-def http_status(url: str) -> str:
-    """Check whether a URL is reachable. Returns JSON with reachable,
-    status_code, and latency_ms, or reachable=false with an error message.
-    """
-    try:
-        start = time.monotonic()
-        resp = requests.get(url, timeout=10)
-        latency_ms = round((time.monotonic() - start) * 1000, 1)
-        return json.dumps({"url": url, "reachable": True, "status_code": resp.status_code, "latency_ms": latency_ms})
-    except requests.RequestException as exc:
-        return json.dumps({"url": url, "reachable": False, "error": str(exc)})
-
-
-@tool("fetch_and_diff")
-def fetch_and_diff(exchange: str) -> str:
-    """Fetch the monitored public API surface for one of: binance, bybit,
-    kraken. Compares it against the last saved snapshot under
-    STATE_DIR/snapshots/ and returns a unified diff (truncated to the first
-    200 lines if longer). The first run for an exchange only baselines - no
-    diff is possible yet, and this is reported explicitly rather than as
-    "no change".
-    """
-    exchange = exchange.lower().strip()
-    url = EXCHANGE_ENDPOINTS.get(exchange)
-    if not url:
-        return json.dumps({"error": f"unknown exchange '{exchange}', known: {sorted(EXCHANGE_ENDPOINTS)}"})
-
-    try:
-        resp = requests.get(url, timeout=15)
-        resp.raise_for_status()
-    except requests.RequestException as exc:
-        return json.dumps({"exchange": exchange, "error": f"fetch failed: {exc}"})
-
-    try:
-        current_text = json.dumps(resp.json(), indent=2, sort_keys=True, ensure_ascii=False)
-    except ValueError:
-        current_text = resp.text
-
-    snapshot_dir = STATE_DIR / "snapshots"
-    snapshot_dir.mkdir(parents=True, exist_ok=True)
-    snapshot_path = snapshot_dir / f"{exchange}.txt"
-
-    if not snapshot_path.exists():
-        snapshot_path.write_text(current_text, encoding="utf-8")
-        return json.dumps({"exchange": exchange, "changed": False, "baseline": True, "diff": ""})
-
-    previous_text = snapshot_path.read_text(encoding="utf-8")
-    if previous_text == current_text:
-        return json.dumps({"exchange": exchange, "changed": False, "baseline": False, "diff": ""})
-
-    diff_lines = list(difflib.unified_diff(
-        previous_text.splitlines(), current_text.splitlines(),
-        fromfile=f"{exchange}_previous", tofile=f"{exchange}_current", lineterm="",
-    ))
-    truncated = len(diff_lines) > MAX_DIFF_LINES
-    if truncated:
-        diff_lines = diff_lines[:MAX_DIFF_LINES] + [f"... truncated, {len(diff_lines) - MAX_DIFF_LINES} more lines ..."]
-    snapshot_path.write_text(current_text, encoding="utf-8")
-    return json.dumps({"exchange": exchange, "changed": True, "baseline": False, "truncated": truncated, "diff": "\n".join(diff_lines)})
-
-
-# --------------------------------------------------------------------------
-# Classifier tool
-# --------------------------------------------------------------------------
-
-@tool("save_alert")
-def save_alert(exchange: str, severity: str, endpoint: str, summary: str) -> str:
-    """Persist a classified API-change alert. severity must be one of:
-    breaking, behavioral, additive, cosmetic. When genuinely unsure between
-    two levels, use the lower one - this tool only validates and stores the
-    classification decision, it does not make it.
-    """
-    if severity not in ALERT_SEVERITIES:
-        return json.dumps({"error": f"invalid severity '{severity}', must be one of {sorted(ALERT_SEVERITIES)}"})
-    record = {
-        "id": f"alert_{uuid.uuid4().hex[:8]}",
-        "created_at": datetime.now(timezone.utc).isoformat(),
-        "exchange": exchange,
-        "severity": severity,
-        "endpoint": endpoint,
-        "summary": summary,
-    }
-    _append_jsonl("alerts.jsonl", record)
-    return json.dumps({"saved": record["id"]})
 
 
 # --------------------------------------------------------------------------

@@ -5,14 +5,11 @@ from tools import (
     check_escalation,
     compare_channel_performance,
     evaluate_hypothesis,
-    fetch_and_diff,
-    http_status,
     open_pull_request,
     read_channel_metrics,
     read_hypotheses,
     read_state,
     request_approval,
-    save_alert,
     write_hypothesis,
 )
 
@@ -29,32 +26,6 @@ claude_llm = LLM(
 )
 
 # Agents mit dem Claude-LLM konfigurieren
-watcher_agent = Agent(
-    role="Change Detection Engine",
-    goal="Reliably detect every change to the monitored exchange API surfaces (Binance, Bybit, Kraken)",
-    backstory=(
-        "Infrastructure engineer obsessed with not missing a single API change. "
-        "Only reports what fetch_and_diff actually returns - never guesses at a "
-        "change that wasn't captured in a diff."
-    ),
-    llm=claude_llm,
-    tools=[http_status, fetch_and_diff],
-    verbose=True,
-)
-
-classifier_agent = Agent(
-    role="API Change Analyst",
-    goal="Turn raw diffs from the Watcher into bot-readable, correctly severity-classified alerts",
-    backstory=(
-        "Turns noisy diffs into breaking/behavioral/additive/cosmetic alerts. "
-        "When genuinely unsure between two severities, always rounds down to "
-        "the less severe one to avoid alert fatigue for subscribers."
-    ),
-    llm=claude_llm,
-    tools=[save_alert],
-    verbose=True,
-)
-
 growth_agent = Agent(
     role="Growth Engine / Dev Relations",
     goal="Draft content matching the currently active hypothesis and measure real reach after it's approved and posted",
@@ -107,30 +78,6 @@ ceo_agent = Agent(
 )
 
 # Tasks definieren
-task_watch = Task(
-    description=(
-        "For each of binance, bybit, kraken: call fetch_and_diff(exchange). "
-        "Report which exchanges changed and include the (possibly truncated) "
-        "diff for each one that did. If a tool call errors (network failure, "
-        "unknown exchange), report the error plainly instead of inventing a "
-        "result."
-    ),
-    agent=watcher_agent,
-    expected_output="Per-exchange change report: changed yes/no, and the diff where applicable.",
-)
-
-task_classify = Task(
-    description=(
-        "Using the Watcher's diff report as input, classify every reported "
-        "change by severity (breaking, behavioral, additive, cosmetic) and "
-        "call save_alert for each one. When genuinely unsure between two "
-        "severities, pick the lower one. If there were no changes, do nothing "
-        "and say so."
-    ),
-    agent=classifier_agent,
-    expected_output="List of saved alert ids with their severities, or a note that there was nothing to classify.",
-)
-
 task_growth = Task(
     description=(
         "Call read_state to see current signups, then read_hypotheses(status="
@@ -229,8 +176,8 @@ task_dev = Task(
 
 # Crew instanziieren
 crew = Crew(
-    agents=[watcher_agent, classifier_agent, growth_agent, ceo_agent, dev_agent],
-    tasks=[task_watch, task_classify, task_growth, task_ceo, task_dev],
+    agents=[growth_agent, ceo_agent, dev_agent],
+    tasks=[task_growth, task_ceo, task_dev],
     process=Process.sequential,
 )
 
