@@ -8,16 +8,21 @@ from tools import (
     check_escalation,
     compare_channel_performance,
     evaluate_hypothesis,
+    log_cycle_usage,
     open_pull_request,
     read_channel_metrics,
     read_channels,
     read_hypotheses,
+    read_last_cycle_note,
     read_state,
     request_approval,
+    save_cycle_note,
     send_telegram_message,
     write_channel,
     write_hypothesis,
 )
+
+_previous_cycle_note = read_last_cycle_note()
 
 # Anthropic API Key aus den Umgebungsvariablen prüfen
 ANTHROPIC_KEY = os.getenv("ANTHROPIC_API_KEY")
@@ -147,7 +152,14 @@ task_channel_strategy = Task(
         "5) Never invent a performance number - impact/confidence are your "
         "own strategic judgment and should be labeled as such, but any "
         "claim about how a tested channel is actually doing must come from "
-        "compare_channel_performance()."
+        "compare_channel_performance()." + (
+            f"\n\nContext from the previous cycle (for continuity - pick up "
+            f"where it left off, don't just repeat it verbatim or ignore "
+            f"it):\n{_previous_cycle_note}"
+            if _previous_cycle_note else
+            "\n\n(No previous-cycle note yet - this is either the first "
+            "cycle ever, or continuity tracking was just added.)"
+        )
     ),
     agent=ceo_agent,
     expected_output=(
@@ -268,10 +280,21 @@ def _task_summary(task: Task) -> str:
         return f"(Output nicht lesbar: {exc})"
 
 
+def _usage_line() -> str:
+    metrics = getattr(crew, "usage_metrics", None)
+    if metrics is None:
+        return "LLM-Nutzung: nicht verfuegbar"
+    total_tokens = getattr(metrics, "total_tokens", None)
+    requests = getattr(metrics, "successful_requests", None)
+    log_cycle_usage({"total_tokens": total_tokens, "successful_requests": requests})
+    return f"LLM-Nutzung diesen Zyklus: {total_tokens} tokens, {requests} requests"
+
+
 def send_cycle_summary(kickoff_error: Exception = None) -> None:
-    """Post a what-happened/what's-next digest of this cycle to Telegram.
-    Called once after kickoff() finishes (or fails) - never raises itself,
-    so a broken notification never masks whatever kickoff() already did or
+    """Post a what-happened/what's-next digest of this cycle to Telegram,
+    and save a condensed version as next cycle's continuity note. Called
+    once after kickoff() finishes (or fails) - never raises itself, so a
+    broken notification never masks whatever kickoff() already did or
     didn't do. If kickoff_error is set, that's reported up front instead of
     being silently swallowed - a hard crew failure must still reach Telegram,
     not just Railway's logs, since that's the only place a human reliably
@@ -284,6 +307,7 @@ def send_cycle_summary(kickoff_error: Exception = None) -> None:
             lines.append(f"WARNUNG: Der Crew-Lauf ist fehlgeschlagen: {kickoff_error}")
             lines.append("Nachfolgende Tasks haben moeglicherweise nicht mehr gelaufen.")
         lines += [
+            _usage_line(),
             f"Offene Freigaben (approve.py): {pending}",
             "",
             "--- Channel-Strategie ---",
@@ -298,7 +322,9 @@ def send_cycle_summary(kickoff_error: Exception = None) -> None:
             "--- Dev ---",
             _task_summary(task_dev)[:400],
         ]
-        send_telegram_message("\n".join(lines))
+        full_summary = "\n".join(lines)
+        send_telegram_message(full_summary)
+        save_cycle_note(full_summary[:3000])
     except Exception as exc:
         print(f"[api-sentinel] cycle summary failed (crew run itself was unaffected): {exc}")
 

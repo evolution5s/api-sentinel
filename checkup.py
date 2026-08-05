@@ -636,6 +636,27 @@ def test_open_pull_request_requires_token():
             os.environ["GITHUB_TOKEN"] = had_token
 
 
+# --- tools.py: cross-cycle continuity + usage log ---------------------------
+
+def test_cycle_note_roundtrip():
+    reset_state()
+    assert tools.read_last_cycle_note() == ""
+    tools.save_cycle_note("cycle 1 happened")
+    assert tools.read_last_cycle_note() == "cycle 1 happened"
+    tools.save_cycle_note("cycle 2 happened")  # overwrites, only latest kept
+    assert tools.read_last_cycle_note() == "cycle 2 happened"
+
+
+def test_log_cycle_usage_appends():
+    reset_state()
+    tools.log_cycle_usage({"total_tokens": 100, "successful_requests": 5})
+    tools.log_cycle_usage({"total_tokens": 200, "successful_requests": 8})
+    history = tools._read_jsonl("usage_history.jsonl")
+    assert len(history) == 2
+    assert history[1]["total_tokens"] == 200
+    assert "at" in history[0]
+
+
 # --- tools.py: cycle notification -------------------------------------------
 
 def test_send_telegram_message_skips_without_credentials():

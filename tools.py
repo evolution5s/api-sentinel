@@ -129,6 +129,43 @@ def sync_signups_from_github() -> int:
 
 
 # --------------------------------------------------------------------------
+# Cross-cycle continuity + usage tracking (orchestration-level, called
+# directly from crew.py, not agent tools - the CEO shouldn't be deciding
+# whether to persist its own continuity note or usage numbers)
+# --------------------------------------------------------------------------
+
+def save_cycle_note(text: str) -> None:
+    """Persist a short digest of what happened this cycle so the next
+    cycle's channel-strategy task can start with real continuity instead of
+    a blank slate every 6h. Overwrites - only the latest cycle's note is kept.
+    """
+    _ensure_state_dir()
+    (STATE_DIR / "last_cycle_note.txt").write_text(text, encoding="utf-8")
+
+
+def read_last_cycle_note() -> str:
+    """Return the previous cycle's note, or "" if there isn't one yet (e.g.
+    the very first run, or the file predates this feature).
+    """
+    path = STATE_DIR / "last_cycle_note.txt"
+    if not path.exists():
+        return ""
+    return path.read_text(encoding="utf-8")
+
+
+def log_cycle_usage(metrics: dict) -> None:
+    """Append this cycle's LLM usage (tokens, request count) to a running
+    history file - lets cost anomalies like an unusually high request count
+    (e.g. from repeated agent retries) be spotted over time, not just
+    reported once and forgotten.
+    """
+    _append_jsonl("usage_history.jsonl", {
+        "at": datetime.now(timezone.utc).isoformat(),
+        **metrics,
+    })
+
+
+# --------------------------------------------------------------------------
 # CEO tools: state, approvals, hypotheses
 # --------------------------------------------------------------------------
 

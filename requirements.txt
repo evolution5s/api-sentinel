@@ -1,4 +1,4 @@
-﻿crewai[anthropic]
-anthropic
+﻿crewai[anthropic]==1.15.11
+anthropic==0.120.2
 python-dotenv
 requests
