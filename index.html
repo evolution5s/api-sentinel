@@ -185,6 +185,10 @@
     </div>
 
     <script>
+        // Identifies which landing page variant a signup came from, so the
+        // Hypothesis Engine (evaluate_hypothesis in tools.py) can attribute
+        // conversions to the right hypothesis. This file is variant lp_v1_default.
+        const LANDING_PAGE_VARIANT_ID = "lp_v1_default";
         let selectedTier = "Indie Tier (29€/mo)";
         function openModal(tierName) {
             if(tierName) selectedTier = tierName;
@@ -198,7 +202,24 @@
         function submitForm(e) {
             e.preventDefault();
             const email = document.getElementById('emailInput').value;
-            console.log("Valide Conversion erfasst:", email, "Tier:", selectedTier);
+            const consent = document.getElementById('updateConsent').checked;
+            const timestamp = new Date().toISOString();
+            const title = encodeURIComponent("[Signup] " + selectedTier);
+            const body = encodeURIComponent(
+                "Email: " + email + "\n" +
+                "Tier: " + selectedTier + "\n" +
+                "Consent: " + consent + "\n" +
+                "Timestamp: " + timestamp + "\n" +
+                "Variant: " + LANDING_PAGE_VARIANT_ID
+            );
+            // Static GitHub Pages hosting has no backend, so this repo's own issue
+            // tracker doubles as free, structured signup storage: tools.py reads
+            // back every "[Signup]"-titled issue via the GitHub Search API. Opens
+            // in a new tab so the visitor completes the submit themselves (no
+            // token can be safely embedded in client-side JS) while this tab keeps
+            // showing the provisioning state below.
+            const issueUrl = "https://github.com/evolution5s/api-sentinel/issues/new?title=" + title + "&body=" + body;
+            window.open(issueUrl, "_blank", "noopener,noreferrer");
             document.getElementById('formState').classList.add('hidden');
             document.getElementById('capacityState').classList.remove('hidden');
         }

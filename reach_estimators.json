@@ -1,0 +1,16 @@
+{
+  "reddit": {
+    "upvote_to_view_multiplier": 100,
+    "comment_to_view_multiplier": 20,
+    "notes": "Prefer real post-insight views when available. upvote_to_view_multiplier assumes a ~1% upvote-to-view ratio (midpoint of the typical 0.5-2% range). comment_to_view_multiplier is a low-confidence fallback of last resort for very early posts with no upvotes yet, based on a rough analogy to general web-forum reply-to-view ratios (~10-25 views per reply), not Reddit-specific evidence."
+  },
+  "x": {
+    "engagement_to_impression_multiplier": 200,
+    "notes": "engagement = likes + retweets + replies + bookmarks. Multiplier corresponds to a ~0.5% engagement rate, deliberately set between the 2026 platform-wide median (~0.12%) and the nano-account range (1-3% for accounts under 10k followers), since the account starts at 0 followers."
+  },
+  "discord_telegram": {
+    "member_to_view_multiplier": 0.10,
+    "notes": "Unvalidated placeholder - no solid source found for this ratio."
+  },
+  "history": []
+}
