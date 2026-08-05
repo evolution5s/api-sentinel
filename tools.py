@@ -26,8 +26,11 @@ SIGNUP_TITLE_PREFIX = "[Signup]"
 APPROVAL_CATEGORIES = {"spend", "legal", "publish", "deploy", "pricing"}
 REQUIRED_HYPOTHESIS_FIELDS = {
     "id", "statement", "category", "landing_page_variant_id",
-    "failure_rate", "success_rate", "duration_days",
+    "failure_rate", "success_rate", "duration_days", "channel",
 }
+CHANNEL_STATUSES = {"not_tested", "bench", "testing", "retired"}
+MAX_CHANNELS_TESTING = 3
+REQUIRED_CHANNEL_FIELDS = {"id", "name", "category", "is_paid", "impact_score", "confidence_score"}
 
 
 # --------------------------------------------------------------------------
@@ -219,6 +222,15 @@ def write_hypothesis(hypothesis: str) -> str:
         if missing:
             return json.dumps({"error": f"new hypothesis missing required fields: {sorted(missing)}"})
         if patch.get("status", "active") == "active":
+            channel_record = next(
+                (c for c in _read_jsonl("channels.jsonl") if c.get("id") == patch["channel"]), None
+            )
+            if channel_record is None or channel_record.get("status") != "testing":
+                return json.dumps({
+                    "error": f"channel '{patch['channel']}' is not currently status='testing' in the "
+                             "roster - call read_channels()/write_channel() to run the Bullseye "
+                             "channel-selection step and promote it first"
+                })
             active_same_variant = [
                 h for h in hyps
                 if h.get("status") == "active" and h.get("landing_page_variant_id") == patch["landing_page_variant_id"]
@@ -337,6 +349,133 @@ def check_escalation(hypothesis_id: str) -> str:
     avg = sum(chain_scores) / len(chain_scores)
     escalate = len(chain_scores) >= 3 and avg <= -0.5
     return json.dumps({"escalate": escalate, "rolling_average": round(avg, 3), "scores_used": chain_scores})
+
+
+# --------------------------------------------------------------------------
+# CEO tool: channel-selection roster (Bullseye framework, Traction by
+# Weinberg & Mares) - which traction channels to test hypotheses on, decided
+# separately from and before which hypothesis to run on a given channel.
+# --------------------------------------------------------------------------
+
+@tool("read_channels")
+def read_channels(status: str = "") -> str:
+    """Return the traction-channel roster as JSON: candidate channels the
+    CEO has brainstormed (Bullseye framework), each with impact_score,
+    confidence_score, cost_to_test_usd, is_paid, status
+    (not_tested/bench/testing/retired), and status_history. Pass a status to
+    filter, or "" for all.
+    """
+    channels = _read_jsonl("channels.jsonl")
+    if status:
+        channels = [c for c in channels if c.get("status") == status]
+    return json.dumps(channels, ensure_ascii=False)
+
+
+@tool("write_channel")
+def write_channel(channel: str, reason: str = "") -> str:
+    """Create or update a candidate traction channel (Bullseye framework:
+    brainstorm channels, score them, test a small number cheaply in
+    parallel, double down on the winner, swap out ones that stop working
+    instead of grinding on them).
+
+    `channel` is a JSON string: a full object (id, name, category, is_paid,
+    impact_score, confidence_score, and optionally cost_to_test_usd,
+    metrics_channel, notes) to create a new candidate, or a partial patch
+    (must include "id") to update one. status must be one of
+    not_tested/bench/testing/retired.
+
+    Enforced invariants (everything else - which channels to brainstorm,
+    how to score them - is your own judgment, not hardcoded here):
+    - at most 3 channels may have status="testing" at once. Bullseye's
+      central lesson is that startups fail by spreading thin across many
+      channels at once, not by picking the "wrong" one first.
+    - a paid channel (is_paid=true) cannot move to status="testing" without
+      approved_request_id pointing at an approval_queue.jsonl entry with
+      status="approved" and category="spend" - this reuses the existing
+      human approval queue, it does not add a separate spend gate.
+    - changing an existing channel's status requires a non-empty `reason`
+      (e.g. "reddit averaging -0.4 over 3 evaluated hypotheses, swapping in
+      content_marketing") so swaps stay auditable, same as any other
+      decision that changes direction.
+    """
+    try:
+        patch = json.loads(channel)
+    except json.JSONDecodeError as exc:
+        return json.dumps({"error": f"invalid JSON: {exc}"})
+
+    if "id" not in patch:
+        return json.dumps({"error": "channel must include an 'id'"})
+
+    if "status" in patch and patch["status"] not in CHANNEL_STATUSES:
+        return json.dumps({
+            "error": f"invalid status '{patch['status']}', must be one of {sorted(CHANNEL_STATUSES)}"
+        })
+
+    channels = _read_jsonl("channels.jsonl")
+    existing_index = next((i for i, c in enumerate(channels) if c.get("id") == patch["id"]), None)
+    now = datetime.now(timezone.utc).isoformat()
+
+    if existing_index is None:
+        missing = REQUIRED_CHANNEL_FIELDS - patch.keys()
+        if missing:
+            return json.dumps({"error": f"new channel missing required fields: {sorted(missing)}"})
+        old_status = None
+        record = {
+            "created_at": now,
+            "cost_to_test_usd": None,
+            "metrics_channel": None,
+            "notes": "",
+            "approved_request_id": None,
+            "status_history": [],
+            **patch,
+        }
+        record["status"] = patch.get("status", "not_tested")
+    else:
+        old = channels[existing_index]
+        old_status = old.get("status")
+        if "status" in patch and patch["status"] != old_status and not reason.strip():
+            return json.dumps({
+                "error": "changing an existing channel's status requires a non-empty reason "
+                         "(audit trail for channel swaps)"
+            })
+        record = {**old, **patch}
+        record.setdefault("status", old_status)
+
+    record["updated_at"] = now
+    target_status = record["status"]
+
+    if target_status == "testing":
+        other_testing = [c for c in channels if c.get("status") == "testing" and c.get("id") != patch["id"]]
+        if len(other_testing) >= MAX_CHANNELS_TESTING:
+            return json.dumps({
+                "error": f"testing cap reached ({len(other_testing)} channels already testing, "
+                         f"max {MAX_CHANNELS_TESTING}) - move one to bench/retired first, or hold off"
+            })
+        if record.get("is_paid"):
+            approved_request_id = record.get("approved_request_id")
+            approval = None
+            if approved_request_id:
+                approvals = _read_jsonl("approval_queue.jsonl")
+                approval = next((a for a in approvals if a.get("id") == approved_request_id), None)
+            if not approval or approval.get("status") != "approved" or approval.get("category") != "spend":
+                return json.dumps({
+                    "error": "paid channel cannot move to status='testing' without approved_request_id "
+                             "pointing at an approved, category='spend' entry in the approval queue - "
+                             "file request_approval first, get it approved, then pass its id here"
+                })
+
+    if target_status != old_status:
+        record["status_history"] = record.get("status_history", []) + [{
+            "at": now, "from": old_status, "to": target_status, "reason": reason or "initial",
+        }]
+
+    if existing_index is None:
+        channels.append(record)
+    else:
+        channels[existing_index] = record
+
+    _write_jsonl("channels.jsonl", channels)
+    return json.dumps({"ok": True, "id": patch["id"], "status": target_status})
 
 
 # --------------------------------------------------------------------------
@@ -459,8 +598,9 @@ def compare_channel_performance() -> str:
     """Rank channels by average score across all evaluated hypotheses that
     used them, using real historical data from hypotheses.jsonl - grounding
     for deciding where to invest effort or ad spend next instead of
-    guessing. Channels with no evaluated hypotheses yet are listed
-    separately as untested, never silently scored as zero.
+    guessing. Roster channels (see read_channels) with no evaluated
+    hypotheses yet are listed separately as untested, never silently scored
+    as zero.
     """
     hyps = _read_jsonl("hypotheses.jsonl")
     by_channel = {}
@@ -478,8 +618,8 @@ def compare_channel_performance() -> str:
         key=lambda row: row["average_score"],
         reverse=True,
     )
-    all_known_channels = {"reddit", "x", "discord", "telegram", "landing_page_direct"}
-    untested = sorted(all_known_channels - by_channel.keys())
+    roster_ids = {c["id"] for c in _read_jsonl("channels.jsonl") if "id" in c}
+    untested = sorted(roster_ids - by_channel.keys())
     return json.dumps({"ranked": ranked, "untested_channels": untested})
 
 

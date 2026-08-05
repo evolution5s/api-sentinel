@@ -7,9 +7,11 @@ from tools import (
     evaluate_hypothesis,
     open_pull_request,
     read_channel_metrics,
+    read_channels,
     read_hypotheses,
     read_state,
     request_approval,
+    write_channel,
     write_hypothesis,
 )
 
@@ -36,7 +38,7 @@ growth_agent = Agent(
         "every reach number comes from read_channel_metrics, never a guess."
     ),
     llm=claude_llm,
-    tools=[request_approval, read_channel_metrics],
+    tools=[request_approval, read_channel_metrics, read_channels],
     verbose=True,
 )
 
@@ -73,22 +75,86 @@ ceo_agent = Agent(
     tools=[
         read_state, read_hypotheses, write_hypothesis, evaluate_hypothesis,
         check_escalation, compare_channel_performance, request_approval,
+        read_channels, write_channel,
     ],
     verbose=True,
 )
 
 # Tasks definieren
+task_channel_strategy = Task(
+    description=(
+        "Maintain the traction-channel roster using the Bullseye framework "
+        "(Traction, Weinberg & Mares): brainstorm candidate channels, score "
+        "them, test a small number in parallel, double down on whichever "
+        "wins, and swap out ones that stop working instead of grinding on "
+        "them. This runs before any hypothesis is picked or created - it "
+        "decides which channels are even in play this cycle.\n"
+        "1) Call read_channels() to see the current roster. If it's empty, "
+        "brainstorm a first set of candidate channels for this niche "
+        "(Freqtrade/CCXT quant-bot users) and write each one with "
+        "write_channel: id, name, a category (e.g. community_marketing, "
+        "engineering_as_marketing, content_marketing, existing_platforms, "
+        "unconventional_pr, seo, paid_ads - a starting point, not an "
+        "exhaustive list; Bullseye lists 19 possible channels, use whichever "
+        "genuinely fit), is_paid, and your own honest impact_score and "
+        "confidence_score - state your reasoning, don't dress up a guess as "
+        "data. Set metrics_channel to reddit/x/discord/telegram if the "
+        "channel has one of those as its real reach metric; leave it unset "
+        "for channels like SEO/PR/engineering-as-marketing that only have "
+        "landing_page_direct (real analytics) as a reach signal.\n"
+        "2) Look at whichever channels are currently status='testing' (max "
+        "3, enforced by write_channel). For each with enough evaluated "
+        "hypotheses to trust the number, call compare_channel_performance() "
+        "and check its real average score. If it's stopped producing decent "
+        "scores, move it to status='bench' or 'retired' via write_channel "
+        "with a concrete reason (cite the average score and hypothesis "
+        "count), and promote a different not_tested/bench candidate into "
+        "'testing' instead - report this swap explicitly, it changes "
+        "direction just like a hypothesis pivot does.\n"
+        "3) If fewer than 3 channels are 'testing' and there's a worthwhile "
+        "candidate sitting idle, promote it - don't leave test capacity "
+        "unused, but don't force a low-scoring channel in just to fill the "
+        "cap.\n"
+        "4) A paid channel (is_paid=true) needs an approved spend request "
+        "before it can become 'testing' - reuses the existing approval "
+        "queue, no separate gate. Weigh paid spend honestly using real "
+        "numbers, not enthusiasm: Reddit's own $5/day minimum only buys "
+        "2-3 clicks, nowhere near a signal; a test that actually produces "
+        "learnable data realistically runs $1,500-3,000 over 2-3 weeks; "
+        "and below roughly $1,000/month, organic channels have generally "
+        "outperformed paid ones by a wide margin for early-stage products. "
+        "This is input to your scoring, not a rule that excludes paid "
+        "channels outright - if you still think it's worth testing, file "
+        "request_approval(category='spend', ...) with the concrete "
+        "platform/budget/rationale, and only pass its id as "
+        "approved_request_id to write_channel once it comes back approved.\n"
+        "5) Never invent a performance number - impact/confidence are your "
+        "own strategic judgment and should be labeled as such, but any "
+        "claim about how a tested channel is actually doing must come from "
+        "compare_channel_performance()."
+    ),
+    agent=ceo_agent,
+    expected_output=(
+        "Roster summary: each channel's status, impact/confidence, and real "
+        "average score where evaluated. Any promotions or swaps made this "
+        "cycle with their reasons. The final list of channels now "
+        "status='testing' (<=3) for this cycle's hypothesis work to pick from."
+    ),
+)
+
 task_growth = Task(
     description=(
         "Call read_state to see current signups, then read_hypotheses(status="
         "'active') to see what's currently being tested. For each active "
-        "hypothesis's channel, call read_channel_metrics - pass source_url "
-        "whenever you have a real post/invite/channel link (reddit, discord, "
-        "and telegram all auto-fetch real public numbers keylessly from a "
-        "URL; x and landing_page_direct need metrics_json with real numbers "
-        "supplied by a human, there is no free auto-fetch for them). Report "
-        "the resulting estimated_reach, reach_source, and any fetch_note per "
-        "hypothesis so the CEO can record it. "
+        "hypothesis, call read_channels() to find its channel's roster entry "
+        "and read off metrics_channel (defaults to landing_page_direct if "
+        "unset), then call read_channel_metrics with that metrics_channel - "
+        "pass source_url whenever you have a real post/invite/channel link "
+        "(reddit, discord, and telegram all auto-fetch real public numbers "
+        "keylessly from a URL; x and landing_page_direct need metrics_json "
+        "with real numbers supplied by a human, there is no free auto-fetch "
+        "for them). Report the resulting estimated_reach, reach_source, and "
+        "any fetch_note per hypothesis so the CEO can record it. "
         "Also compare content formats across platforms you have visibility "
         "into (short technical post vs. thread vs. changelog digest, etc.) "
         "and note which format seems to fit each channel's audience best - "
@@ -125,20 +191,17 @@ task_ceo = Task(
         "returns escalate=true, file a request_approval (category 'pricing' "
         "or 'publish', whichever fits) explicitly flagging 'fundamental "
         "strategy change needed' instead of quietly pivoting again. "
-        "5) Before formulating a follow-up hypothesis, call "
-        "compare_channel_performance() and actually weigh the result: "
-        "prefer channels with a strong average score and enough evaluated "
-        "hypotheses to trust it, but also consider untested_channels - "
-        "don't just repeat the same channel out of habit. Paid ads "
-        "(e.g. reddit_ads, x_ads) are a legitimate option alongside organic "
-        "channels, factoring in the Growth report's format comparison, but "
-        "never decide this silently: if you're leaning toward paid spend, "
-        "file a request_approval with category='spend' stating the "
-        "platform, a concrete budget, targeting rationale, and why organic "
-        "channels alone don't cover it - a paid hypothesis only starts "
-        "being measured once a human has actually placed that spend after "
-        "approving it. State your channel reasoning explicitly in the "
-        "report, including which alternatives you considered and rejected. "
+        "5) Pick the channel for any follow-up hypothesis only from "
+        "whichever channels the channel-strategy step above left as "
+        "status='testing' (write_hypothesis enforces this - it rejects a "
+        "channel that isn't currently 'testing' in the roster). Within "
+        "that set, weigh the Growth report's format comparison and each "
+        "channel's real average score from compare_channel_performance() "
+        "to decide which one fits this particular follow-up best - don't "
+        "just repeat the same one out of habit if another testing channel "
+        "fits the hypothesis better. Never pick a channel outside the "
+        "current testing set yourself; if none of them fit, say so and "
+        "leave the follow-up for next cycle instead of forcing it. "
         "6) Formulate exactly one follow-up hypothesis per evaluated "
         "hypothesis, setting prior_hypothesis_id, prior_score, and channel "
         "per the reasoning above, sized per the decision band the score "
@@ -177,7 +240,7 @@ task_dev = Task(
 # Crew instanziieren
 crew = Crew(
     agents=[growth_agent, ceo_agent, dev_agent],
-    tasks=[task_growth, task_ceo, task_dev],
+    tasks=[task_channel_strategy, task_growth, task_ceo, task_dev],
     process=Process.sequential,
 )
 

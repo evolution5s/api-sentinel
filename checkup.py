@@ -43,6 +43,19 @@ def reset_state():
     if SCRATCH_DIR.exists():
         shutil.rmtree(SCRATCH_DIR)
     SCRATCH_DIR.mkdir(parents=True)
+    _seed_testing_channel()
+
+
+def _seed_testing_channel(channel_id="reddit"):
+    """Most hypothesis tests need a channel that's already status='testing'
+    (write_hypothesis now enforces this). Called on every reset_state() so
+    existing tests don't each need their own roster setup; tests that care
+    about a different channel id seed their own on top of this.
+    """
+    tools.write_channel.run(channel=json.dumps({
+        "id": channel_id, "name": channel_id.title(), "category": "community_marketing",
+        "is_paid": False, "impact_score": 3, "confidence_score": 3, "status": "testing",
+    }))
 
 
 SAMPLE_HYP = {
@@ -53,6 +66,7 @@ SAMPLE_HYP = {
     "failure_rate": 0.001,
     "success_rate": 0.01,
     "duration_days": 10,
+    "channel": "reddit",
 }
 
 
@@ -347,6 +361,112 @@ def test_check_escalation_no_scores_yet():
     assert result["escalate"] is False
 
 
+def test_write_hypothesis_rejects_channel_not_testing():
+    reset_state()
+    tools.write_channel.run(channel=json.dumps({"id": "reddit", "status": "bench"}), reason="testing rediscovered stale")
+    result = json.loads(tools.write_hypothesis.run(hypothesis=json.dumps(SAMPLE_HYP)))
+    assert "error" in result and "not currently status='testing'" in result["error"]
+
+
+def test_write_hypothesis_rejects_unknown_channel():
+    reset_state()
+    bad = {**SAMPLE_HYP, "channel": "carrier_pigeon"}
+    result = json.loads(tools.write_hypothesis.run(hypothesis=json.dumps(bad)))
+    assert "error" in result
+
+
+# --- tools.py: channel roster (Bullseye framework) --------------------------
+
+def test_write_channel_create_requires_fields():
+    reset_state()
+    result = json.loads(tools.write_channel.run(channel=json.dumps({"id": "seo"})))
+    assert "error" in result
+
+
+def test_write_channel_create_defaults_not_tested():
+    reset_state()
+    result = json.loads(tools.write_channel.run(channel=json.dumps({
+        "id": "content_marketing", "name": "Content marketing", "category": "content_marketing",
+        "is_paid": False, "impact_score": 4, "confidence_score": 2,
+    })))
+    assert result == {"ok": True, "id": "content_marketing", "status": "not_tested"}
+    stored = json.loads(tools.read_channels.run())
+    entry = next(c for c in stored if c["id"] == "content_marketing")
+    assert entry["status_history"][0]["to"] == "not_tested"
+
+
+def test_write_channel_testing_cap_enforced():
+    reset_state()  # "reddit" already testing from reset_state
+    _seed_testing_channel("discord")
+    _seed_testing_channel("telegram")
+    result = json.loads(tools.write_channel.run(channel=json.dumps({
+        "id": "seo", "name": "SEO", "category": "seo", "is_paid": False,
+        "impact_score": 2, "confidence_score": 2, "status": "testing",
+    })))
+    assert "error" in result and "testing cap reached" in result["error"]
+
+
+def test_write_channel_status_change_requires_reason():
+    reset_state()
+    result = json.loads(tools.write_channel.run(channel=json.dumps({"id": "reddit", "status": "bench"})))
+    assert "error" in result and "requires a non-empty reason" in result["error"]
+
+
+def test_write_channel_status_change_with_reason_logs_history():
+    reset_state()
+    result = json.loads(tools.write_channel.run(
+        channel=json.dumps({"id": "reddit", "status": "bench"}), reason="scored -0.5 over 3 tests",
+    ))
+    assert result == {"ok": True, "id": "reddit", "status": "bench"}
+    entry = json.loads(tools.read_channels.run())[0]
+    assert entry["status_history"][-1] == {"at": entry["updated_at"], "from": "testing", "to": "bench", "reason": "scored -0.5 over 3 tests"}
+
+
+def test_write_channel_paid_requires_approved_spend_request():
+    reset_state()
+    result = json.loads(tools.write_channel.run(channel=json.dumps({
+        "id": "reddit_ads", "name": "Reddit Ads", "category": "paid_ads", "is_paid": True,
+        "impact_score": 3, "confidence_score": 2, "status": "testing",
+    })))
+    assert "error" in result and "approved_request_id" in result["error"]
+
+
+def test_write_channel_paid_succeeds_with_approved_spend_request():
+    reset_state()
+    appr = json.loads(tools.request_approval.run(category="spend", proposal="$1500 reddit ads test", reasoning="r"))
+    approvals = tools._read_jsonl("approval_queue.jsonl")
+    approvals[0]["status"] = "approved"
+    tools._write_jsonl("approval_queue.jsonl", approvals)
+    result = json.loads(tools.write_channel.run(channel=json.dumps({
+        "id": "reddit_ads", "name": "Reddit Ads", "category": "paid_ads", "is_paid": True,
+        "impact_score": 3, "confidence_score": 2, "status": "testing",
+        "approved_request_id": appr["queued"],
+    })))
+    assert result == {"ok": True, "id": "reddit_ads", "status": "testing"}
+
+
+def test_write_channel_paid_rejects_pending_approval():
+    reset_state()
+    appr = json.loads(tools.request_approval.run(category="spend", proposal="$1500 reddit ads test", reasoning="r"))
+    result = json.loads(tools.write_channel.run(channel=json.dumps({
+        "id": "reddit_ads", "name": "Reddit Ads", "category": "paid_ads", "is_paid": True,
+        "impact_score": 3, "confidence_score": 2, "status": "testing",
+        "approved_request_id": appr["queued"],
+    })))
+    assert "error" in result
+
+
+def test_read_channels_status_filter():
+    reset_state()
+    _seed_testing_channel("discord")
+    tools.write_channel.run(channel=json.dumps({
+        "id": "seo", "name": "SEO", "category": "seo", "is_paid": False,
+        "impact_score": 2, "confidence_score": 2,
+    }))
+    assert {c["id"] for c in json.loads(tools.read_channels.run(status="testing"))} == {"reddit", "discord"}
+    assert {c["id"] for c in json.loads(tools.read_channels.run(status="not_tested"))} == {"seo"}
+
+
 # --- tools.py: growth --------------------------------------------------------
 
 def test_read_channel_metrics_tool_reddit():
@@ -454,14 +574,15 @@ def test_read_channel_metrics_tool_telegram_source_url():
 # --- tools.py: compare_channel_performance ----------------------------------
 
 def test_compare_channel_performance_empty():
-    reset_state()
+    reset_state()  # seeds one roster channel ("reddit"), no evaluated hypotheses yet
     result = json.loads(tools.compare_channel_performance.run())
     assert result["ranked"] == []
-    assert set(result["untested_channels"]) == {"reddit", "x", "discord", "telegram", "landing_page_direct"}
+    assert result["untested_channels"] == ["reddit"]
 
 
 def test_compare_channel_performance_ranks_by_score():
     reset_state()
+    _seed_testing_channel("x")
     tools.write_hypothesis.run(hypothesis=json.dumps({
         **SAMPLE_HYP, "id": "hyp_reddit_1", "channel": "reddit", "status": "evaluated", "score": 0.8,
     }))
@@ -476,7 +597,7 @@ def test_compare_channel_performance_ranks_by_score():
     result = json.loads(tools.compare_channel_performance.run())
     assert result["ranked"][0] == {"channel": "reddit", "average_score": 0.6, "evaluated_hypotheses": 2}
     assert result["ranked"][1] == {"channel": "x", "average_score": -0.6, "evaluated_hypotheses": 1}
-    assert set(result["untested_channels"]) == {"discord", "telegram", "landing_page_direct"}
+    assert result["untested_channels"] == []
 
 
 # --- tools.py: dev -----------------------------------------------------------
@@ -525,9 +646,9 @@ def test_approve_cli_flow():
 
 # --- crew.py: construction sanity (no kickoff, no API calls) ---------------
 
-def test_crew_has_three_agents_and_tasks():
+def test_crew_has_three_agents_and_four_tasks():
     assert len(crew.crew.agents) == 3
-    assert len(crew.crew.tasks) == 3
+    assert len(crew.crew.tasks) == 4
 
 
 def test_ceo_agent_tools_match_spec():
@@ -535,12 +656,18 @@ def test_ceo_agent_tools_match_spec():
     assert tool_names == {
         "read_state", "read_hypotheses", "write_hypothesis", "evaluate_hypothesis",
         "check_escalation", "compare_channel_performance", "request_approval",
+        "read_channels", "write_channel",
     }, tool_names
 
 
 def test_growth_dev_tools():
-    assert {t.name for t in crew.growth_agent.tools} == {"request_approval", "read_channel_metrics"}
+    assert {t.name for t in crew.growth_agent.tools} == {"request_approval", "read_channel_metrics", "read_channels"}
     assert {t.name for t in crew.dev_agent.tools} == {"open_pull_request"}
+
+
+def test_channel_strategy_task_assigned_to_ceo():
+    assert crew.task_channel_strategy.agent is crew.ceo_agent
+    assert crew.crew.tasks[0] is crew.task_channel_strategy
 
 
 def main():
