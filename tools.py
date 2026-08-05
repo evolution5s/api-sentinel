@@ -1,5 +1,11 @@
 """State persistence and CrewAI tools shared by all api-sentinel agents.
 
+This is the Sub-CEO/operative layer for the api-sentinel subsidiary
+specifically - see holding.py for the Main-CEO/holding-level layer above it
+(subsidiary registry, pivot review, cross-subsidiary requests, the shared
+research archive), which reuses STATE_DIR's approval_queue.jsonl as the one
+human approval queue rather than adding a second one.
+
 Everything under STATE_DIR is plain JSONL so it stays human-readable and
 diffable. STATE_DIR defaults to /data (the Railway volume mount point) but
 can be overridden for local runs and tests.
@@ -16,6 +22,7 @@ import requests
 from crewai.tools import tool
 
 import scoring
+from jsonl_store import append_jsonl, read_jsonl, write_jsonl
 
 STATE_DIR = Path(os.getenv("STATE_DIR", "/data"))
 
@@ -43,33 +50,15 @@ def _ensure_state_dir() -> None:
 
 
 def _append_jsonl(filename: str, record: dict) -> None:
-    _ensure_state_dir()
-    with (STATE_DIR / filename).open("a", encoding="utf-8") as f:
-        f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    append_jsonl(STATE_DIR, filename, record)
 
 
 def _read_jsonl(filename: str) -> list:
-    path = STATE_DIR / filename
-    if not path.exists():
-        return []
-    records = []
-    with path.open("r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                records.append(json.loads(line))
-            except json.JSONDecodeError:
-                continue
-    return records
+    return read_jsonl(STATE_DIR, filename)
 
 
 def _write_jsonl(filename: str, records: list) -> None:
-    _ensure_state_dir()
-    with (STATE_DIR / filename).open("w", encoding="utf-8") as f:
-        for record in records:
-            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    write_jsonl(STATE_DIR, filename, records)
 
 
 # --------------------------------------------------------------------------

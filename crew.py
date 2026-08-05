@@ -21,6 +21,18 @@ from tools import (
     write_channel,
     write_hypothesis,
 )
+from holding import (
+    decide_pivot_proposal,
+    file_cross_subsidiary_request,
+    file_pivot_proposal,
+    read_cross_subsidiary_requests,
+    read_pivot_proposals,
+    read_subsidiaries,
+    register_subsidiary,
+    resolve_cross_subsidiary_request,
+    search_research_archive,
+    set_subsidiary_status,
+)
 
 _previous_cycle_note = read_last_cycle_note()
 
@@ -67,28 +79,68 @@ dev_agent = Agent(
 )
 
 ceo_agent = Agent(
-    role="Autonomous CEO & Lean Startup strategist",
+    role="Sub-CEO of API Sentinel (reports to the Main-CEO)",
     goal=(
         "Evaluate due hypotheses, formulate follow-up hypotheses, and grow API "
         "Sentinel into a profitable bootstrapped business - without ever "
-        "fabricating a number or bypassing the human approval queue"
+        "fabricating a number, bypassing the human approval queue, or deciding "
+        "a fundamental strategy change alone"
     ),
     backstory=(
-        "Data-driven SaaS CEO running a strict Build-Measure-Learn loop. Has no "
-        "access to payment methods; any action that costs money, creates a "
-        "legal obligation, or becomes publicly visible must go through "
-        "request_approval first. Computes scores only via evaluate_hypothesis "
-        "(never by mental arithmetic), and escalates to the board via "
-        "request_approval if check_escalation signals a fundamental strategy "
-        "problem."
+        "Data-driven SaaS Sub-CEO running a strict Build-Measure-Learn loop "
+        "for one subsidiary of the holding. Has no access to payment methods; "
+        "any action that costs money, creates a legal obligation, or becomes "
+        "publicly visible must go through request_approval first. Computes "
+        "scores only via evaluate_hypothesis (never by mental arithmetic). "
+        "Operates strictly within API Sentinel's current business model - "
+        "when check_escalation signals a fundamental strategy problem, files "
+        "a structured pivot proposal with the Main-CEO (file_pivot_proposal) "
+        "instead of deciding a pivot alone or escalating straight to the "
+        "board; the Main-CEO reviews it and, for anything with real reach, "
+        "loops in the Aufsichtsrat. Can pull historical data from other "
+        "subsidiaries via search_research_archive, but never contacts "
+        "another subsidiary's Sub-CEO directly - that always goes through "
+        "the Main-CEO (file_cross_subsidiary_request)."
     ),
     llm=claude_llm,
     tools=[
         read_state, read_hypotheses, write_hypothesis, evaluate_hypothesis,
         check_escalation, compare_channel_performance, request_approval,
         read_channels, write_channel,
+        file_pivot_proposal, file_cross_subsidiary_request, search_research_archive,
     ],
     max_iter=50,
+    verbose=True,
+)
+
+main_ceo_agent = Agent(
+    role="Main-CEO of the Open Claw Holding",
+    goal=(
+        "Steer the holding's subsidiaries strategically: review pivot "
+        "proposals and cross-subsidiary requests from Sub-CEOs, manage the "
+        "subsidiary registry (including the dormant-state lifecycle), and "
+        "loop in the Aufsichtsrat for anything with real reach - never "
+        "decide big-impact moves alone"
+    ),
+    backstory=(
+        "Runs the holding above individual subsidiaries' Sub-CEOs. With only "
+        "api-sentinel registered today, most cycles have nothing to review - "
+        "that's expected, not a sign anything is broken. Never fabricates a "
+        "decision just to have something to report; 'nothing pending this "
+        "cycle' is a complete, valid answer. Instantiating a new subsidiary, "
+        "deploying new agents, or connecting new external tools always goes "
+        "through request_approval to the Aufsichtsrat first, no exceptions - "
+        "register_subsidiary itself enforces this, but the same discipline "
+        "applies to every judgment call this role makes."
+    ),
+    llm=claude_llm,
+    tools=[
+        read_subsidiaries, register_subsidiary, set_subsidiary_status,
+        read_pivot_proposals, decide_pivot_proposal,
+        read_cross_subsidiary_requests, resolve_cross_subsidiary_request,
+        search_research_archive, request_approval,
+    ],
+    max_iter=25,
     verbose=True,
 )
 
@@ -216,9 +268,18 @@ task_ceo = Task(
         "duration_days and extension_used=true, status stays 'active') rather "
         "than closing it - never extend a second time. "
         "4) After evaluating, call check_escalation(hypothesis_id). If it "
-        "returns escalate=true, file a request_approval (category 'pricing' "
-        "or 'publish', whichever fits) explicitly flagging 'fundamental "
-        "strategy change needed' instead of quietly pivoting again. "
+        "returns escalate=true, this is a pivot-level decision, not "
+        "something to decide or escalate to the board yourself: fill out "
+        "the standard pivot template and call file_pivot_proposal("
+        "subsidiary_id='api-sentinel', proposal=...) with all required "
+        "fields (nature_of_change, validating_data, "
+        "evolutionary_or_disruptive, existing_business_disposition, "
+        "capability_gap_analysis, new_resources_needed, risk_assessment, "
+        "synergy_overlap) - cite the real rolling-average score from "
+        "check_escalation as your validating_data, never invent it. The "
+        "Main-CEO reviews it next cycle; don't also file a separate "
+        "request_approval for the same issue, and don't quietly pivot on "
+        "your own instead. "
         "5) Pick the channel for any follow-up hypothesis only from "
         "whichever channels the channel-strategy step above left as "
         "status='testing' (write_hypothesis enforces this - it rejects a "
@@ -252,6 +313,47 @@ task_ceo = Task(
     ),
 )
 
+task_main_ceo_review = Task(
+    description=(
+        "Run the holding's governance review for this cycle:\n"
+        "1) Call read_pivot_proposals(status='pending'). For each: weigh it "
+        "against the decision matrix - approve_in_place (the pivot happens "
+        "within the filing subsidiary), move_to_subsidiary (fits an "
+        "existing different subsidiary's portfolio better), "
+        "spinoff_required (needs a brand-new subsidiary), or rejected. "
+        "Call decide_pivot_proposal with your decision and reasoning. If "
+        "the decision is spinoff_required, or move_to_subsidiary would "
+        "meaningfully change another subsidiary's scope, also file a "
+        "request_approval explaining the pivot and your recommendation - "
+        "never action either of those alone, that always goes to the "
+        "Aufsichtsrat. If there are no pending proposals, say so plainly "
+        "rather than inventing one to review.\n"
+        "2) Call read_cross_subsidiary_requests(status='pending'). For "
+        "each: decide whether it's justified and call "
+        "resolve_cross_subsidiary_request. With only one subsidiary "
+        "registered today there is usually nowhere to actually route the "
+        "request to - approve or reject the request itself honestly, but "
+        "never fabricate a result you can't actually produce; say plainly "
+        "if no other subsidiary exists yet to fetch from.\n"
+        "3) Call read_subsidiaries() and report the current holding "
+        "structure (which are active/dormant). Only call "
+        "set_subsidiary_status if there's a concrete reason to change one "
+        "this cycle (e.g. a Sub-CEO reported its project done or paused) - "
+        "never change status speculatively.\n"
+        "4) Never call register_subsidiary without an already-approved "
+        "request_approval backing it - the tool enforces this, but don't "
+        "attempt it prematurely either.\n"
+        "5) Nothing to review this cycle is a completely normal, valid "
+        "outcome - report it as such rather than inventing busywork."
+    ),
+    agent=main_ceo_agent,
+    expected_output=(
+        "Pivot proposals reviewed (if any) with decisions and reasoning. "
+        "Cross-subsidiary requests resolved (if any). Current subsidiary "
+        "registry summary. Any request_approval filed for board sign-off."
+    ),
+)
+
 task_dev = Task(
     description=(
         "Read the CEO's report above. If and only if it says a new or changed "
@@ -267,8 +369,8 @@ task_dev = Task(
 
 # Crew instanziieren
 crew = Crew(
-    agents=[growth_agent, ceo_agent, dev_agent],
-    tasks=[task_channel_strategy, task_growth, task_ceo, task_dev],
+    agents=[growth_agent, ceo_agent, main_ceo_agent, dev_agent],
+    tasks=[task_channel_strategy, task_growth, task_ceo, task_main_ceo_review, task_dev],
     process=Process.sequential,
 )
 
@@ -316,8 +418,11 @@ def send_cycle_summary(kickoff_error: Exception = None) -> None:
             "--- Wachstum ---",
             _task_summary(task_growth)[:800],
             "",
-            "--- CEO: Ergebnis & naechste Schritte ---",
+            "--- Sub-CEO (API Sentinel): Ergebnis & naechste Schritte ---",
             _task_summary(task_ceo)[:1800],
+            "",
+            "--- Main-CEO: Holding-Review ---",
+            _task_summary(task_main_ceo_review)[:1000],
             "",
             "--- Dev ---",
             _task_summary(task_dev)[:400],

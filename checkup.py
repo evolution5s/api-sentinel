@@ -23,6 +23,7 @@ os.environ["STATE_DIR"] = str(SCRATCH_DIR)
 
 import scoring  # noqa: E402
 import tools  # noqa: E402
+import holding  # noqa: E402
 import approve  # noqa: E402
 import crew  # noqa: E402
 
@@ -67,6 +68,17 @@ SAMPLE_HYP = {
     "success_rate": 0.01,
     "duration_days": 10,
     "channel": "reddit",
+}
+
+SAMPLE_PIVOT = {
+    "nature_of_change": "Shift from Freqtrade/CCXT niche to general crypto trading tools",
+    "validating_data": "3-hypothesis rolling average of -0.6",
+    "evolutionary_or_disruptive": "disruptive",
+    "existing_business_disposition": "pause organic channels, keep landing page live",
+    "capability_gap_analysis": "no new agents needed, same tool set applies",
+    "new_resources_needed": "none identified yet",
+    "risk_assessment": "moderate - broader audience but diluted positioning",
+    "synergy_overlap": "none with other subsidiaries (only one exists)",
 }
 
 
@@ -709,11 +721,206 @@ def test_approve_cli_flow():
     assert final[0]["status"] == "approved", "an already-decided request must not be overwritten"
 
 
+# --- holding.py: subsidiary registry ----------------------------------------
+
+def test_read_subsidiaries_auto_bootstraps_api_sentinel():
+    reset_state()
+    subs = json.loads(holding.read_subsidiaries.run())
+    assert len(subs) == 1
+    assert subs[0]["id"] == "api-sentinel"
+    assert subs[0]["status"] == "active"
+    assert subs[0]["state_dir"] == str(tools.STATE_DIR)
+
+
+def test_read_subsidiaries_status_filter():
+    reset_state()
+    holding.read_subsidiaries.run()  # bootstraps api-sentinel
+    assert len(json.loads(holding.read_subsidiaries.run(status="active"))) == 1
+    assert len(json.loads(holding.read_subsidiaries.run(status="dormant"))) == 0
+
+
+def test_register_subsidiary_requires_approved_spend_like_request():
+    reset_state()
+    result = json.loads(holding.register_subsidiary.run(
+        subsidiary=json.dumps({"id": "second-co", "name": "Second Co", "focus": "test"}),
+        approved_request_id="appr_doesnotexist",
+    ))
+    assert "error" in result and "approved_request_id" in result["error"]
+
+
+def test_register_subsidiary_succeeds_once_approved():
+    reset_state()
+    appr = json.loads(tools.request_approval.run(category="deploy", proposal="spin off second-co", reasoning="r"))
+    approvals = tools._read_jsonl("approval_queue.jsonl")
+    approvals[0]["status"] = "approved"
+    tools._write_jsonl("approval_queue.jsonl", approvals)
+
+    result = json.loads(holding.register_subsidiary.run(
+        subsidiary=json.dumps({"id": "second-co", "name": "Second Co", "focus": "test"}),
+        approved_request_id=appr["queued"],
+    ))
+    assert result == {"ok": True, "id": "second-co"}
+    subs = json.loads(holding.read_subsidiaries.run())
+    assert {s["id"] for s in subs} == {"api-sentinel", "second-co"}
+
+
+def test_register_subsidiary_rejects_duplicate_id():
+    reset_state()
+    appr = json.loads(tools.request_approval.run(category="deploy", proposal="p", reasoning="r"))
+    approvals = tools._read_jsonl("approval_queue.jsonl")
+    approvals[0]["status"] = "approved"
+    tools._write_jsonl("approval_queue.jsonl", approvals)
+    result = json.loads(holding.register_subsidiary.run(
+        subsidiary=json.dumps({"id": "api-sentinel", "name": "dup", "focus": "test"}),
+        approved_request_id=appr["queued"],
+    ))
+    assert "error" in result
+
+
+def test_set_subsidiary_status_requires_reason():
+    reset_state()
+    holding.read_subsidiaries.run()
+    result = json.loads(holding.set_subsidiary_status.run(subsidiary_id="api-sentinel", status="dormant", reason=""))
+    assert "error" in result
+
+
+def test_set_subsidiary_status_roundtrip():
+    reset_state()
+    holding.read_subsidiaries.run()
+    result = json.loads(holding.set_subsidiary_status.run(
+        subsidiary_id="api-sentinel", status="dormant", reason="project paused for the quarter",
+    ))
+    assert result == {"ok": True, "id": "api-sentinel", "status": "dormant"}
+    subs = json.loads(holding.read_subsidiaries.run())
+    assert subs[0]["status"] == "dormant"
+    assert subs[0]["status_history"][-1]["reason"] == "project paused for the quarter"
+
+
+# --- holding.py: pivot proposals --------------------------------------------
+
+def test_file_pivot_proposal_requires_template_fields():
+    reset_state()
+    result = json.loads(holding.file_pivot_proposal.run(
+        subsidiary_id="api-sentinel", proposal=json.dumps({"nature_of_change": "x"}),
+    ))
+    assert "error" in result
+
+
+def test_file_and_decide_pivot_proposal():
+    reset_state()
+    filed = json.loads(holding.file_pivot_proposal.run(
+        subsidiary_id="api-sentinel", proposal=json.dumps(SAMPLE_PIVOT),
+    ))
+    assert "filed" in filed
+    pending = json.loads(holding.read_pivot_proposals.run(status="pending"))
+    assert len(pending) == 1
+
+    result = json.loads(holding.decide_pivot_proposal.run(
+        proposal_id=filed["filed"], decision="approve_in_place", reasoning="scoped, low risk",
+    ))
+    assert result == {"ok": True, "id": filed["filed"], "decision": "approve_in_place"}
+    decided = json.loads(holding.read_pivot_proposals.run(status="decided"))
+    assert decided[0]["decision"] == "approve_in_place"
+
+
+def test_decide_pivot_proposal_rejects_invalid_decision():
+    reset_state()
+    filed = json.loads(holding.file_pivot_proposal.run(
+        subsidiary_id="api-sentinel", proposal=json.dumps(SAMPLE_PIVOT),
+    ))
+    result = json.loads(holding.decide_pivot_proposal.run(
+        proposal_id=filed["filed"], decision="just_wing_it", reasoning="r",
+    ))
+    assert "error" in result
+
+
+def test_decide_pivot_proposal_does_not_redecide():
+    reset_state()
+    filed = json.loads(holding.file_pivot_proposal.run(
+        subsidiary_id="api-sentinel", proposal=json.dumps(SAMPLE_PIVOT),
+    ))
+    holding.decide_pivot_proposal.run(proposal_id=filed["filed"], decision="rejected", reasoning="r1")
+    result = json.loads(holding.decide_pivot_proposal.run(
+        proposal_id=filed["filed"], decision="approve_in_place", reasoning="r2",
+    ))
+    assert "error" in result
+    decided = json.loads(holding.read_pivot_proposals.run())[0]
+    assert decided["decision"] == "rejected", "first decision must stick"
+
+
+# --- holding.py: cross-subsidiary requests ----------------------------------
+
+def test_file_and_resolve_cross_subsidiary_request():
+    reset_state()
+    filed = json.loads(holding.file_cross_subsidiary_request.run(
+        from_subsidiary_id="api-sentinel", to_subsidiary_id="second-co",
+        request="reddit reach benchmarks", reasoning="no other subsidiary exists yet",
+    ))
+    assert "filed" in filed
+    pending = json.loads(holding.read_cross_subsidiary_requests.run(status="pending"))
+    assert len(pending) == 1
+
+    result = json.loads(holding.resolve_cross_subsidiary_request.run(
+        request_id=filed["filed"], decision="rejected",
+        result="", reasoning="second-co does not exist yet",
+    ))
+    assert result == {"ok": True, "id": filed["filed"], "status": "rejected"}
+
+
+def test_resolve_cross_subsidiary_request_rejects_invalid_decision():
+    reset_state()
+    filed = json.loads(holding.file_cross_subsidiary_request.run(
+        from_subsidiary_id="api-sentinel", to_subsidiary_id="second-co", request="r", reasoning="r",
+    ))
+    result = json.loads(holding.resolve_cross_subsidiary_request.run(
+        request_id=filed["filed"], decision="maybe",
+    ))
+    assert "error" in result
+
+
+def test_resolve_cross_subsidiary_request_does_not_reresolve():
+    reset_state()
+    filed = json.loads(holding.file_cross_subsidiary_request.run(
+        from_subsidiary_id="api-sentinel", to_subsidiary_id="second-co", request="r", reasoning="r",
+    ))
+    holding.resolve_cross_subsidiary_request.run(request_id=filed["filed"], decision="rejected")
+    result = json.loads(holding.resolve_cross_subsidiary_request.run(request_id=filed["filed"], decision="approved"))
+    assert "error" in result
+
+
+# --- holding.py: research archive -------------------------------------------
+
+def test_search_research_archive_finds_matching_hypothesis():
+    reset_state()
+    holding.read_subsidiaries.run()  # bootstraps api-sentinel with the real STATE_DIR
+    tools.write_hypothesis.run(hypothesis=json.dumps({
+        **SAMPLE_HYP, "id": "hyp_archive_1", "statement": "Freqtrade users want breaking-change alerts",
+    }))
+    result = json.loads(holding.search_research_archive.run(query="breaking-change"))
+    assert result["total_matches"] == 1
+    assert result["matches"][0]["subsidiary_id"] == "api-sentinel"
+    assert result["matches"][0]["source_file"] == "hypotheses.jsonl"
+
+
+def test_search_research_archive_empty_query_errors():
+    reset_state()
+    result = json.loads(holding.search_research_archive.run(query="   "))
+    assert "error" in result
+
+
+def test_search_research_archive_no_match():
+    reset_state()
+    holding.read_subsidiaries.run()
+    result = json.loads(holding.search_research_archive.run(query="something that does not exist anywhere"))
+    assert result["total_matches"] == 0
+    assert result["matches"] == []
+
+
 # --- crew.py: construction sanity (no kickoff, no API calls) ---------------
 
-def test_crew_has_three_agents_and_four_tasks():
-    assert len(crew.crew.agents) == 3
-    assert len(crew.crew.tasks) == 4
+def test_crew_has_four_agents_and_five_tasks():
+    assert len(crew.crew.agents) == 4
+    assert len(crew.crew.tasks) == 5
 
 
 def test_ceo_agent_tools_match_spec():
@@ -722,6 +929,17 @@ def test_ceo_agent_tools_match_spec():
         "read_state", "read_hypotheses", "write_hypothesis", "evaluate_hypothesis",
         "check_escalation", "compare_channel_performance", "request_approval",
         "read_channels", "write_channel",
+        "file_pivot_proposal", "file_cross_subsidiary_request", "search_research_archive",
+    }, tool_names
+
+
+def test_main_ceo_agent_tools_match_spec():
+    tool_names = {t.name for t in crew.main_ceo_agent.tools}
+    assert tool_names == {
+        "read_subsidiaries", "register_subsidiary", "set_subsidiary_status",
+        "read_pivot_proposals", "decide_pivot_proposal",
+        "read_cross_subsidiary_requests", "resolve_cross_subsidiary_request",
+        "search_research_archive", "request_approval",
     }, tool_names
 
 
@@ -733,6 +951,11 @@ def test_growth_dev_tools():
 def test_channel_strategy_task_assigned_to_ceo():
     assert crew.task_channel_strategy.agent is crew.ceo_agent
     assert crew.crew.tasks[0] is crew.task_channel_strategy
+
+
+def test_main_ceo_review_task_assigned_to_main_ceo():
+    assert crew.task_main_ceo_review.agent is crew.main_ceo_agent
+    assert crew.crew.tasks[3] is crew.task_main_ceo_review
 
 
 def test_send_cycle_summary_never_raises_without_a_crew_run():
