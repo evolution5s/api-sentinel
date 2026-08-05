@@ -672,3 +672,40 @@ def open_pull_request(branch_name: str, file_path: str, file_content: str, pr_ti
         return json.dumps({"error": f"could not open PR: {pr_resp.status_code} {pr_resp.text}"})
 
     return json.dumps({"pr_url": pr_resp.json()["html_url"]})
+
+
+# --------------------------------------------------------------------------
+# Cycle notification (orchestration-level, not an agent tool - called
+# directly from crew.py after kickoff() so delivery never depends on an
+# agent remembering to call it)
+# --------------------------------------------------------------------------
+
+TELEGRAM_MAX_MESSAGE_LENGTH = 4096
+
+
+def send_telegram_message(text: str) -> None:
+    """Send a plain-text message via a Telegram bot to a fixed chat, split
+    across multiple messages if it exceeds Telegram's 4096-char limit.
+    Needs TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID in the environment; prints
+    a clear warning and returns quietly if either is missing or the send
+    fails - a missing/failed notification must never crash the crew run
+    that already completed successfully.
+    """
+    token = os.getenv("TELEGRAM_BOT_TOKEN")
+    chat_id = os.getenv("TELEGRAM_CHAT_ID")
+    if not token or not chat_id:
+        print("[telegram] TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID not set - skipping cycle summary notification.")
+        return
+
+    for i in range(0, len(text), TELEGRAM_MAX_MESSAGE_LENGTH):
+        chunk = text[i:i + TELEGRAM_MAX_MESSAGE_LENGTH]
+        try:
+            resp = requests.post(
+                f"https://api.telegram.org/bot{token}/sendMessage",
+                json={"chat_id": chat_id, "text": chunk},
+                timeout=15,
+            )
+            resp.raise_for_status()
+        except requests.RequestException as exc:
+            print(f"[telegram] failed to send cycle summary: {exc}")
+            return

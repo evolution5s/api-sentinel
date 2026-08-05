@@ -1,4 +1,7 @@
+import json
 import os
+from datetime import datetime, timezone
+
 from crewai import Agent, Crew, Process, Task, LLM
 
 from tools import (
@@ -11,6 +14,7 @@ from tools import (
     read_hypotheses,
     read_state,
     request_approval,
+    send_telegram_message,
     write_channel,
     write_hypothesis,
 )
@@ -244,7 +248,45 @@ crew = Crew(
     process=Process.sequential,
 )
 
+def _task_summary(task: Task) -> str:
+    try:
+        output = task.output
+        return output.raw if output and output.raw else "(kein Output)"
+    except Exception as exc:
+        return f"(Output nicht lesbar: {exc})"
+
+
+def send_cycle_summary() -> None:
+    """Post a what-happened/what's-next digest of this cycle to Telegram.
+    Called once after kickoff() finishes - never gates or delays the crew
+    run itself, and never raises (a failed notification must not look like
+    a failed cycle).
+    """
+    try:
+        pending = json.loads(read_state.run()).get("pending_approvals", "?")
+        summary = "\n".join([
+            f"API Sentinel Zyklus - {datetime.now(timezone.utc).isoformat()}",
+            f"Offene Freigaben (approve.py): {pending}",
+            "",
+            "--- Channel-Strategie ---",
+            _task_summary(task_channel_strategy)[:1200],
+            "",
+            "--- Wachstum ---",
+            _task_summary(task_growth)[:800],
+            "",
+            "--- CEO: Ergebnis & naechste Schritte ---",
+            _task_summary(task_ceo)[:1800],
+            "",
+            "--- Dev ---",
+            _task_summary(task_dev)[:400],
+        ])
+        send_telegram_message(summary)
+    except Exception as exc:
+        print(f"[api-sentinel] cycle summary failed (crew run itself was unaffected): {exc}")
+
+
 if __name__ == "__main__":
     print("[api-sentinel] Autonomous Loop Started (Anthropic Claude)...")
     crew.kickoff()
     print("[api-sentinel] Execution finished.")
+    send_cycle_summary()

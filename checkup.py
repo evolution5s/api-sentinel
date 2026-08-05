@@ -616,6 +616,30 @@ def test_open_pull_request_requires_token():
             os.environ["GITHUB_TOKEN"] = had_token
 
 
+# --- tools.py: cycle notification -------------------------------------------
+
+def test_send_telegram_message_skips_without_credentials():
+    had_token = os.environ.pop("TELEGRAM_BOT_TOKEN", None)
+    had_chat = os.environ.pop("TELEGRAM_CHAT_ID", None)
+    try:
+        tools.send_telegram_message("test")  # must not raise
+    finally:
+        if had_token is not None:
+            os.environ["TELEGRAM_BOT_TOKEN"] = had_token
+        if had_chat is not None:
+            os.environ["TELEGRAM_CHAT_ID"] = had_chat
+
+
+def test_send_telegram_message_degrades_gracefully_on_bad_token():
+    os.environ["TELEGRAM_BOT_TOKEN"] = "invalid-token-for-checkup"
+    os.environ["TELEGRAM_CHAT_ID"] = "0"
+    try:
+        tools.send_telegram_message("test")  # real network call, bad token -> must not raise
+    finally:
+        os.environ.pop("TELEGRAM_BOT_TOKEN", None)
+        os.environ.pop("TELEGRAM_CHAT_ID", None)
+
+
 def test_sync_signups_from_github_via_read_state():
     reset_state()
     state = json.loads(tools.read_state.run())
@@ -668,6 +692,16 @@ def test_growth_dev_tools():
 def test_channel_strategy_task_assigned_to_ceo():
     assert crew.task_channel_strategy.agent is crew.ceo_agent
     assert crew.crew.tasks[0] is crew.task_channel_strategy
+
+
+def test_send_cycle_summary_never_raises_without_a_crew_run():
+    reset_state()
+    had_token = os.environ.pop("TELEGRAM_BOT_TOKEN", None)
+    try:
+        crew.send_cycle_summary()  # no kickoff() happened; task.output is None on every task
+    finally:
+        if had_token is not None:
+            os.environ["TELEGRAM_BOT_TOKEN"] = had_token
 
 
 def main():
