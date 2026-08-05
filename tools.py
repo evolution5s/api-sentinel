@@ -30,6 +30,7 @@ REQUIRED_HYPOTHESIS_FIELDS = {
 }
 CHANNEL_STATUSES = {"not_tested", "bench", "testing", "retired"}
 MAX_CHANNELS_TESTING = 3
+MAX_TOTAL_CHANNELS = 20
 REQUIRED_CHANNEL_FIELDS = {"id", "name", "category", "is_paid", "impact_score", "confidence_score"}
 
 
@@ -416,6 +417,13 @@ def write_channel(channel: str, reason: str = "") -> str:
     now = datetime.now(timezone.utc).isoformat()
 
     if existing_index is None:
+        if len(channels) >= MAX_TOTAL_CHANNELS:
+            return json.dumps({
+                "error": f"roster already has {len(channels)} channels (max {MAX_TOTAL_CHANNELS}) - "
+                         "work with the existing candidates (read_channels) instead of brainstorming "
+                         "more; if this is a retry after an earlier error, the roster from that "
+                         "earlier attempt is very likely already there"
+            })
         missing = REQUIRED_CHANNEL_FIELDS - patch.keys()
         if missing:
             return json.dumps({"error": f"new channel missing required fields: {sorted(missing)}"})

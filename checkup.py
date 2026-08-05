@@ -395,6 +395,26 @@ def test_write_channel_create_defaults_not_tested():
     assert entry["status_history"][0]["to"] == "not_tested"
 
 
+def test_write_channel_total_roster_cap_enforced():
+    reset_state()
+    for i in range(tools.MAX_TOTAL_CHANNELS - 1):  # reset_state already seeded 1 ("reddit")
+        tools.write_channel.run(channel=json.dumps({
+            "id": f"candidate_{i}", "name": f"Candidate {i}", "category": "content_marketing",
+            "is_paid": False, "impact_score": 3, "confidence_score": 3,
+        }))
+    assert len(json.loads(tools.read_channels.run())) == tools.MAX_TOTAL_CHANNELS
+    result = json.loads(tools.write_channel.run(channel=json.dumps({
+        "id": "one_too_many", "name": "One Too Many", "category": "seo",
+        "is_paid": False, "impact_score": 1, "confidence_score": 1,
+    })))
+    assert "error" in result and "max 20" in result["error"]
+    # updating an existing channel must still work even when the roster is full
+    result = json.loads(tools.write_channel.run(
+        channel=json.dumps({"id": "reddit", "status": "bench"}), reason="still allowed at cap",
+    ))
+    assert result.get("ok") is True
+
+
 def test_write_channel_testing_cap_enforced():
     reset_state()  # "reddit" already testing from reset_state
     _seed_testing_channel("discord")

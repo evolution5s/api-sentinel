@@ -43,6 +43,7 @@ growth_agent = Agent(
     ),
     llm=claude_llm,
     tools=[request_approval, read_channel_metrics, read_channels],
+    max_iter=30,
     verbose=True,
 )
 
@@ -56,6 +57,7 @@ dev_agent = Agent(
     ),
     llm=claude_llm,
     tools=[open_pull_request],
+    max_iter=15,
     verbose=True,
 )
 
@@ -81,6 +83,7 @@ ceo_agent = Agent(
         check_escalation, compare_channel_performance, request_approval,
         read_channels, write_channel,
     ],
+    max_iter=50,
     verbose=True,
 )
 
@@ -96,7 +99,16 @@ task_channel_strategy = Task(
         "1) Call read_channels() to see the current roster. If it's empty, "
         "brainstorm a first set of candidate channels for this niche "
         "(Freqtrade/CCXT quant-bot users) and write each one with "
-        "write_channel: id, name, a category (e.g. community_marketing, "
+        "write_channel. If it already has entries - including a partial set "
+        "from an earlier interrupted attempt - do NOT brainstorm a fresh "
+        "batch from scratch: work with what's already there (it persists "
+        "across retries), fill in any channel that's missing required "
+        "fields, and only add genuinely new candidates if the existing set "
+        "is thin. Near-duplicate entries waste roster slots (capped at 20 "
+        "total) and confuse the performance comparison later - check "
+        "read_channels() output for something close to what you're about "
+        "to add before creating it. For each new channel: id, name, a "
+        "category (e.g. community_marketing, "
         "engineering_as_marketing, content_marketing, existing_platforms, "
         "unconventional_pr, seo, paid_ads - a starting point, not an "
         "exhaustive list; Bullseye lists 19 possible channels, use whichever "
@@ -256,16 +268,22 @@ def _task_summary(task: Task) -> str:
         return f"(Output nicht lesbar: {exc})"
 
 
-def send_cycle_summary() -> None:
+def send_cycle_summary(kickoff_error: Exception = None) -> None:
     """Post a what-happened/what's-next digest of this cycle to Telegram.
-    Called once after kickoff() finishes - never gates or delays the crew
-    run itself, and never raises (a failed notification must not look like
-    a failed cycle).
+    Called once after kickoff() finishes (or fails) - never raises itself,
+    so a broken notification never masks whatever kickoff() already did or
+    didn't do. If kickoff_error is set, that's reported up front instead of
+    being silently swallowed - a hard crew failure must still reach Telegram,
+    not just Railway's logs, since that's the only place a human reliably
+    sees it.
     """
     try:
         pending = json.loads(read_state.run()).get("pending_approvals", "?")
-        summary = "\n".join([
-            f"API Sentinel Zyklus - {datetime.now(timezone.utc).isoformat()}",
+        lines = [f"API Sentinel Zyklus - {datetime.now(timezone.utc).isoformat()}"]
+        if kickoff_error is not None:
+            lines.append(f"WARNUNG: Der Crew-Lauf ist fehlgeschlagen: {kickoff_error}")
+            lines.append("Nachfolgende Tasks haben moeglicherweise nicht mehr gelaufen.")
+        lines += [
             f"Offene Freigaben (approve.py): {pending}",
             "",
             "--- Channel-Strategie ---",
@@ -279,14 +297,18 @@ def send_cycle_summary() -> None:
             "",
             "--- Dev ---",
             _task_summary(task_dev)[:400],
-        ])
-        send_telegram_message(summary)
+        ]
+        send_telegram_message("\n".join(lines))
     except Exception as exc:
         print(f"[api-sentinel] cycle summary failed (crew run itself was unaffected): {exc}")
 
 
 if __name__ == "__main__":
     print("[api-sentinel] Autonomous Loop Started (Anthropic Claude)...")
-    crew.kickoff()
-    print("[api-sentinel] Execution finished.")
-    send_cycle_summary()
+    try:
+        crew.kickoff()
+        print("[api-sentinel] Execution finished.")
+        send_cycle_summary()
+    except Exception as exc:
+        print(f"[api-sentinel] crew.kickoff() failed: {exc}")
+        send_cycle_summary(kickoff_error=exc)
