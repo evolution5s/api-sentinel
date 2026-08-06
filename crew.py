@@ -468,14 +468,19 @@ def _usage_line() -> str:
         "total_tokens": getattr(metrics, "total_tokens", None),
         "prompt_tokens": getattr(metrics, "prompt_tokens", None),
         "cached_prompt_tokens": getattr(metrics, "cached_prompt_tokens", None),
+        "cache_creation_tokens": getattr(metrics, "cache_creation_tokens", None),
         "completion_tokens": getattr(metrics, "completion_tokens", None),
         "successful_requests": getattr(metrics, "successful_requests", None),
     }
     log_cycle_usage(usage)
     return (
         f"LLM-Nutzung diesen Zyklus: {usage['total_tokens']} tokens gesamt "
-        f"({usage['prompt_tokens']} prompt, {usage['completion_tokens']} completion, "
-        f"davon {usage['cached_prompt_tokens']} prompt-tokens aus dem Cache), "
+        f"({usage['prompt_tokens']} prompt, {usage['completion_tokens']} completion), "
+        f"Prompt-Cache: {usage['cached_prompt_tokens']} tokens gelesen "
+        f"(guenstig), {usage['cache_creation_tokens']} tokens neu geschrieben "
+        f"(teurer, einmalig pro Cache-Fenster) - CrewAI cached role/goal/"
+        f"backstory + Tool-Definitionen pro Agent automatisch, sobald der "
+        f"gemeinsame Praefix (Tools+System) das Modell-Minimum erreicht; "
         f"{usage['successful_requests']} Requests, max_tokens/Call: "
         f"Growth={growth_llm.max_tokens} Dev={dev_llm.max_tokens} "
         f"Sub-CEO={ceo_llm.max_tokens} Main-CEO={main_ceo_llm.max_tokens}"
