@@ -42,19 +42,42 @@ ANTHROPIC_KEY = os.getenv("ANTHROPIC_API_KEY")
 if not ANTHROPIC_KEY:
     print("[Error] ANTHROPIC_API_KEY fehlt in den Railway Environment Variables!")
 
-# Anthropic Claude Sonnet 5 als dediziertes LLM definieren.
-# max_tokens wird bewusst explizit gesetzt statt sich auf den Library-Default
-# zu verlassen (aktuell 4096 in crewai's nativer Anthropic-Completion-Klasse) -
-# damit ein kuenftiges crewai/litellm-Upgrade diesen Wert nicht stillschweigend
-# aendern kann. 4096 deckt die tatsaechlichen Task-Outputs dieses Crews
-# (siehe expected_output unten, <2000 Zeichen) komfortabel ab.
-LLM_MAX_TOKENS = 4096
+# Anthropic Claude Sonnet 5 - pro Agent ein eigenes LLM mit eigenem max_tokens
+# statt eines geteilten Werts fuer alle vier, weil die Agenten sich stark
+# darin unterscheiden, wie viel sie tatsaechlich zu sagen haben:
+#   - Sub-CEO/Main-CEO: echte Abwaegung (Hypothesen-Verdikte, Channel-Wahl,
+#     Pivot-Entscheidungen) - bekommt mehr Budget und darf denken.
+#   - Growth/Dev: mechanisches Reporting bzw. Content-Generierung nach
+#     Vorgabe des CEO-Reports - kleineres, vorhersagbares Budget, kein
+#     Denken noetig.
+#
+# max_tokens ist bei Claude Sonnet 5 eine gemeinsame Obergrenze fuer
+# Denken + sichtbare Antwort - zu knapp bemessen kann das Denken das
+# Budget auffressen und die eigentliche Antwort abschneiden (stop_reason
+# "max_tokens"), ohne dass das wie ein Fehler aussieht.
+#
+# thinking-Konfiguration - verifiziert gegen die tatsaechlich installierte
+# crewai-Version (1.15.9 lokal, 1.15.11 gepinnt in requirements.txt, beide
+# geprueft): AnthropicThinkingConfig.type ist dort ein Literal["enabled",
+# "disabled"] - "adaptive" (Sonnet 5s tatsaechlicher On-Modus laut
+# Anthropic) wird von crewai's eigener Pydantic-Validierung abgelehnt,
+# noch bevor ein API-Call passiert. "enabled" wuerde zwar crewai passieren,
+# aber bei Sonnet 5 serverseitig mit 400 abgelehnt werden (budget_tokens
+# ist fuer dieses Modell entfernt, nur "adaptive" ist der gueltige
+# On-Modus). Deshalb:
+#   - Denken AN (Sub-CEO/Main-CEO): thinking gar nicht setzen - Sonnet 5
+#     laeuft dann laut Anthropic-Doku bereits automatisch adaptiv. Das ist
+#     inhaltlich identisch zu einem expliziten "adaptive", nur eben nicht
+#     explizit im Code ausdrueckbar mit dieser crewai-Version.
+#   - Denken AUS (Growth/Dev): thinking={"type": "disabled"} - das ist bei
+#     Sonnet 5 ein gueltiger, von crewai unterstuetzter Wert.
+_ANTHROPIC_KWARGS = {"model": "anthropic/claude-sonnet-5", "api_key": ANTHROPIC_KEY}
+_THINKING_DISABLED = {"type": "disabled"}
 
-claude_llm = LLM(
-    model="anthropic/claude-sonnet-5",
-    api_key=ANTHROPIC_KEY,
-    max_tokens=LLM_MAX_TOKENS,
-)
+growth_llm = LLM(max_tokens=1500, thinking=_THINKING_DISABLED, **_ANTHROPIC_KWARGS)
+dev_llm = LLM(max_tokens=8000, thinking=_THINKING_DISABLED, **_ANTHROPIC_KWARGS)
+ceo_llm = LLM(max_tokens=8000, **_ANTHROPIC_KWARGS)
+main_ceo_llm = LLM(max_tokens=4000, **_ANTHROPIC_KWARGS)
 
 # Agents mit dem Claude-LLM konfigurieren.
 # Pro Agent gesetzte Kappungen gegen Budget-Ausreisser in einem einzelnen
@@ -78,7 +101,7 @@ growth_agent = Agent(
         "- every piece of content goes through request_approval first, and "
         "every reach number comes from read_channel_metrics, never a guess."
     ),
-    llm=claude_llm,
+    llm=growth_llm,
     tools=[request_approval, read_channel_metrics, read_channels],
     max_iter=30,
     max_execution_time=600,
@@ -94,7 +117,7 @@ dev_agent = Agent(
         "anything live itself. That step is always a separate, human-approved "
         "action."
     ),
-    llm=claude_llm,
+    llm=dev_llm,
     tools=[open_pull_request],
     max_iter=15,
     max_execution_time=300,
@@ -126,7 +149,7 @@ ceo_agent = Agent(
         "another subsidiary's Sub-CEO directly - that always goes through "
         "the Main-CEO (file_cross_subsidiary_request)."
     ),
-    llm=claude_llm,
+    llm=ceo_llm,
     tools=[
         read_state, read_hypotheses, write_hypothesis, evaluate_hypothesis,
         check_escalation, compare_channel_performance, request_approval,
@@ -159,7 +182,7 @@ main_ceo_agent = Agent(
         "register_subsidiary itself enforces this, but the same discipline "
         "applies to every judgment call this role makes."
     ),
-    llm=claude_llm,
+    llm=main_ceo_llm,
     tools=[
         read_subsidiaries, register_subsidiary, set_subsidiary_status,
         read_pivot_proposals, decide_pivot_proposal,
@@ -453,7 +476,9 @@ def _usage_line() -> str:
         f"LLM-Nutzung diesen Zyklus: {usage['total_tokens']} tokens gesamt "
         f"({usage['prompt_tokens']} prompt, {usage['completion_tokens']} completion, "
         f"davon {usage['cached_prompt_tokens']} prompt-tokens aus dem Cache), "
-        f"{usage['successful_requests']} Requests, max_tokens/Call={LLM_MAX_TOKENS}"
+        f"{usage['successful_requests']} Requests, max_tokens/Call: "
+        f"Growth={growth_llm.max_tokens} Dev={dev_llm.max_tokens} "
+        f"Sub-CEO={ceo_llm.max_tokens} Main-CEO={main_ceo_llm.max_tokens}"
     )
 
 
