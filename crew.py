@@ -42,13 +42,33 @@ ANTHROPIC_KEY = os.getenv("ANTHROPIC_API_KEY")
 if not ANTHROPIC_KEY:
     print("[Error] ANTHROPIC_API_KEY fehlt in den Railway Environment Variables!")
 
-# Anthropic Claude Sonnet 5 als dediziertes LLM definieren
+# Anthropic Claude Sonnet 5 als dediziertes LLM definieren.
+# max_tokens wird bewusst explizit gesetzt statt sich auf den Library-Default
+# zu verlassen (aktuell 4096 in crewai's nativer Anthropic-Completion-Klasse) -
+# damit ein kuenftiges crewai/litellm-Upgrade diesen Wert nicht stillschweigend
+# aendern kann. 4096 deckt die tatsaechlichen Task-Outputs dieses Crews
+# (siehe expected_output unten, <2000 Zeichen) komfortabel ab.
+LLM_MAX_TOKENS = 4096
+
 claude_llm = LLM(
     model="anthropic/claude-sonnet-5",
-    api_key=ANTHROPIC_KEY
+    api_key=ANTHROPIC_KEY,
+    max_tokens=LLM_MAX_TOKENS,
 )
 
-# Agents mit dem Claude-LLM konfigurieren
+# Agents mit dem Claude-LLM konfigurieren.
+# Pro Agent gesetzte Kappungen gegen Budget-Ausreisser in einem einzelnen
+# Cron-Lauf (verifiziert gegen die tatsaechlich installierte crewai-Version
+# 1.15.9 - siehe Agent.model_fields, nicht angenommen):
+#   - max_iter: bereits vorhanden, unveraendert - harte Obergrenze fuer
+#     Tool-Aufrufe/Denkschritte einer einzelnen Task.
+#   - max_execution_time (neu, Sekunden): harte Wall-Clock-Grenze pro Task -
+#     faengt Faelle ab, in denen wenige, aber sehr lange/teure Schritte
+#     (nicht viele kleine) das Budget sprengen wuerden. Ein Ueberschreiten
+#     wirft TimeoutError, das crew.kickoff() nach oben durchreicht und vom
+#     bestehenden kickoff_error-Pfad in send_cycle_summary() gemeldet wird.
+#   - max_rpm (neu): zusaetzliches Sicherheitsnetz gegen einen Agenten, der
+#     in kurzer Zeit ungewoehnlich viele Requests abfeuert.
 growth_agent = Agent(
     role="Growth Engine / Dev Relations",
     goal="Draft content matching the currently active hypothesis and measure real reach after it's approved and posted",
@@ -61,6 +81,8 @@ growth_agent = Agent(
     llm=claude_llm,
     tools=[request_approval, read_channel_metrics, read_channels],
     max_iter=30,
+    max_execution_time=600,
+    max_rpm=20,
     verbose=True,
 )
 
@@ -75,6 +97,8 @@ dev_agent = Agent(
     llm=claude_llm,
     tools=[open_pull_request],
     max_iter=15,
+    max_execution_time=300,
+    max_rpm=20,
     verbose=True,
 )
 
@@ -110,6 +134,8 @@ ceo_agent = Agent(
         file_pivot_proposal, file_cross_subsidiary_request, search_research_archive,
     ],
     max_iter=50,
+    max_execution_time=900,
+    max_rpm=20,
     verbose=True,
 )
 
@@ -141,8 +167,32 @@ main_ceo_agent = Agent(
         search_research_archive, request_approval,
     ],
     max_iter=25,
+    max_execution_time=600,
+    max_rpm=20,
     verbose=True,
 )
+
+# --------------------------------------------------------------------------
+# max_iter-Watchdog: CrewAI wirft beim Erreichen von max_iter keine
+# Exception und feuert dafuer auch kein Event - es haengt intern still ein
+# "gib jetzt deine beste finale Antwort" an und macht weiter (siehe
+# handle_max_iterations_exceeded in crewai.utilities.agent_utils). Ohne
+# diesen Watchdog wuerde ein wiederholt an sein Limit stossender Agent
+# also nie auffallen. Task.callback feuert einmal pro Task-Abschluss, zu
+# dem Zeitpunkt spiegelt agent.agent_executor.iterations noch exakt die
+# Iterationszahl dieser einen Task wider (wird erst bei der naechsten
+# Task-Ausfuehrung des Agenten auf 0 zurueckgesetzt).
+# --------------------------------------------------------------------------
+_limit_hits: list[str] = []
+
+
+def _make_iteration_watchdog(agent: Agent, label: str):
+    def _watchdog(_output):
+        executor = agent.agent_executor
+        if executor is not None and executor.iterations >= agent.max_iter:
+            _limit_hits.append(f"{label}: max_iter-Kappe ({agent.max_iter}) erreicht, finale Antwort erzwungen")
+    return _watchdog
+
 
 # Tasks definieren
 task_channel_strategy = Task(
@@ -220,6 +270,7 @@ task_channel_strategy = Task(
         "cycle with their reasons. The final list of channels now "
         "status='testing' (<=3) for this cycle's hypothesis work to pick from."
     ),
+    callback=_make_iteration_watchdog(ceo_agent, "Sub-CEO (Channel-Strategie)"),
 )
 
 task_growth = Task(
@@ -250,6 +301,7 @@ task_growth = Task(
         "Per active hypothesis: estimated_reach, reach_source, fetch_note if any. "
         "Plus a short cross-platform format comparison for the CEO to weigh."
     ),
+    callback=_make_iteration_watchdog(growth_agent, "Growth"),
 )
 
 task_ceo = Task(
@@ -311,6 +363,7 @@ task_ceo = Task(
         "follow-up hypothesis started, and any pending approval or escalation "
         "filed. Pending Dev work (new variant needed or not) stated plainly."
     ),
+    callback=_make_iteration_watchdog(ceo_agent, "Sub-CEO (Build-Measure-Learn)"),
 )
 
 task_main_ceo_review = Task(
@@ -352,6 +405,7 @@ task_main_ceo_review = Task(
         "Cross-subsidiary requests resolved (if any). Current subsidiary "
         "registry summary. Any request_approval filed for board sign-off."
     ),
+    callback=_make_iteration_watchdog(main_ceo_agent, "Main-CEO"),
 )
 
 task_dev = Task(
@@ -365,6 +419,7 @@ task_dev = Task(
     ),
     agent=dev_agent,
     expected_output="PR URL if one was opened, or a note that no variant was needed this cycle.",
+    callback=_make_iteration_watchdog(dev_agent, "Dev"),
 )
 
 # Crew instanziieren
@@ -386,10 +441,20 @@ def _usage_line() -> str:
     metrics = getattr(crew, "usage_metrics", None)
     if metrics is None:
         return "LLM-Nutzung: nicht verfuegbar"
-    total_tokens = getattr(metrics, "total_tokens", None)
-    requests = getattr(metrics, "successful_requests", None)
-    log_cycle_usage({"total_tokens": total_tokens, "successful_requests": requests})
-    return f"LLM-Nutzung diesen Zyklus: {total_tokens} tokens, {requests} requests"
+    usage = {
+        "total_tokens": getattr(metrics, "total_tokens", None),
+        "prompt_tokens": getattr(metrics, "prompt_tokens", None),
+        "cached_prompt_tokens": getattr(metrics, "cached_prompt_tokens", None),
+        "completion_tokens": getattr(metrics, "completion_tokens", None),
+        "successful_requests": getattr(metrics, "successful_requests", None),
+    }
+    log_cycle_usage(usage)
+    return (
+        f"LLM-Nutzung diesen Zyklus: {usage['total_tokens']} tokens gesamt "
+        f"({usage['prompt_tokens']} prompt, {usage['completion_tokens']} completion, "
+        f"davon {usage['cached_prompt_tokens']} prompt-tokens aus dem Cache), "
+        f"{usage['successful_requests']} Requests, max_tokens/Call={LLM_MAX_TOKENS}"
+    )
 
 
 def send_cycle_summary(kickoff_error: Exception = None) -> None:
@@ -411,6 +476,11 @@ def send_cycle_summary(kickoff_error: Exception = None) -> None:
         lines += [
             _usage_line(),
             f"Offene Freigaben (approve.py): {pending}",
+        ]
+        if _limit_hits:
+            lines.append("WARNUNG: Sicherheitslimits diesen Zyklus ausgeloest:")
+            lines.extend(f"- {hit}" for hit in _limit_hits)
+        lines += [
             "",
             "--- Channel-Strategie ---",
             _task_summary(task_channel_strategy)[:1200],
