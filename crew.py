@@ -84,10 +84,14 @@ if not ANTHROPIC_KEY:
 # Sub-CEO/Main-CEO war das immer schon die Absicht; fuer Growth/Dev
 # verliert das den zuvor angestrebten "kein Denken noetig"-Sparvorteil,
 # aber ein zuverlaessig laufender Cron-Job hat Vorrang vor der
-# Fein-Optimierung.
+# Fein-Optimierung. Growth's max_tokens wurde deshalb von 1500 auf 3000
+# angehoben - bei 1500 UND jetzt zwangsweise aktivem Thinking ist die
+# Gefahr real, dass Denken das Budget auffrisst und die sichtbare Antwort
+# abschneidet (stop_reason "max_tokens"), ohne dass das wie ein Fehler
+# aussieht.
 _ANTHROPIC_KWARGS = {"model": "anthropic/claude-sonnet-5", "api_key": ANTHROPIC_KEY}
 
-growth_llm = LLM(max_tokens=1500, **_ANTHROPIC_KWARGS)
+growth_llm = LLM(max_tokens=3000, **_ANTHROPIC_KWARGS)
 dev_llm = LLM(max_tokens=8000, **_ANTHROPIC_KWARGS)
 ceo_llm = LLM(max_tokens=8000, **_ANTHROPIC_KWARGS)
 main_ceo_llm = LLM(max_tokens=4000, **_ANTHROPIC_KWARGS)
@@ -115,7 +119,7 @@ growth_agent = Agent(
         "every reach number comes from read_channel_metrics, never a guess."
     ),
     llm=growth_llm,
-    tools=[request_approval, read_channel_metrics, read_channels],
+    tools=[request_approval, read_channel_metrics, read_channels, read_state, read_hypotheses],
     max_iter=30,
     max_execution_time=600,
     max_rpm=20,
@@ -343,6 +347,19 @@ task_growth = Task(
 task_ceo = Task(
     description=(
         "Run the Build-Measure-Learn loop: "
+        "0) Call read_state() first. If total_hypotheses is 0 (nothing has "
+        "ever been written - the very first cycle ever, before any "
+        "hypothesis existed to evaluate or follow up on), the loop has "
+        "nothing to start from yet: formulate and write exactly one initial "
+        "hypothesis via write_hypothesis to actually kick it off. Pick a "
+        "channel from whichever the channel-strategy step above left as "
+        "status='testing', size it with the same judgment you'd apply to "
+        "any hypothesis (a concrete statement, category, "
+        "landing_page_variant_id, failure_rate, success_rate, duration_days), "
+        "and leave prior_hypothesis_id/prior_score unset since it has no "
+        "predecessor. This step only ever fires once, when the system is "
+        "completely empty - once any hypothesis exists, new ones only ever "
+        "come from step 6 below as follow-ups to an evaluated one. "
         "1) Call read_hypotheses(status='active') and find any hypothesis "
         "whose duration_days has elapsed since created_at. "
         "2) For each due hypothesis, first make sure measured.reach_estimate "

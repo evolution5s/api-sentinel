@@ -1072,7 +1072,9 @@ def test_main_ceo_agent_tools_match_spec():
 
 
 def test_growth_dev_tools():
-    assert {t.name for t in crew.growth_agent.tools} == {"request_approval", "read_channel_metrics", "read_channels"}
+    assert {t.name for t in crew.growth_agent.tools} == {
+        "request_approval", "read_channel_metrics", "read_channels", "read_state", "read_hypotheses",
+    }
     assert {t.name for t in crew.dev_agent.tools} == {"open_pull_request"}
 
 
