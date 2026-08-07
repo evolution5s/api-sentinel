@@ -1350,6 +1350,82 @@ def test_set_and_read_strategic_direction_returns_latest():
     assert result["direction"]["focus_area"] == "hold off on paid channels"
 
 
+# --- crewai_patches.py: max_iter force-final-answer 400 fix ----------------
+
+def test_max_iterations_patch_uses_user_role_not_assistant():
+    from crewai.agents.crew_agent_executor import handle_max_iterations_exceeded
+    from crewai.agents.parser import AgentFinish
+
+    class _FakePrinter:
+        def print(self, content, color=None):
+            pass
+
+    class _FakeLLM:
+        def call(self, messages, callbacks=None):
+            assert messages[-1]["role"] == "user", (
+                f"expected the forced-final-answer message to be role='user' "
+                f"(Anthropic rejects a conversation ending on 'assistant' as an "
+                f"unsupported prefill), got '{messages[-1]['role']}'"
+            )
+            return "Final Answer: forced"
+
+    messages = [{"role": "user", "content": "do the task"}]
+    result = handle_max_iterations_exceeded(
+        formatted_answer=AgentFinish(thought="t", output="partial", text="partial"),
+        printer=_FakePrinter(),
+        messages=messages,
+        llm=_FakeLLM(),
+        callbacks=[],
+        verbose=False,
+    )
+    assert isinstance(result, AgentFinish)
+    assert messages[-1]["role"] == "user"
+
+
+def test_max_iterations_patch_applied_in_both_known_modules():
+    import crewai.agents.crew_agent_executor as cae
+    import crewai.experimental.agent_executor as eae
+    # both modules import the name directly, so both need patching independently
+    assert cae.handle_max_iterations_exceeded is eae.handle_max_iterations_exceeded
+
+
+# --- agent_profile.json: model/token/iteration profile toggle --------------
+
+def test_agent_profile_file_has_both_profiles_fully_specified():
+    with open(crew._AGENT_PROFILE_FILE, encoding="utf-8") as f:
+        config = json.load(f)
+    assert config["active_profile"] in config["profiles"]
+    for name, profile in config["profiles"].items():
+        assert "model" in profile and "cycle_token_budget" in profile, name
+        for role in ("growth", "dev", "sub_ceo", "main_ceo"):
+            agent_cfg = profile["agents"][role]
+            for key in ("max_tokens", "max_iter", "max_execution_time"):
+                assert isinstance(agent_cfg[key], int) and agent_cfg[key] > 0, (name, role, key)
+
+
+def test_load_agent_profile_returns_the_active_one():
+    profile = crew._load_agent_profile()
+    with open(crew._AGENT_PROFILE_FILE, encoding="utf-8") as f:
+        config = json.load(f)
+    assert profile["name"] == config["active_profile"]
+    assert profile["model"] == config["profiles"][config["active_profile"]]["model"]
+
+
+def test_agents_are_configured_from_the_active_profile():
+    profile = crew.AGENT_PROFILE
+    assert crew.growth_llm.max_tokens == profile["agents"]["growth"]["max_tokens"]
+    assert crew.dev_llm.max_tokens == profile["agents"]["dev"]["max_tokens"]
+    assert crew.ceo_llm.max_tokens == profile["agents"]["sub_ceo"]["max_tokens"]
+    assert crew.main_ceo_llm.max_tokens == profile["agents"]["main_ceo"]["max_tokens"]
+    assert crew.growth_agent.max_iter == profile["agents"]["growth"]["max_iter"]
+    assert crew.dev_agent.max_iter == profile["agents"]["dev"]["max_iter"]
+    assert crew.ceo_agent.max_iter == profile["agents"]["sub_ceo"]["max_iter"]
+    assert crew.main_ceo_agent.max_iter == profile["agents"]["main_ceo"]["max_iter"]
+    assert crew.CYCLE_TOKEN_BUDGET == profile["cycle_token_budget"]
+    for llm in (crew.growth_llm, crew.dev_llm, crew.ceo_llm, crew.main_ceo_llm):
+        assert llm.model == profile["model"]
+
+
 # --- crew.py: construction sanity (no kickoff, no API calls) ---------------
 
 def test_crew_has_four_agents_and_five_tasks():

@@ -1,0 +1,27 @@
+{
+  "active_profile": "testing",
+  "profiles": {
+    "testing": {
+      "description": "Minimal-cost functional check while still in testing - cheapest model, small token/iteration caps. This is for verifying the crew still runs end to end, not for judging output quality. Switch active_profile back to 'normal' once done.",
+      "model": "claude-haiku-4-5",
+      "cycle_token_budget": 50000,
+      "agents": {
+        "growth": {"max_tokens": 500, "max_iter": 6, "max_execution_time": 120},
+        "dev": {"max_tokens": 500, "max_iter": 4, "max_execution_time": 90},
+        "sub_ceo": {"max_tokens": 800, "max_iter": 15, "max_execution_time": 240},
+        "main_ceo": {"max_tokens": 500, "max_iter": 6, "max_execution_time": 120}
+      }
+    },
+    "normal": {
+      "description": "Production settings - Claude Sonnet 5, tuned for real hypothesis-testing quality and Build-Measure-Learn work.",
+      "model": "claude-sonnet-5",
+      "cycle_token_budget": 1000000,
+      "agents": {
+        "growth": {"max_tokens": 3000, "max_iter": 30, "max_execution_time": 600},
+        "dev": {"max_tokens": 8000, "max_iter": 15, "max_execution_time": 300},
+        "sub_ceo": {"max_tokens": 8000, "max_iter": 50, "max_execution_time": 900},
+        "main_ceo": {"max_tokens": 4000, "max_iter": 25, "max_execution_time": 600}
+      }
+    }
+  }
+}

@@ -1,9 +1,20 @@
 import json
 import os
 from datetime import datetime, timezone
+from pathlib import Path
 
 from crewai import Agent, Crew, Process, Task, LLM
 from crewai.tasks.conditional_task import ConditionalTask
+
+import crewai_patches
+
+# Muss vor jeder Agent/Task-Konstruktion passieren, insbesondere vor dem
+# ersten crew.kickoff() - siehe crewai_patches.py: crewai wirft einen
+# "assistant message prefill"-400 (Anthropic lehnt jede Conversation ab,
+# die auf einer assistant-Nachricht endet) IMMER, wenn ein Agent sein
+# max_iter tatsaechlich erreicht - kein Rand-, sondern der Normalfall,
+# sobald ein Cap wirklich mal greift. Reproduziert in Produktion.
+crewai_patches.apply_patches()
 
 from tools import (
     check_approval_status,
@@ -56,56 +67,43 @@ ANTHROPIC_KEY = os.getenv("ANTHROPIC_API_KEY")
 if not ANTHROPIC_KEY:
     print("[Error] ANTHROPIC_API_KEY fehlt in den Railway Environment Variables!")
 
-# Anthropic Claude Sonnet 5 - pro Agent ein eigenes LLM mit eigenem max_tokens
-# statt eines geteilten Werts fuer alle vier, weil die Agenten sich stark
-# darin unterscheiden, wie viel sie tatsaechlich zu sagen haben:
-#   - Sub-CEO/Main-CEO: echte Abwaegung (Hypothesen-Verdikte, Channel-Wahl,
-#     Pivot-Entscheidungen) - bekommt mehr Budget und darf denken.
-#   - Growth/Dev: mechanisches Reporting bzw. Content-Generierung nach
-#     Vorgabe des CEO-Reports - kleineres, vorhersagbares Budget, kein
-#     Denken noetig.
+# --------------------------------------------------------------------------
+# Agent-Profil (Modell + Token-/Iterations-/Zeit-Kappen pro Agent) kommt aus
+# agent_profile.json statt hier hartcodiert zu sein - siehe die Datei selbst
+# fuer die "testing"/"normal"-Profile. Zum Zurueckwechseln auf die normalen
+# Einstellungen einfach active_profile in dieser Datei auf "normal" setzen
+# und neu deployen - kein Code-Aenderung noetig.
 #
-# max_tokens ist bei Claude Sonnet 5 eine gemeinsame Obergrenze fuer
-# Denken + sichtbare Antwort - zu knapp bemessen kann das Denken das
-# Budget auffressen und die eigentliche Antwort abschneiden (stop_reason
-# "max_tokens"), ohne dass das wie ein Fehler aussieht.
-#
-# thinking-Konfiguration - verifiziert gegen die tatsaechlich installierte
-# crewai-Version (1.15.9 lokal, 1.15.11 gepinnt in requirements.txt, beide
-# geprueft): AnthropicThinkingConfig.type ist dort ein Literal["enabled",
-# "disabled"] - "adaptive" (Sonnet 5s tatsaechlicher On-Modus laut
-# Anthropic) wird von crewai's eigener Pydantic-Validierung abgelehnt,
-# noch bevor ein API-Call passiert.
-#
-# thinking={"type": "disabled"} wurde hier bewusst wieder entfernt - das
-# war die Ursache des "thinking.disabled.budget_tokens: Extra inputs are
-# not permitted"-Fehlers, der jeden Cron-Lauf abgebrochen hat.
-# Root Cause verifiziert: AnthropicThinkingConfig(type="disabled")
-# .model_dump() liefert IMMER {"type": "disabled", "budget_tokens": None}
-# mit, und crewai's _prepare_completion_params() serialisiert das ohne
-# exclude_none=True in den API-Call - Anthropic lehnt budget_tokens als
-# Feld unter type="disabled" komplett ab, auch als null. Ueber den
-# oeffentlichen thinking=-Parameter laesst sich das nicht umgehen, da
-# Pydantic jeden Input in genau dieses Modell validiert. Das ist ein
-# crewai-Bug (bestaetigt in 1.15.9 und 1.15.11), keine Fehlkonfiguration
-# hier - ein Upstream-Report waere angebracht.
-#
-# Konsequenz: thinking bleibt fuer alle vier Agenten unGESETZT. Sonnet 5
-# laeuft dann laut Anthropic-Doku ohnehin automatisch adaptiv - fuer
-# Sub-CEO/Main-CEO war das immer schon die Absicht; fuer Growth/Dev
-# verliert das den zuvor angestrebten "kein Denken noetig"-Sparvorteil,
-# aber ein zuverlaessig laufender Cron-Job hat Vorrang vor der
-# Fein-Optimierung. Growth's max_tokens wurde deshalb von 1500 auf 3000
-# angehoben - bei 1500 UND jetzt zwangsweise aktivem Thinking ist die
-# Gefahr real, dass Denken das Budget auffrisst und die sichtbare Antwort
-# abschneidet (stop_reason "max_tokens"), ohne dass das wie ein Fehler
-# aussieht.
-_ANTHROPIC_KWARGS = {"model": "anthropic/claude-sonnet-5", "api_key": ANTHROPIC_KEY}
+# thinking bleibt bewusst fuer ALLE Agenten in JEDEM Profil ungesetzt (kein
+# thinking={"type": ...} irgendwo): Sonnet 5 laeuft dann laut Anthropic-Doku
+# automatisch adaptiv, Haiku 4.5 (ein aelteres Modell ohne adaptive-thinking-
+# Support) laeuft ohne Denken, wenn thinking nicht gesetzt ist - beide sind
+# also mit derselben Nicht-Konfiguration korrekt und minimal bedient, kein
+# Sonderfall pro Profil noetig. thinking={"type": "disabled"} wurde vor zwei
+# Commits bewusst entfernt (siehe Git-Historie) - das war die Ursache des
+# "thinking.disabled.budget_tokens: Extra inputs are not permitted"-Fehlers,
+# der jeden Cron-Lauf auf Sonnet 5 abgebrochen hat (crewai-Bug: model_dump()
+# eines "disabled"-Thinking-Configs liefert IMMER budget_tokens: None mit,
+# Anthropic lehnt das Feld unter type="disabled" komplett ab, auch als null).
+_AGENT_PROFILE_FILE = Path(__file__).parent / "agent_profile.json"
 
-growth_llm = LLM(max_tokens=3000, **_ANTHROPIC_KWARGS)
-dev_llm = LLM(max_tokens=8000, **_ANTHROPIC_KWARGS)
-ceo_llm = LLM(max_tokens=8000, **_ANTHROPIC_KWARGS)
-main_ceo_llm = LLM(max_tokens=4000, **_ANTHROPIC_KWARGS)
+
+def _load_agent_profile() -> dict:
+    with _AGENT_PROFILE_FILE.open("r", encoding="utf-8") as f:
+        config = json.load(f)
+    active = config["active_profile"]
+    return {"name": active, **config["profiles"][active]}
+
+
+AGENT_PROFILE = _load_agent_profile()
+print(f"[api-sentinel] agent_profile active: '{AGENT_PROFILE['name']}' ({AGENT_PROFILE['model']}) - {AGENT_PROFILE['description']}")
+
+_ANTHROPIC_KWARGS = {"model": f"anthropic/{AGENT_PROFILE['model']}", "api_key": ANTHROPIC_KEY}
+
+growth_llm = LLM(max_tokens=AGENT_PROFILE["agents"]["growth"]["max_tokens"], **_ANTHROPIC_KWARGS)
+dev_llm = LLM(max_tokens=AGENT_PROFILE["agents"]["dev"]["max_tokens"], **_ANTHROPIC_KWARGS)
+ceo_llm = LLM(max_tokens=AGENT_PROFILE["agents"]["sub_ceo"]["max_tokens"], **_ANTHROPIC_KWARGS)
+main_ceo_llm = LLM(max_tokens=AGENT_PROFILE["agents"]["main_ceo"]["max_tokens"], **_ANTHROPIC_KWARGS)
 
 # Agents mit dem Claude-LLM konfigurieren.
 # Pro Agent gesetzte Kappungen gegen Budget-Ausreisser in einem einzelnen
@@ -157,8 +155,8 @@ growth_agent = Agent(
         request_approval, read_channel_metrics, read_channels, read_state, read_hypotheses,
         read_task_orders, complete_task_order,
     ],
-    max_iter=30,
-    max_execution_time=600,
+    max_iter=AGENT_PROFILE["agents"]["growth"]["max_iter"],
+    max_execution_time=AGENT_PROFILE["agents"]["growth"]["max_execution_time"],
     max_rpm=20,
     max_retry_limit=1,
     verbose=True,
@@ -180,8 +178,8 @@ dev_agent = Agent(
     ),
     llm=dev_llm,
     tools=[open_pull_request, read_task_orders, complete_task_order, check_approval_status],
-    max_iter=15,
-    max_execution_time=300,
+    max_iter=AGENT_PROFILE["agents"]["dev"]["max_iter"],
+    max_execution_time=AGENT_PROFILE["agents"]["dev"]["max_execution_time"],
     max_rpm=20,
     max_retry_limit=1,
     verbose=True,
@@ -234,8 +232,8 @@ ceo_agent = Agent(
         file_status_report, read_strategic_direction,
         file_pivot_proposal, file_cross_subsidiary_request, search_research_archive,
     ],
-    max_iter=50,
-    max_execution_time=900,
+    max_iter=AGENT_PROFILE["agents"]["sub_ceo"]["max_iter"],
+    max_execution_time=AGENT_PROFILE["agents"]["sub_ceo"]["max_execution_time"],
     max_rpm=20,
     max_retry_limit=1,
     verbose=True,
@@ -280,8 +278,8 @@ main_ceo_agent = Agent(
         read_status_reports, acknowledge_status_report, set_strategic_direction,
         search_research_archive, request_approval,
     ],
-    max_iter=25,
-    max_execution_time=600,
+    max_iter=AGENT_PROFILE["agents"]["main_ceo"]["max_iter"],
+    max_execution_time=AGENT_PROFILE["agents"]["main_ceo"]["max_execution_time"],
     max_rpm=20,
     max_retry_limit=1,
     verbose=True,
@@ -327,7 +325,11 @@ def _make_iteration_watchdog(agent: Agent, label: str):
 # jedem Agenten-LLM (nicht nur den am Ende gecachten Wert) und funktioniert
 # deshalb auch mitten im Lauf zuverlaessig - verifiziert im Quellcode
 # (crewai/crew.py), nicht angenommen.
-CYCLE_TOKEN_BUDGET = 1_000_000
+#
+# Kommt aus agent_profile.json (cycle_token_budget) statt hartcodiert zu
+# sein, damit das "testing"-Profil auch die Zyklus-Obergrenze mit auf ein
+# Minimum senkt, nicht nur die Werte pro Task.
+CYCLE_TOKEN_BUDGET = AGENT_PROFILE["cycle_token_budget"]
 
 
 def _within_cycle_budget(_previous_task_output) -> bool:
@@ -748,6 +750,7 @@ def _usage_line() -> str:
     }
     log_cycle_usage(usage)
     return (
+        f"Agent-Profil: '{AGENT_PROFILE['name']}' ({AGENT_PROFILE['model']}). "
         f"LLM-Nutzung diesen Zyklus: {usage['total_tokens']} tokens gesamt "
         f"({usage['prompt_tokens']} prompt, {usage['completion_tokens']} completion), "
         f"Prompt-Cache: {usage['cached_prompt_tokens']} tokens gelesen "
