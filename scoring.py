@@ -4,6 +4,7 @@ dependency so the arithmetic can be unit-tested in isolation from the agent
 runtime and from disk state.
 """
 import json
+import math
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -37,7 +38,11 @@ def compute_score(conversions: float, estimated_reach: float, failure_rate: floa
 
 
 def verdict_for_score(score: float) -> str:
-    """Section 5.4 decision bands."""
+    """Section 5.4 decision bands. Human-readable narrative label only -
+    the four-way outcome workflow branches on classify_outcome() below, not
+    on this string, but the band boundaries (0.7/0.3/-0.3/-0.7) are shared
+    between the two so they never quietly disagree.
+    """
     if score >= 0.7:
         return "strongly validated"
     if score >= 0.3:
@@ -47,6 +52,65 @@ def verdict_for_score(score: float) -> str:
     if score >= -0.7:
         return "weakly negative"
     return "strongly devalidated"
+
+
+PIVOT_ATTEMPT_CAP = 2
+HYPOTHESIS_OUTCOMES = {"build", "test_further", "pivot", "bury"}
+
+
+def compute_break_even_users(build_cost: float, price_point_monthly: float, horizon_months: float) -> int:
+    """How many paying users, sustained for horizon_months at
+    price_point_monthly, are needed to recoup build_cost. Ceiling - a
+    fractional user isn't a real break-even point. This is the number that
+    turns a "test further" into a "build" for one specific hypothesis;
+    there is no global user-count target (see classify_outcome).
+    """
+    if build_cost <= 0:
+        raise ValueError("build_cost must be > 0")
+    if price_point_monthly <= 0:
+        raise ValueError("price_point_monthly must be > 0")
+    if horizon_months <= 0:
+        raise ValueError("horizon_months must be > 0")
+    return math.ceil(build_cost / (price_point_monthly * horizon_months))
+
+
+def classify_outcome(
+    score: float,
+    conversions: float,
+    break_even_users: int,
+    extension_used: bool,
+    pivot_attempts_so_far: int,
+) -> str:
+    """Deterministic four-way outcome bucket (bury/pivot/test_further/build)
+    for one evaluated hypothesis. Deliberately not agent judgment - both the
+    "test further" and "pivot" paths could otherwise loop indefinitely, so
+    the caps here (one extension, PIVOT_ATTEMPT_CAP pivots) are enforced in
+    code, not left to a model deciding case by case.
+
+    - Build requires BOTH a strong rate (score >= 0.7) AND enough real
+      conversions to actually clear this hypothesis's own break-even bar -
+      a great rate on too few real users is "test further", not "build".
+      This is what makes a tiny sample a legitimate Build basis when the
+      break-even bar is genuinely low, and stops a small positive sample
+      from being read as validating a hypothesis with a high break-even bar.
+    - Test further fires once (guarded by extension_used, the same flag the
+      existing single-extension mechanic already uses) for any score that
+      isn't already clearly negative, whether that's an ambiguous rate or a
+      strong rate without enough real conversions yet.
+    - Below that: a clearly bad score (< -0.7), or an ambiguous score that
+      already used its one extension and still didn't clear into Build, is
+      Bury once the pivot budget is spent, Pivot otherwise.
+    """
+    if score >= 0.7 and conversions >= break_even_users:
+        return "build"
+
+    if not extension_used and score >= -0.3:
+        return "test_further"
+
+    if score < -0.7:
+        return "bury"
+
+    return "pivot" if pivot_attempts_so_far < PIVOT_ATTEMPT_CAP else "bury"
 
 
 def estimate_reach(channel: str, metrics: dict, estimators: dict = None) -> tuple:

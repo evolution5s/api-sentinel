@@ -6,9 +6,13 @@ from crewai import Agent, Crew, Process, Task, LLM
 from crewai.tasks.conditional_task import ConditionalTask
 
 from tools import (
+    check_approval_status,
     check_escalation,
     compare_channel_performance,
+    complete_task_order,
+    compute_break_even,
     evaluate_hypothesis,
+    file_task_order,
     is_system_paused,
     log_cycle_usage,
     notify_new_pending_approvals,
@@ -19,6 +23,7 @@ from tools import (
     read_hypotheses,
     read_last_cycle_note,
     read_state,
+    read_task_orders,
     request_approval,
     save_cycle_note,
     send_telegram_message,
@@ -26,15 +31,20 @@ from tools import (
     write_hypothesis,
 )
 from holding import (
+    acknowledge_status_report,
     decide_pivot_proposal,
     file_cross_subsidiary_request,
     file_pivot_proposal,
+    file_status_report,
     read_cross_subsidiary_requests,
     read_pivot_proposals,
+    read_status_reports,
+    read_strategic_direction,
     read_subsidiaries,
     register_subsidiary,
     resolve_cross_subsidiary_request,
     search_research_archive,
+    set_strategic_direction,
     set_subsidiary_status,
 )
 
@@ -136,10 +146,17 @@ growth_agent = Agent(
         "Technical marketer for the Freqtrade/CCXT quant-bot community. Drafts "
         "posts and measures results, but has no publishing authority of its own "
         "- every piece of content goes through request_approval first, and "
-        "every reach number comes from read_channel_metrics, never a guess."
+        "every reach number comes from read_channel_metrics, never a guess. "
+        "Concrete work comes from the Sub-CEO as task orders "
+        "(read_task_orders(to_role='growth', status='open')) - that's the "
+        "authoritative ask, not a paraphrase of it; call complete_task_order "
+        "with the real result when done, don't just narrate it in prose."
     ),
     llm=growth_llm,
-    tools=[request_approval, read_channel_metrics, read_channels, read_state, read_hypotheses],
+    tools=[
+        request_approval, read_channel_metrics, read_channels, read_state, read_hypotheses,
+        read_task_orders, complete_task_order,
+    ],
     max_iter=30,
     max_execution_time=600,
     max_rpm=20,
@@ -153,10 +170,16 @@ dev_agent = Agent(
     backstory=(
         "Ships landing page variants as PRs only - never merges or makes "
         "anything live itself. That step is always a separate, human-approved "
-        "action."
+        "action. Concrete work comes from the Sub-CEO as task orders "
+        "(read_task_orders(to_role='dev', status='open')) - that's the "
+        "authoritative ask, not a paraphrase of it. For any order tied to a "
+        "'build' hypothesis outcome, verifies via check_approval_status that "
+        "its approval is actually approved before opening a PR - never takes "
+        "another agent's word that something was approved. Calls "
+        "complete_task_order with the real result (e.g. the PR URL) when done."
     ),
     llm=dev_llm,
-    tools=[open_pull_request],
+    tools=[open_pull_request, read_task_orders, complete_task_order, check_approval_status],
     max_iter=15,
     max_execution_time=300,
     max_rpm=20,
@@ -177,7 +200,21 @@ ceo_agent = Agent(
         "for one subsidiary of the holding. Has no access to payment methods; "
         "any action that costs money, creates a legal obligation, or becomes "
         "publicly visible must go through request_approval first. Computes "
-        "scores only via evaluate_hypothesis (never by mental arithmetic). "
+        "scores only via evaluate_hypothesis, and break-even user counts "
+        "only via compute_break_even (never by mental arithmetic). Every "
+        "hypothesis gets a real economic bar sized to itself, not one fixed "
+        "target applied everywhere - a hypothesis that costs a few dollars "
+        "to build has a very different bar than one needing real engineering "
+        "effort. Reads the Main-CEO's current strategic direction "
+        "(read_strategic_direction) at the start of the cycle and factors it "
+        "in - it's the frame to work within, not a command that overrides "
+        "tactical judgment on channel picks or hypothesis sizing. Hands "
+        "concrete work to Growth/Dev as task orders (file_task_order) "
+        "instead of leaving it to be inferred from a report, and reports "
+        "back to the Main-CEO the same way (file_status_report) - always for "
+        "a 'build' outcome (that one always needs a human look before "
+        "anyone starts building), otherwise whenever something actually "
+        "needs a decision from above. "
         "Operates strictly within API Sentinel's current business model - "
         "when check_escalation signals a fundamental strategy problem, files "
         "a structured pivot proposal with the Main-CEO (file_pivot_proposal) "
@@ -192,7 +229,9 @@ ceo_agent = Agent(
     tools=[
         read_state, read_hypotheses, write_hypothesis, evaluate_hypothesis,
         check_escalation, compare_channel_performance, request_approval,
-        read_channels, write_channel,
+        read_channels, write_channel, compute_break_even,
+        file_task_order, read_task_orders,
+        file_status_report, read_strategic_direction,
         file_pivot_proposal, file_cross_subsidiary_request, search_research_archive,
     ],
     max_iter=50,
@@ -206,27 +245,39 @@ main_ceo_agent = Agent(
     role="Main-CEO of the Open Claw Holding",
     goal=(
         "Steer the holding's subsidiaries strategically: review pivot "
-        "proposals and cross-subsidiary requests from Sub-CEOs, manage the "
-        "subsidiary registry (including the dormant-state lifecycle), and "
-        "loop in the Aufsichtsrat for anything with real reach - never "
-        "decide big-impact moves alone"
+        "proposals, cross-subsidiary requests, and status reports from "
+        "Sub-CEOs, set strategic direction where it's actually warranted, "
+        "manage the subsidiary registry (including the dormant-state "
+        "lifecycle), and loop in the Aufsichtsrat for anything with real "
+        "reach - never decide big-impact moves alone"
     ),
     backstory=(
         "Runs the holding above individual subsidiaries' Sub-CEOs. With only "
         "api-sentinel registered today, most cycles have nothing to review - "
         "that's expected, not a sign anything is broken. Never fabricates a "
         "decision just to have something to report; 'nothing pending this "
-        "cycle' is a complete, valid answer. Instantiating a new subsidiary, "
-        "deploying new agents, or connecting new external tools always goes "
-        "through request_approval to the Aufsichtsrat first, no exceptions - "
-        "register_subsidiary itself enforces this, but the same discipline "
-        "applies to every judgment call this role makes."
+        "cycle' is a complete, valid answer. Reads Sub-CEO status reports "
+        "(read_status_reports) - especially ones flagged as needing a "
+        "decision, e.g. every 'build' outcome always surfaces here before "
+        "anyone starts building - and acknowledges them once reviewed "
+        "(acknowledge_status_report) so they don't keep resurfacing. Can set "
+        "a Sub-CEO's strategic direction (set_strategic_direction) when "
+        "there's a real reason to - a market shift, a pattern across several "
+        "reports, a decision that just got made - but this is the exception, "
+        "not a box to fill every cycle; it doesn't override the Sub-CEO's own "
+        "tactical judgment, it's the frame the Sub-CEO reads and works "
+        "within. Instantiating a new subsidiary, deploying new agents, or "
+        "connecting new external tools always goes through request_approval "
+        "to the Aufsichtsrat first, no exceptions - register_subsidiary "
+        "itself enforces this, but the same discipline applies to every "
+        "judgment call this role makes."
     ),
     llm=main_ceo_llm,
     tools=[
         read_subsidiaries, register_subsidiary, set_subsidiary_status,
         read_pivot_proposals, decide_pivot_proposal,
         read_cross_subsidiary_requests, resolve_cross_subsidiary_request,
+        read_status_reports, acknowledge_status_report, set_strategic_direction,
         search_research_archive, request_approval,
     ],
     max_iter=25,
@@ -299,6 +350,11 @@ task_channel_strategy = Task(
         "wins, and swap out ones that stop working instead of grinding on "
         "them. This runs before any hypothesis is picked or created - it "
         "decides which channels are even in play this cycle.\n"
+        "0) Call read_strategic_direction(subsidiary_id='api-sentinel') "
+        "first. No direction set is a normal, valid state - most cycles "
+        "will have none. If one is set, read it as the frame for this "
+        "cycle's channel and hypothesis judgment calls, not as a command "
+        "that overrides your own tactical read of the data below.\n"
         "1) Call read_channels() to see the current roster. If it's empty, "
         "brainstorm a first set of candidate channels for this niche "
         "(Freqtrade/CCXT quant-bot users) and write each one with "
@@ -372,7 +428,18 @@ task_channel_strategy = Task(
 task_growth = ConditionalTask(
     condition=_within_cycle_budget,
     description=(
-        "Call read_state to see current signups, then read_hypotheses(status="
+        "0) Call read_task_orders(to_role='growth', status='open') first. "
+        "These are the Sub-CEO's concrete asks for this cycle, if any were "
+        "filed last cycle - treat them as authoritative over any free-text "
+        "summary above them, since a task order is a fixed record, not a "
+        "paraphrase. An empty list is normal, not an error - most of this "
+        "task's work below runs regardless of whether an explicit order "
+        "exists yet, since active hypotheses need their reach measured "
+        "every cycle either way. For each order you act on, call "
+        "complete_task_order(order_id, result) with the real result once "
+        "done - don't just describe it in your final report and leave the "
+        "order open.\n"
+        "1) Call read_state to see current signups, then read_hypotheses(status="
         "'active') to see what's currently being tested. For each active "
         "hypothesis, call read_channels() to find its channel's roster entry "
         "and read off metrics_channel (defaults to landing_page_direct if "
@@ -396,7 +463,8 @@ task_growth = ConditionalTask(
     agent=growth_agent,
     expected_output=(
         "Per active hypothesis: estimated_reach, reach_source, fetch_note if any. "
-        "Plus a short cross-platform format comparison for the CEO to weigh."
+        "Plus a short cross-platform format comparison for the CEO to weigh. "
+        "Any task orders acted on marked complete with their real result."
     ),
     callback=_make_iteration_watchdog(growth_agent, "Growth"),
 )
@@ -404,12 +472,26 @@ task_growth = ConditionalTask(
 task_ceo = ConditionalTask(
     condition=_within_cycle_budget,
     description=(
-        "Run the Build-Measure-Learn loop: "
-        "0) Call read_state() first. If total_hypotheses is 0 (nothing has "
-        "ever been written - the very first cycle ever, before any "
-        "hypothesis existed to evaluate or follow up on), the loop has "
-        "nothing to start from yet: formulate and write exactly one initial "
-        "hypothesis via write_hypothesis to actually kick it off. Pick a "
+        "Run the Build-Measure-Learn loop. Every hypothesis you create in "
+        "this task - the bootstrap one in step 0, or a pivot follow-up in "
+        "step 5 - needs hypothesis_type ('value': solves a real problem for "
+        "the user, or 'growth': helps distribution/scaling of something "
+        "already validated as valuable) and its own economics fixed BEFORE "
+        "it runs, never adjusted afterward to fit the result: "
+        "estimated_build_cost (rough token/time cost of the real product/"
+        "feature this would become if it succeeds - not the cost of the "
+        "test itself), price_point_monthly, and break_even_horizon_months. "
+        "Call compute_break_even(estimated_build_cost, price_point_monthly, "
+        "break_even_horizon_months) to get break_even_users - never estimate "
+        "that number yourself - and include it on the write_hypothesis call. "
+        "A landing page costing a few dollars to build has a very different "
+        "bar than something needing real Dev-agent effort - size the "
+        "economics honestly per hypothesis, there is no one fixed target.\n"
+        "0) Call read_hypotheses() with no filter first. If it's completely "
+        "empty (nothing has ever been written - the very first cycle ever), "
+        "the loop has nothing to start from yet: formulate and write exactly "
+        "one initial hypothesis via write_hypothesis to actually kick it "
+        "off, including hypothesis_type and the economics above. Pick a "
         "channel from whichever the channel-strategy step above left as "
         "status='testing', size it with the same judgment you'd apply to "
         "any hypothesis (a concrete statement, category, "
@@ -417,62 +499,128 @@ task_ceo = ConditionalTask(
         "and leave prior_hypothesis_id/prior_score unset since it has no "
         "predecessor. This step only ever fires once, when the system is "
         "completely empty - once any hypothesis exists, new ones only ever "
-        "come from step 6 below as follow-ups to an evaluated one. "
+        "come from step 5 below, as a pivot follow-up to an evaluated one.\n"
         "1) Call read_hypotheses(status='active') and find any hypothesis "
-        "whose duration_days has elapsed since created_at. "
+        "whose duration_days has elapsed since created_at.\n"
         "2) For each due hypothesis, first make sure measured.reach_estimate "
         "is set (use the Growth report above; if it's still missing, leave "
         "the hypothesis active and note that it can't be scored yet). If it "
-        "is set, call evaluate_hypothesis(hypothesis_id) to get the real score "
-        "and verdict, then call write_hypothesis to persist status='evaluated', "
-        "the score, and measured.conversions. "
-        "3) If the verdict is 'inconclusive' and extension_used is false, "
-        "instead extend the hypothesis once (write_hypothesis with a new "
-        "duration_days and extension_used=true, status stays 'active') rather "
-        "than closing it - never extend a second time. "
-        "4) After evaluating, call check_escalation(hypothesis_id). If it "
-        "returns escalate=true, this is a pivot-level decision, not "
-        "something to decide or escalate to the board yourself: fill out "
-        "the standard pivot template and call file_pivot_proposal("
-        "subsidiary_id='api-sentinel', proposal=...) with all required "
-        "fields (nature_of_change, validating_data, "
+        "is set, call evaluate_hypothesis(hypothesis_id) to get the real "
+        "score and a four-way outcome - build/test_further/pivot/bury, "
+        "derived deterministically from the score, real conversions, and "
+        "this hypothesis's own break_even_users, so it can't be talked into "
+        "a different bucket. A tiny real sample is a completely legitimate "
+        "basis for 'build' when break_even_users is genuinely low (e.g. 2) - "
+        "treat that as a real economic conclusion, not noise to dismiss. "
+        "Conversely a good rate on too few real conversions relative to a "
+        "high break_even_users is 'test_further', not 'build', no matter how "
+        "good the rate looks - don't let a small positive sample get "
+        "inflated into false confidence for a hypothesis with a high bar. "
+        "Then act on the outcome:\n"
+        "   - build: call write_hypothesis to persist status='evaluated', "
+        "outcome='build', the score, and measured.conversions. This is the "
+        "one outcome that always needs a human look before anyone starts "
+        "building, even though everything up to here ran autonomously: "
+        "call request_approval(category='deploy', proposal=..., "
+        "reasoning=...) citing the hypothesis_id, its score, its real "
+        "conversions vs. break_even_users, and the build cost/price point - "
+        "never skip this, and note the approval id it returns. Then, "
+        "regardless of whether it's approved yet, call "
+        "file_task_order(to_role='dev', hypothesis_id=..., "
+        "task_description=..., context=...) describing what needs building - "
+        "put the exact approval id from request_approval's response "
+        "literally in task_description or context (e.g. 'approval_id: "
+        "appr_xxxxxxxx') so Dev has something concrete to check via "
+        "check_approval_status, not a paraphrase. Dev verifies the approval "
+        "status itself before acting - don't assume your report telling it "
+        "'this was approved' is enough.\n"
+        "   - test_further: call write_hypothesis with a new duration_days "
+        "and extension_used=true (status stays 'active'), outcome="
+        "'test_further' - typically with a larger sample size than the "
+        "first round. This fires at most once per hypothesis; if it's "
+        "already extension_used=true and still lands here, evaluate_"
+        "hypothesis itself will not return 'test_further' again - it forces "
+        "a pivot-or-bury decision instead.\n"
+        "   - pivot: call write_hypothesis on the due hypothesis to persist "
+        "status='evaluated', outcome='pivot', the score, and measured."
+        "conversions. Then go to step 4/5 below to formulate exactly one "
+        "retest with exactly one identified variable changed.\n"
+        "   - bury: call write_hypothesis to persist status='buried', "
+        "outcome='bury', the score, measured.conversions, and a concrete "
+        "bury_reasoning citing the real data that led there. This is not "
+        "permanent and not a deletion - the record stays, and it can be "
+        "revisited later if the context changes (new channel, new pricing, "
+        "market shift) - say so in your report rather than treating it as "
+        "closed forever.\n"
+        "3) After evaluating, call check_escalation(hypothesis_id) "
+        "regardless of the outcome above - that's a separate, bigger-picture "
+        "check (rolling average across the lineage) from the per-hypothesis "
+        "outcome. If it returns escalate=true, this is a pivot-level "
+        "decision, not something to decide or escalate to the board "
+        "yourself: fill out the standard pivot template and call "
+        "file_pivot_proposal(subsidiary_id='api-sentinel', proposal=...) "
+        "with all required fields (nature_of_change, validating_data, "
         "evolutionary_or_disruptive, existing_business_disposition, "
         "capability_gap_analysis, new_resources_needed, risk_assessment, "
         "synergy_overlap) - cite the real rolling-average score from "
         "check_escalation as your validating_data, never invent it. The "
         "Main-CEO reviews it next cycle; don't also file a separate "
         "request_approval for the same issue, and don't quietly pivot on "
-        "your own instead. "
-        "5) Pick the channel for any follow-up hypothesis only from "
-        "whichever channels the channel-strategy step above left as "
-        "status='testing' (write_hypothesis enforces this - it rejects a "
+        "your own instead.\n"
+        "4) For a 'pivot' outcome only: pick the channel for the retest "
+        "only from whichever channels the channel-strategy step above left "
+        "as status='testing' (write_hypothesis enforces this - it rejects a "
         "channel that isn't currently 'testing' in the roster). Within "
         "that set, weigh the Growth report's format comparison and each "
         "channel's real average score from compare_channel_performance() "
-        "to decide which one fits this particular follow-up best - don't "
-        "just repeat the same one out of habit if another testing channel "
-        "fits the hypothesis better. Never pick a channel outside the "
+        "to decide which one fits this particular retest best - unless "
+        "'channel' is itself the one variable you're changing, in which "
+        "case this choice IS the pivot. Never pick a channel outside the "
         "current testing set yourself; if none of them fit, say so and "
-        "leave the follow-up for next cycle instead of forcing it. "
-        "6) Formulate exactly one follow-up hypothesis per evaluated "
-        "hypothesis, setting prior_hypothesis_id, prior_score, and channel "
-        "per the reasoning above, sized per the decision band the score "
-        "fell into. Call write_hypothesis to create it - if it's rejected "
-        "for hitting the parallelism limit on that landing_page_variant_id, "
-        "pick a different variant or hold off. "
-        "7) If the new hypothesis needs a new or changed landing page "
-        "variant, say so explicitly in your final report so the Dev agent "
-        "can act on it. Making any variant live is category 'publish' and "
-        "needs request_approval - never skip that. "
-        "8) Never invent conversion, reach, or revenue numbers. Every number "
-        "in your report must trace back to a tool call above."
+        "leave the retest for next cycle instead of forcing it.\n"
+        "5) For a 'pivot' outcome only: formulate exactly one retest "
+        "hypothesis, setting prior_hypothesis_id and prior_score to the "
+        "hypothesis you just marked outcome='pivot'. Change exactly ONE "
+        "identified variable - audience, price, copy, channel, or timing - "
+        "and set pivot_variable_changed to that one and pivot_reasoning to "
+        "why (write_hypothesis requires both whenever prior_hypothesis_id "
+        "points at a 'pivot' outcome). Don't change several things at once - "
+        "that makes the next result uninterpretable. Give it its own fresh "
+        "economics (hypothesis_type, estimated_build_cost, "
+        "price_point_monthly, break_even_horizon_months, and a fresh "
+        "compute_break_even call for break_even_users) rather than copying "
+        "the prior hypothesis's numbers unchecked. Call write_hypothesis to "
+        "create it - if it's rejected for hitting the parallelism limit on "
+        "that landing_page_variant_id, pick a different variant or hold off. "
+        "Pivot attempts on one lineage are capped (evaluate_hypothesis "
+        "enforces this automatically by returning 'bury' once the cap is "
+        "hit) - don't try to talk a hypothesis that's already spent its "
+        "pivot budget into one more retest.\n"
+        "6) If a pivot retest needs a new or changed landing page variant, "
+        "file a file_task_order(to_role='dev', ...) for it explicitly - "
+        "don't just mention it in your report and assume Dev will notice. "
+        "Making any variant live is category 'publish' and needs "
+        "request_approval - never skip that, on top of the 'deploy' "
+        "approval already required for build outcomes above.\n"
+        "7) File a file_status_report(subsidiary_id='api-sentinel', ...) "
+        "to the Main-CEO for every hypothesis you evaluated this cycle - "
+        "what was being tested, what you found, and the outcome. Set "
+        "needs_decision_from_above=true with a concrete decision_context "
+        "for every 'build' outcome (that approval request needs the "
+        "Main-CEO's/board's attention) and for anything else that "
+        "genuinely needs a call from above; false is a normal, valid "
+        "answer for a routine bury/pivot/test_further.\n"
+        "8) Never invent conversion, reach, revenue, or economics numbers. "
+        "Every number in your report must trace back to a tool call above."
     ),
     agent=ceo_agent,
     expected_output=(
-        "Status report: for each evaluated hypothesis, its score/verdict, "
-        "what happened next (scaled/extended/pivoted/dropped), the new "
-        "follow-up hypothesis started, and any pending approval or escalation "
-        "filed. Pending Dev work (new variant needed or not) stated plainly."
+        "Status report: for each evaluated hypothesis, its score/outcome "
+        "(build/test_further/pivot/bury) and the economics behind it, what "
+        "happened next, and the new retest started for any pivot. Any "
+        "pending approval, escalation, or status report filed for the "
+        "Main-CEO. Pending Dev work stated as task orders filed, not just "
+        "narrated."
     ),
     callback=_make_iteration_watchdog(ceo_agent, "Sub-CEO (Build-Measure-Learn)"),
 )
@@ -481,7 +629,17 @@ task_main_ceo_review = ConditionalTask(
     condition=_within_cycle_budget,
     description=(
         "Run the holding's governance review for this cycle:\n"
-        "1) Call read_pivot_proposals(status='pending'). For each: weigh it "
+        "1) Call read_status_reports(subsidiary_id='api-sentinel', "
+        "needs_decision_only=true) first - these are the Sub-CEO's fixed "
+        "reports for anything that actually needs your attention this "
+        "cycle, most importantly every 'build' outcome (real resource "
+        "commitment, always needs a human/board look before anyone starts "
+        "building - the Sub-CEO already filed the request_approval, your "
+        "job here is to notice it and weigh in, not to second-guess the "
+        "score). For each you've actually considered, call "
+        "acknowledge_status_report(report_id) so it doesn't keep resurfacing "
+        "next cycle. An empty list is a normal, valid outcome.\n"
+        "2) Call read_pivot_proposals(status='pending'). For each: weigh it "
         "against the decision matrix - approve_in_place (the pivot happens "
         "within the filing subsidiary), move_to_subsidiary (fits an "
         "existing different subsidiary's portfolio better), "
@@ -493,29 +651,39 @@ task_main_ceo_review = ConditionalTask(
         "never action either of those alone, that always goes to the "
         "Aufsichtsrat. If there are no pending proposals, say so plainly "
         "rather than inventing one to review.\n"
-        "2) Call read_cross_subsidiary_requests(status='pending'). For "
+        "3) Call read_cross_subsidiary_requests(status='pending'). For "
         "each: decide whether it's justified and call "
         "resolve_cross_subsidiary_request. With only one subsidiary "
         "registered today there is usually nowhere to actually route the "
         "request to - approve or reject the request itself honestly, but "
         "never fabricate a result you can't actually produce; say plainly "
         "if no other subsidiary exists yet to fetch from.\n"
-        "3) Call read_subsidiaries() and report the current holding "
+        "4) Call read_subsidiaries() and report the current holding "
         "structure (which are active/dormant). Only call "
         "set_subsidiary_status if there's a concrete reason to change one "
         "this cycle (e.g. a Sub-CEO reported its project done or paused) - "
         "never change status speculatively.\n"
-        "4) Never call register_subsidiary without an already-approved "
+        "5) Only if the status reports above show a genuine reason to - a "
+        "pattern across several of them, a market shift, a decision that "
+        "just got made - call set_strategic_direction(subsidiary_id="
+        "'api-sentinel', focus_area=..., reasoning=...) to steer the "
+        "Sub-CEO's focus next cycle. This is the exception, not something "
+        "to do every cycle just to have done it - most cycles should set no "
+        "new direction, and that's a completely valid outcome too.\n"
+        "6) Never call register_subsidiary without an already-approved "
         "request_approval backing it - the tool enforces this, but don't "
         "attempt it prematurely either.\n"
-        "5) Nothing to review this cycle is a completely normal, valid "
+        "7) Nothing to review this cycle is a completely normal, valid "
         "outcome - report it as such rather than inventing busywork."
     ),
     agent=main_ceo_agent,
     expected_output=(
-        "Pivot proposals reviewed (if any) with decisions and reasoning. "
-        "Cross-subsidiary requests resolved (if any). Current subsidiary "
-        "registry summary. Any request_approval filed for board sign-off."
+        "Status reports reviewed (if any needed a decision) with what was "
+        "decided. Pivot proposals reviewed (if any) with decisions and "
+        "reasoning. Cross-subsidiary requests resolved (if any). Current "
+        "subsidiary registry summary. Any strategic direction set (or "
+        "explicitly not set, and why not). Any request_approval filed for "
+        "board sign-off."
     ),
     callback=_make_iteration_watchdog(main_ceo_agent, "Main-CEO"),
 )
@@ -523,15 +691,31 @@ task_main_ceo_review = ConditionalTask(
 task_dev = ConditionalTask(
     condition=_within_cycle_budget,
     description=(
-        "Read the CEO's report above. If and only if it says a new or changed "
-        "landing page variant is needed, call open_pull_request to add it as "
-        "a new file (naming pattern lp_v{n}_{label}.html) on a new branch "
-        "against main - never edit index.html directly and never merge. If "
-        "the CEO's report didn't ask for a variant this cycle, do nothing and "
-        "say so."
+        "Call read_task_orders(to_role='dev', status='open') first - these "
+        "are the Sub-CEO's fixed asks, not something to infer from the "
+        "report above. An empty list means nothing was ordered this cycle - "
+        "do nothing and say so, don't act on the free-text report alone. "
+        "For each open order: if it's tied to a hypothesis_id whose outcome "
+        "is 'build', call check_approval_status on the approval the order "
+        "references (read it from the order's context/task_description) "
+        "and confirm status=='approved' yourself before doing anything - "
+        "never take another agent's claim that something was approved at "
+        "face value. If it's not yet approved, leave the order open and say "
+        "so; don't open a PR for it early. Once actually approved (or for "
+        "any order that was never approval-gated to begin with, e.g. a "
+        "pivot retest's variant), call open_pull_request to add the variant "
+        "as a new file (naming pattern lp_v{n}_{label}.html) on a new "
+        "branch against main - never edit index.html directly and never "
+        "merge. Call complete_task_order(order_id, result) with the real "
+        "PR URL (or the reason nothing was opened) once done - don't just "
+        "narrate it in your final report and leave the order open."
     ),
     agent=dev_agent,
-    expected_output="PR URL if one was opened, or a note that no variant was needed this cycle.",
+    expected_output=(
+        "Per open task order: PR URL if one was opened, or the reason it "
+        "wasn't (not yet approved, or no variant needed) - and confirmation "
+        "each was marked complete via complete_task_order."
+    ),
     callback=_make_iteration_watchdog(dev_agent, "Dev"),
 )
 

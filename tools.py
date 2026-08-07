@@ -34,7 +34,15 @@ APPROVAL_CATEGORIES = {"spend", "legal", "publish", "deploy", "pricing"}
 REQUIRED_HYPOTHESIS_FIELDS = {
     "id", "statement", "category", "landing_page_variant_id",
     "failure_rate", "success_rate", "duration_days", "channel",
+    # Economics (section 2 of the outcome-engine brief): required before an
+    # experiment is allowed to run at all, same as failure_rate/success_rate
+    # already are - not something computed after the fact to fit a result.
+    "hypothesis_type", "estimated_build_cost", "price_point_monthly",
+    "break_even_horizon_months", "break_even_users",
 }
+HYPOTHESIS_TYPES = {"value", "growth"}
+PIVOT_VARIABLES = {"audience", "price", "copy", "channel", "timing"}
+HYPOTHESIS_STATUSES = {"active", "evaluated", "buried"}
 CHANNEL_STATUSES = {"not_tested", "bench", "testing", "retired"}
 MAX_CHANNELS_TESTING = 3
 MAX_TOTAL_CHANNELS = 20
@@ -214,6 +222,25 @@ def request_approval(category: str, proposal: str, reasoning: str) -> str:
     return json.dumps({"queued": record["id"]})
 
 
+@tool("check_approval_status")
+def check_approval_status(approval_id: str) -> str:
+    """Look up a request_approval entry's real status directly, instead of
+    trusting another agent's free-text claim that "this was approved". Used
+    by Dev to verify a Build-outcome approval actually exists and is
+    status='approved' before opening a PR for it - never take the CEO's
+    report's word for that alone.
+    """
+    approvals = _read_jsonl("approval_queue.jsonl")
+    approval = next((a for a in approvals if a.get("id") == approval_id), None)
+    if approval is None:
+        return json.dumps({"error": f"no approval request with id '{approval_id}'"})
+    return json.dumps({
+        "id": approval["id"],
+        "status": approval.get("status"),
+        "category": approval.get("category"),
+    })
+
+
 @tool("read_hypotheses")
 def read_hypotheses(status: str = "") -> str:
     """Return hypotheses as JSON. Pass status="active" or status="evaluated"
@@ -232,6 +259,21 @@ def write_hypothesis(hypothesis: str) -> str:
     least an "id". Creating a new active hypothesis is rejected if its
     landing_page_variant_id already has 2 other active hypotheses (section
     5.6 parallelism rule) - pick a different variant or wait instead.
+
+    New hypotheses require hypothesis_type ("value" or "growth") and the
+    economics that must be fixed before the experiment runs, not adjusted
+    afterward to fit the result: estimated_build_cost, price_point_monthly,
+    break_even_horizon_months, and break_even_users (get this last one from
+    compute_break_even() first - never estimate it by hand).
+
+    If prior_hypothesis_id points at a hypothesis whose outcome was "pivot",
+    this new one must also say pivot_variable_changed (one of audience/
+    price/copy/channel/timing) and pivot_reasoning - exactly one identified
+    variable, logged, per the pivot-then-retest rule.
+
+    Setting status="buried" requires a non-empty bury_reasoning - buried
+    hypotheses are never deleted, only marked, so the reasoning has to be
+    on the record for whoever revisits it later.
     """
     try:
         patch = json.loads(hypothesis)
@@ -241,6 +283,21 @@ def write_hypothesis(hypothesis: str) -> str:
     if "id" not in patch:
         return json.dumps({"error": "hypothesis must include an 'id'"})
 
+    if "status" in patch and patch["status"] not in HYPOTHESIS_STATUSES:
+        return json.dumps({
+            "error": f"invalid status '{patch['status']}', must be one of {sorted(HYPOTHESIS_STATUSES)}"
+        })
+    if "hypothesis_type" in patch and patch["hypothesis_type"] not in HYPOTHESIS_TYPES:
+        return json.dumps({
+            "error": f"invalid hypothesis_type '{patch['hypothesis_type']}', must be one of {sorted(HYPOTHESIS_TYPES)}"
+        })
+    if "outcome" in patch and patch["outcome"] is not None and patch["outcome"] not in scoring.HYPOTHESIS_OUTCOMES:
+        return json.dumps({
+            "error": f"invalid outcome '{patch['outcome']}', must be one of {sorted(scoring.HYPOTHESIS_OUTCOMES)} or null"
+        })
+    if patch.get("status") == "buried" and not (patch.get("bury_reasoning") or "").strip():
+        return json.dumps({"error": "status='buried' requires a non-empty bury_reasoning"})
+
     hyps = _read_jsonl("hypotheses.jsonl")
     existing_index = next((i for i, h in enumerate(hyps) if h.get("id") == patch["id"]), None)
 
@@ -248,6 +305,17 @@ def write_hypothesis(hypothesis: str) -> str:
         missing = REQUIRED_HYPOTHESIS_FIELDS - patch.keys()
         if missing:
             return json.dumps({"error": f"new hypothesis missing required fields: {sorted(missing)}"})
+        prior_id = patch.get("prior_hypothesis_id")
+        if prior_id:
+            prior = next((h for h in hyps if h.get("id") == prior_id), None)
+            if prior is not None and prior.get("outcome") == "pivot":
+                if patch.get("pivot_variable_changed") not in PIVOT_VARIABLES:
+                    return json.dumps({
+                        "error": "this hypothesis follows a 'pivot' outcome - pivot_variable_changed "
+                                 f"must be one of {sorted(PIVOT_VARIABLES)} (exactly one identified variable)"
+                    })
+                if not (patch.get("pivot_reasoning") or "").strip():
+                    return json.dumps({"error": "this hypothesis follows a 'pivot' outcome - pivot_reasoning is required"})
         if patch.get("status", "active") == "active":
             channel_record = next(
                 (c for c in _read_jsonl("channels.jsonl") if c.get("id") == patch["channel"]), None
@@ -273,6 +341,7 @@ def write_hypothesis(hypothesis: str) -> str:
             "interim_proxy": True,
             "measured": {"conversions": 0, "reach_estimate": None, "reach_source": None},
             "score": None,
+            "outcome": None,
             "prior_hypothesis_id": None,
             "prior_score": None,
             "extension_used": False,
@@ -293,16 +362,49 @@ def write_hypothesis(hypothesis: str) -> str:
     return json.dumps({"ok": True, "id": patch["id"]})
 
 
+def _count_pivot_attempts(hyps_by_id: dict, hypothesis_id: str) -> int:
+    """Walk the full prior_hypothesis_id chain (unbounded, unlike
+    check_escalation's last-3 window - the pivot cap needs the true total)
+    counting how many ancestors were themselves a 'pivot' outcome.
+    """
+    count = 0
+    current = hyps_by_id.get(hypothesis_id)
+    seen = set()
+    while current and current.get("id") not in seen:
+        seen.add(current.get("id"))
+        if current.get("outcome") == "pivot":
+            count += 1
+        current = hyps_by_id.get(current.get("prior_hypothesis_id"))
+    return count
+
+
 @tool("evaluate_hypothesis")
 def evaluate_hypothesis(hypothesis_id: str) -> str:
-    """Compute the real score and verdict for a hypothesis (section 5.3/5.4).
-    Counts conversions from signups.jsonl (matched by landing_page_variant_id
-    and a submitted_at timestamp inside [created_at, created_at+duration_days])
-    and uses whatever measured.reach_estimate is already stored - it does NOT
-    guess a reach number. If reach_estimate is still null, returns an error
-    saying so instead of scoring; get Growth to call read_channel_metrics and
-    write_hypothesis first. Read-only: does not persist anything itself, call
-    write_hypothesis afterwards to save status/score/measured.
+    """Compute the real score, verdict, and four-way outcome for a
+    hypothesis (section 5.3/5.4 plus the outcome-engine addendum). Counts
+    conversions from signups.jsonl (matched by landing_page_variant_id and a
+    submitted_at timestamp inside [created_at, created_at+duration_days])
+    and uses whatever measured.reach_estimate is already stored - it does
+    NOT guess a reach number. If reach_estimate is still null, returns an
+    error saying so instead of scoring; get Growth to call
+    read_channel_metrics and write_hypothesis first.
+
+    outcome is one of:
+    - "build": score >= 0.7 AND conversions already clear this hypothesis's
+      own break_even_users - a strong rate on too few real conversions is
+      "test_further", not "build", even if break_even_users is small.
+    - "test_further": ambiguous score, or a strong score without enough
+      real conversions yet - fires only once (extension_used gate), same
+      as the existing single-extension mechanic.
+    - "pivot": weak-negative score (or an ambiguous score that already used
+      its one extension), and this hypothesis's lineage hasn't spent its
+      pivot budget (PIVOT_ATTEMPT_CAP) yet.
+    - "bury": clearly bad score, or the pivot budget for this lineage is
+      exhausted. Not permanent - a buried hypothesis can be revisited later,
+      it's just not automatically retried by this loop anymore.
+
+    Read-only: does not persist anything itself, call write_hypothesis
+    afterwards to save status/score/outcome/measured.
     """
     hyps = _read_jsonl("hypotheses.jsonl")
     hyp = next((h for h in hyps if h.get("id") == hypothesis_id), None)
@@ -314,6 +416,13 @@ def evaluate_hypothesis(hypothesis_id: str) -> str:
         return json.dumps({
             "error": "measured.reach_estimate is not set yet - call read_channel_metrics "
                      "and write_hypothesis to record it before evaluating"
+        })
+
+    break_even_users = hyp.get("break_even_users")
+    if not break_even_users:
+        return json.dumps({
+            "error": "break_even_users is not set on this hypothesis - it must be computed via "
+                     "compute_break_even() and written at creation time, before the experiment runs"
         })
 
     created_at = hyp.get("created_at", "")
@@ -344,12 +453,21 @@ def evaluate_hypothesis(hypothesis_id: str) -> str:
     except (KeyError, ValueError) as exc:
         return json.dumps({"error": str(exc)})
 
+    hyps_by_id = {h["id"]: h for h in hyps if "id" in h}
+    pivot_attempts = _count_pivot_attempts(hyps_by_id, hypothesis_id)
+    outcome = scoring.classify_outcome(
+        score, conversions, break_even_users, bool(hyp.get("extension_used")), pivot_attempts,
+    )
+
     return json.dumps({
         "hypothesis_id": hypothesis_id,
         "conversions": conversions,
         "estimated_reach": reach,
         "score": score,
         "verdict": scoring.verdict_for_score(score),
+        "outcome": outcome,
+        "break_even_users": break_even_users,
+        "pivot_attempts_so_far": pivot_attempts,
     })
 
 
@@ -376,6 +494,100 @@ def check_escalation(hypothesis_id: str) -> str:
     avg = sum(chain_scores) / len(chain_scores)
     escalate = len(chain_scores) >= 3 and avg <= -0.5
     return json.dumps({"escalate": escalate, "rolling_average": round(avg, 3), "scores_used": chain_scores})
+
+
+@tool("compute_break_even")
+def compute_break_even(estimated_build_cost: float, price_point_monthly: float, break_even_horizon_months: float) -> str:
+    """Compute break_even_users for a hypothesis before it's created - how
+    many paying users, sustained for break_even_horizon_months at
+    price_point_monthly, are needed to recoup estimated_build_cost. Never
+    estimate this by hand; this is the same "no mental arithmetic" rule
+    evaluate_hypothesis already enforces for scores. The result is required
+    on write_hypothesis for every new hypothesis (section 2 of the
+    outcome-engine addendum) and is what write_hypothesis's parallel
+    evaluate_hypothesis call later checks real conversions against to
+    decide "build" vs "test_further" - a low break_even_users makes even a
+    tiny real sample a legitimate build basis, a high one means a small
+    positive sample is not enough evidence yet, regardless of how good the
+    rate looks.
+    """
+    try:
+        break_even_users = scoring.compute_break_even_users(
+            estimated_build_cost, price_point_monthly, break_even_horizon_months,
+        )
+    except ValueError as exc:
+        return json.dumps({"error": str(exc)})
+    return json.dumps({"break_even_users": break_even_users})
+
+
+# --------------------------------------------------------------------------
+# Structured handoff: Sub-CEO -> executing agent (Growth/Dev). Replaces
+# relying on CrewAI's automatic free-text task-output-as-context passing
+# for anything that matters - a fixed record instead of paraphrased prose,
+# so what was actually asked survives the hop. Lives here (not holding.py)
+# because this handoff is entirely within the api-sentinel subsidiary's own
+# operative layer, not a holding-level concern.
+# --------------------------------------------------------------------------
+
+TASK_ORDER_ROLES = {"growth", "dev"}
+
+
+@tool("file_task_order")
+def file_task_order(to_role: str, task_description: str, context: str, hypothesis_id: str = "") -> str:
+    """Sub-CEO hands a concrete task to Growth or Dev as a fixed record,
+    instead of leaving it to be inferred from free-text task output.
+    to_role must be "growth" or "dev". task_description is the concrete ask
+    (e.g. "build landing page variant for hyp_x123, testing a $15/mo price
+    point"); context is the why. Pass hypothesis_id whenever this task
+    ties back to one - most do.
+    """
+    if to_role not in TASK_ORDER_ROLES:
+        return json.dumps({"error": f"invalid to_role '{to_role}', must be one of {sorted(TASK_ORDER_ROLES)}"})
+    record = {
+        "id": f"order_{uuid.uuid4().hex[:8]}",
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "from_role": "sub_ceo",
+        "to_role": to_role,
+        "hypothesis_id": hypothesis_id or None,
+        "task_description": task_description,
+        "context": context,
+        "status": "open",
+        "result": None,
+    }
+    _append_jsonl("task_orders.jsonl", record)
+    return json.dumps({"filed": record["id"]})
+
+
+@tool("read_task_orders")
+def read_task_orders(to_role: str, status: str = "") -> str:
+    """Read task orders addressed to a role (growth/dev). Pass status="open"
+    for what's actually pending, or "" for all (including already-done ones,
+    useful for continuity across cycles).
+    """
+    orders = [o for o in _read_jsonl("task_orders.jsonl") if o.get("to_role") == to_role]
+    if status:
+        orders = [o for o in orders if o.get("status") == status]
+    return json.dumps(orders, ensure_ascii=False)
+
+
+@tool("complete_task_order")
+def complete_task_order(order_id: str, result: str) -> str:
+    """Growth/Dev closes the loop on a task order with a fixed result
+    instead of just narrating it in prose - this is what the Sub-CEO (and,
+    via status reports, the Main-CEO) actually reads back, not a summary of
+    the summary.
+    """
+    orders = _read_jsonl("task_orders.jsonl")
+    idx = next((i for i, o in enumerate(orders) if o.get("id") == order_id), None)
+    if idx is None:
+        return json.dumps({"error": f"no task order with id '{order_id}'"})
+    if orders[idx].get("status") == "done":
+        return json.dumps({"error": f"'{order_id}' is already marked done, not overwriting its result"})
+    orders[idx]["status"] = "done"
+    orders[idx]["result"] = result
+    orders[idx]["completed_at"] = datetime.now(timezone.utc).isoformat()
+    _write_jsonl("task_orders.jsonl", orders)
+    return json.dumps({"ok": True, "id": order_id})
 
 
 # --------------------------------------------------------------------------

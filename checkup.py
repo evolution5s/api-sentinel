@@ -68,6 +68,11 @@ SAMPLE_HYP = {
     "success_rate": 0.01,
     "duration_days": 10,
     "channel": "reddit",
+    "hypothesis_type": "value",
+    "estimated_build_cost": 1000,
+    "price_point_monthly": 20,
+    "break_even_horizon_months": 6,
+    "break_even_users": 9,  # ceil(1000 / (20 * 6))
 }
 
 SAMPLE_PIVOT = {
@@ -214,6 +219,48 @@ def test_update_reach_multiplier_roundtrip():
         scoring.REACH_ESTIMATORS_FILE = original_file
 
 
+# --- scoring.py: break-even / four-way outcome ----------------------------
+
+def test_compute_break_even_users():
+    assert scoring.compute_break_even_users(1000, 20, 6) == 9  # ceil(1000/120)
+    assert scoring.compute_break_even_users(40, 20, 1) == 2  # exact division
+
+
+def test_compute_break_even_users_rejects_non_positive_inputs():
+    for kwargs in (
+        dict(build_cost=0, price_point_monthly=20, horizon_months=6),
+        dict(build_cost=100, price_point_monthly=0, horizon_months=6),
+        dict(build_cost=100, price_point_monthly=20, horizon_months=0),
+    ):
+        try:
+            scoring.compute_break_even_users(**kwargs)
+            assert False, f"expected ValueError for {kwargs}"
+        except ValueError:
+            pass
+
+
+def test_classify_outcome_build_requires_both_score_and_sample():
+    # strong score + enough real conversions -> build
+    assert scoring.classify_outcome(0.8, 5, 2, False, 0) == "build"
+    # strong score but NOT enough real conversions relative to a high bar -> test_further
+    assert scoring.classify_outcome(0.8, 1, 50, False, 0) == "test_further"
+
+
+def test_classify_outcome_test_further_fires_once():
+    assert scoring.classify_outcome(0.0, 3, 10, False, 0) == "test_further"
+    # already extended once and still ambiguous -> forced decision, not a second test_further
+    assert scoring.classify_outcome(0.0, 3, 10, True, 0) in ("pivot", "bury")
+
+
+def test_classify_outcome_pivot_then_bury_once_cap_reached():
+    assert scoring.classify_outcome(-0.5, 1, 10, False, 0) == "pivot"
+    assert scoring.classify_outcome(-0.5, 1, 10, False, scoring.PIVOT_ATTEMPT_CAP) == "bury"
+
+
+def test_classify_outcome_clearly_bad_score_is_always_bury():
+    assert scoring.classify_outcome(-0.9, 0, 10, False, 0) == "bury"
+
+
 # --- tools.py: JSONL primitives -------------------------------------------
 
 def test_jsonl_roundtrip():
@@ -261,6 +308,78 @@ def test_read_state_reports_pending_approvals():
     assert state["signup_source"].startswith("github_issues")
 
 
+def test_check_approval_status_unknown_id():
+    reset_state()
+    result = json.loads(tools.check_approval_status.run(approval_id="appr_doesnotexist"))
+    assert "error" in result
+
+
+def test_check_approval_status_reflects_real_state():
+    reset_state()
+    appr = json.loads(tools.request_approval.run(category="deploy", proposal="p", reasoning="r"))
+    result = json.loads(tools.check_approval_status.run(approval_id=appr["queued"]))
+    assert result == {"id": appr["queued"], "status": "pending", "category": "deploy"}
+
+    approvals = tools._read_jsonl("approval_queue.jsonl")
+    approvals[0]["status"] = "approved"
+    tools._write_jsonl("approval_queue.jsonl", approvals)
+    result = json.loads(tools.check_approval_status.run(approval_id=appr["queued"]))
+    assert result["status"] == "approved"
+
+
+# --- tools.py: task orders (Sub-CEO -> Growth/Dev structured handoff) -------
+
+def test_file_task_order_rejects_invalid_role():
+    reset_state()
+    result = json.loads(tools.file_task_order.run(
+        to_role="marketing", task_description="do a thing", context="because",
+    ))
+    assert "error" in result
+
+
+def test_file_and_read_task_order():
+    reset_state()
+    filed = json.loads(tools.file_task_order.run(
+        to_role="dev", task_description="build variant for hyp_x", context="build outcome",
+        hypothesis_id="hyp_x",
+    ))
+    assert "filed" in filed
+    open_orders = json.loads(tools.read_task_orders.run(to_role="dev", status="open"))
+    assert len(open_orders) == 1
+    assert open_orders[0]["hypothesis_id"] == "hyp_x"
+    assert open_orders[0]["status"] == "open"
+    # scoped by role - growth doesn't see dev's order
+    assert json.loads(tools.read_task_orders.run(to_role="growth", status="open")) == []
+
+
+def test_complete_task_order_roundtrip():
+    reset_state()
+    filed = json.loads(tools.file_task_order.run(
+        to_role="growth", task_description="measure reach", context="active hypothesis",
+    ))
+    order_id = filed["filed"]
+    result = json.loads(tools.complete_task_order.run(order_id=order_id, result="reach=1200"))
+    assert result.get("ok") is True
+
+    open_orders = json.loads(tools.read_task_orders.run(to_role="growth", status="open"))
+    assert open_orders == []
+    all_orders = json.loads(tools.read_task_orders.run(to_role="growth"))
+    assert all_orders[0]["status"] == "done" and all_orders[0]["result"] == "reach=1200"
+
+
+def test_complete_task_order_does_not_overwrite_done():
+    reset_state()
+    filed = json.loads(tools.file_task_order.run(
+        to_role="growth", task_description="measure reach", context="active hypothesis",
+    ))
+    order_id = filed["filed"]
+    tools.complete_task_order.run(order_id=order_id, result="first result")
+    result = json.loads(tools.complete_task_order.run(order_id=order_id, result="second result"))
+    assert "error" in result
+    stored = json.loads(tools.read_task_orders.run(to_role="growth"))[0]
+    assert stored["result"] == "first result"
+
+
 # --- tools.py: hypotheses -------------------------------------------------
 
 def test_write_hypothesis_create_requires_fields():
@@ -289,6 +408,59 @@ def test_write_hypothesis_update_merges():
     stored = json.loads(tools.read_hypotheses.run())[0]
     assert stored["measured"]["reach_estimate"] == 5000
     assert stored["measured"]["conversions"] == 0
+
+
+def test_write_hypothesis_rejects_invalid_hypothesis_type():
+    reset_state()
+    bad = {**SAMPLE_HYP, "hypothesis_type": "vanity"}
+    result = json.loads(tools.write_hypothesis.run(hypothesis=json.dumps(bad)))
+    assert "error" in result and "hypothesis_type" in result["error"]
+
+
+def test_write_hypothesis_rejects_invalid_status():
+    reset_state()
+    bad = {**SAMPLE_HYP, "status": "made_up"}
+    result = json.loads(tools.write_hypothesis.run(hypothesis=json.dumps(bad)))
+    assert "error" in result and "status" in result["error"]
+
+
+def test_write_hypothesis_bury_requires_reasoning():
+    reset_state()
+    tools.write_hypothesis.run(hypothesis=json.dumps(SAMPLE_HYP))
+    result = json.loads(tools.write_hypothesis.run(
+        hypothesis=json.dumps({"id": "hyp_test_0001", "status": "buried"}),
+    ))
+    assert "error" in result and "bury_reasoning" in result["error"]
+
+    result = json.loads(tools.write_hypothesis.run(hypothesis=json.dumps({
+        "id": "hyp_test_0001", "status": "buried", "outcome": "bury",
+        "bury_reasoning": "score never cleared the threshold across 2 pivots",
+    })))
+    assert result.get("ok") is True
+    stored = json.loads(tools.read_hypotheses.run())[0]
+    assert stored["status"] == "buried"
+
+
+def test_write_hypothesis_pivot_followup_requires_variable_and_reasoning():
+    reset_state()
+    _seed_testing_channel("reddit")
+    tools.write_hypothesis.run(hypothesis=json.dumps({**SAMPLE_HYP, "outcome": "pivot"}))
+
+    followup = {
+        **SAMPLE_HYP, "id": "hyp_pivot_followup",
+        "landing_page_variant_id": "lp_v2_pivot",
+        "prior_hypothesis_id": "hyp_test_0001", "prior_score": -0.5,
+    }
+    result = json.loads(tools.write_hypothesis.run(hypothesis=json.dumps(followup)))
+    assert "error" in result and "pivot_variable_changed" in result["error"]
+
+    followup["pivot_variable_changed"] = "price"
+    result = json.loads(tools.write_hypothesis.run(hypothesis=json.dumps(followup)))
+    assert "error" in result and "pivot_reasoning" in result["error"]
+
+    followup["pivot_reasoning"] = "original price point was too high for this audience"
+    result = json.loads(tools.write_hypothesis.run(hypothesis=json.dumps(followup)))
+    assert result.get("ok") is True
 
 
 def test_write_hypothesis_parallelism_limit():
@@ -348,6 +520,73 @@ def test_evaluate_hypothesis_counts_matching_signups():
     expected_score = scoring.compute_score(3, 1000, 0.001, 0.01)
     assert result["score"] == expected_score
     assert result["verdict"] == scoring.verdict_for_score(expected_score)
+
+
+def test_compute_break_even_tool():
+    reset_state()
+    result = json.loads(tools.compute_break_even.run(
+        estimated_build_cost=1000, price_point_monthly=20, break_even_horizon_months=6,
+    ))
+    assert result == {"break_even_users": 9}
+
+
+def test_compute_break_even_tool_rejects_non_positive():
+    reset_state()
+    result = json.loads(tools.compute_break_even.run(
+        estimated_build_cost=0, price_point_monthly=20, break_even_horizon_months=6,
+    ))
+    assert "error" in result
+
+
+def test_evaluate_hypothesis_requires_break_even_users():
+    reset_state()
+    hyp = {k: v for k, v in SAMPLE_HYP.items() if k != "break_even_users"}
+    tools.write_hypothesis.run(hypothesis=json.dumps({**hyp, "break_even_users": None}))
+    tools.write_hypothesis.run(hypothesis=json.dumps({
+        "id": "hyp_test_0001", "measured": {"reach_estimate": 1000, "reach_source": "estimated_upvotes"},
+    }))
+    result = json.loads(tools.evaluate_hypothesis.run(hypothesis_id="hyp_test_0001"))
+    assert "error" in result and "break_even_users" in result["error"]
+
+
+def test_evaluate_hypothesis_returns_build_outcome_when_sample_clears_break_even():
+    reset_state()
+    hyp = {**SAMPLE_HYP, "break_even_users": 2, "failure_rate": 0.001, "success_rate": 0.01}
+    tools.write_hypothesis.run(hypothesis=json.dumps(hyp))
+    tools.write_hypothesis.run(hypothesis=json.dumps({
+        "id": "hyp_test_0001", "measured": {"reach_estimate": 200, "reach_source": "estimated_upvotes"},
+    }))
+    created_at = datetime.fromisoformat(
+        json.loads(tools.read_hypotheses.run())[0]["created_at"].replace("Z", "+00:00")
+    )
+    inside_ts = (created_at + timedelta(hours=1)).isoformat()
+    for i in range(2):  # exactly break_even_users - a tiny sample, but real
+        tools._append_jsonl("signups.jsonl", {
+            "issue_number": i, "landing_page_variant_id": "lp_v1_default", "submitted_at": inside_ts,
+        })
+    result = json.loads(tools.evaluate_hypothesis.run(hypothesis_id="hyp_test_0001"))
+    assert result["score"] >= 0.7, result
+    assert result["outcome"] == "build", result
+
+
+def test_evaluate_hypothesis_returns_test_further_when_score_good_but_sample_too_small():
+    reset_state()
+    hyp = {**SAMPLE_HYP, "break_even_users": 50, "failure_rate": 0.001, "success_rate": 0.01}
+    tools.write_hypothesis.run(hypothesis=json.dumps(hyp))
+    tools.write_hypothesis.run(hypothesis=json.dumps({
+        "id": "hyp_test_0001", "measured": {"reach_estimate": 200, "reach_source": "estimated_upvotes"},
+    }))
+    created_at = datetime.fromisoformat(
+        json.loads(tools.read_hypotheses.run())[0]["created_at"].replace("Z", "+00:00")
+    )
+    inside_ts = (created_at + timedelta(hours=1)).isoformat()
+    for i in range(2):  # same great rate as above, but break_even_users=50 this time
+        tools._append_jsonl("signups.jsonl", {
+            "issue_number": i, "landing_page_variant_id": "lp_v1_default", "submitted_at": inside_ts,
+        })
+    result = json.loads(tools.evaluate_hypothesis.run(hypothesis_id="hyp_test_0001"))
+    assert result["score"] >= 0.7, result
+    assert result["outcome"] == "test_further", "a good rate on too few real conversions must not be 'build'"
 
 
 def test_check_escalation_triggers_on_low_rolling_average():
@@ -1044,6 +1283,73 @@ def test_search_research_archive_no_match():
     assert result["matches"] == []
 
 
+# --- holding.py: status reports (Sub-CEO -> Main-CEO structured handoff) ----
+
+def test_file_status_report_needs_decision_requires_context():
+    reset_state()
+    result = json.loads(holding.file_status_report.run(
+        subsidiary_id="api-sentinel", what_was_asked="evaluate hyp_x",
+        what_was_found="score 0.8, outcome build", needs_decision_from_above=True,
+    ))
+    assert "error" in result and "decision_context" in result["error"]
+
+
+def test_file_status_report_rejects_invalid_outcome():
+    reset_state()
+    result = json.loads(holding.file_status_report.run(
+        subsidiary_id="api-sentinel", what_was_asked="x", what_was_found="y", outcome="amazing",
+    ))
+    assert "error" in result
+
+
+def test_file_and_read_status_report_flow():
+    reset_state()
+    filed = json.loads(holding.file_status_report.run(
+        subsidiary_id="api-sentinel", what_was_asked="evaluate hyp_x",
+        what_was_found="score 0.8, cleared break-even with 2 real conversions",
+        hypothesis_id="hyp_x", outcome="build",
+        needs_decision_from_above=True, decision_context="approve the deploy request appr_xxx",
+    ))
+    assert "filed" in filed
+
+    needs_decision = json.loads(holding.read_status_reports.run(
+        subsidiary_id="api-sentinel", needs_decision_only=True,
+    ))
+    assert len(needs_decision) == 1
+    assert needs_decision[0]["outcome"] == "build"
+
+    ack = json.loads(holding.acknowledge_status_report.run(report_id=filed["filed"]))
+    assert ack.get("ok") is True
+    stored = json.loads(holding.read_status_reports.run(subsidiary_id="api-sentinel"))[0]
+    assert stored["acknowledged"] is True
+
+
+def test_acknowledge_status_report_unknown_id():
+    reset_state()
+    result = json.loads(holding.acknowledge_status_report.run(report_id="report_doesnotexist"))
+    assert "error" in result
+
+
+# --- holding.py: strategic direction (Main-CEO -> Sub-CEO structured handoff)
+
+def test_read_strategic_direction_none_set_is_valid():
+    reset_state()
+    result = json.loads(holding.read_strategic_direction.run(subsidiary_id="api-sentinel"))
+    assert result == {"direction": None}
+
+
+def test_set_and_read_strategic_direction_returns_latest():
+    reset_state()
+    holding.set_strategic_direction.run(
+        subsidiary_id="api-sentinel", focus_area="prioritize value hypotheses", reasoning="early data is thin",
+    )
+    holding.set_strategic_direction.run(
+        subsidiary_id="api-sentinel", focus_area="hold off on paid channels", reasoning="pivot proposal pending",
+    )
+    result = json.loads(holding.read_strategic_direction.run(subsidiary_id="api-sentinel"))
+    assert result["direction"]["focus_area"] == "hold off on paid channels"
+
+
 # --- crew.py: construction sanity (no kickoff, no API calls) ---------------
 
 def test_crew_has_four_agents_and_five_tasks():
@@ -1056,7 +1362,9 @@ def test_ceo_agent_tools_match_spec():
     assert tool_names == {
         "read_state", "read_hypotheses", "write_hypothesis", "evaluate_hypothesis",
         "check_escalation", "compare_channel_performance", "request_approval",
-        "read_channels", "write_channel",
+        "read_channels", "write_channel", "compute_break_even",
+        "file_task_order", "read_task_orders",
+        "file_status_report", "read_strategic_direction",
         "file_pivot_proposal", "file_cross_subsidiary_request", "search_research_archive",
     }, tool_names
 
@@ -1067,6 +1375,7 @@ def test_main_ceo_agent_tools_match_spec():
         "read_subsidiaries", "register_subsidiary", "set_subsidiary_status",
         "read_pivot_proposals", "decide_pivot_proposal",
         "read_cross_subsidiary_requests", "resolve_cross_subsidiary_request",
+        "read_status_reports", "acknowledge_status_report", "set_strategic_direction",
         "search_research_archive", "request_approval",
     }, tool_names
 
@@ -1074,8 +1383,11 @@ def test_main_ceo_agent_tools_match_spec():
 def test_growth_dev_tools():
     assert {t.name for t in crew.growth_agent.tools} == {
         "request_approval", "read_channel_metrics", "read_channels", "read_state", "read_hypotheses",
+        "read_task_orders", "complete_task_order",
     }
-    assert {t.name for t in crew.dev_agent.tools} == {"open_pull_request"}
+    assert {t.name for t in crew.dev_agent.tools} == {
+        "open_pull_request", "read_task_orders", "complete_task_order", "check_approval_status",
+    }
 
 
 def test_channel_strategy_task_assigned_to_ceo():

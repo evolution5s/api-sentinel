@@ -21,6 +21,7 @@ from pathlib import Path
 from crewai.tools import tool
 
 from jsonl_store import append_jsonl, read_jsonl, write_jsonl
+from scoring import HYPOTHESIS_OUTCOMES
 from tools import STATE_DIR as SUBSIDIARY_STATE_DIR
 
 HOLDING_DIR = SUBSIDIARY_STATE_DIR / "_holding"
@@ -360,3 +361,121 @@ def search_research_archive(query: str, subsidiary_id: str = "") -> str:
         {"query": query, "matches": results[:20], "total_matches": len(results)},
         ensure_ascii=False,
     )
+
+
+# --------------------------------------------------------------------------
+# Structured handoff: Sub-CEO -> Main-CEO (status report). Generalizes the
+# pivot-proposal pattern to every cycle's report, not just fundamental-
+# strategy escalations - a fixed record instead of the Main-CEO having to
+# re-derive what happened from the Sub-CEO's free-text task output.
+# --------------------------------------------------------------------------
+
+@tool("file_status_report")
+def file_status_report(
+    subsidiary_id: str,
+    what_was_asked: str,
+    what_was_found: str,
+    hypothesis_id: str = "",
+    outcome: str = "",
+    needs_decision_from_above: bool = False,
+    decision_context: str = "",
+) -> str:
+    """Sub-CEO reports this cycle's work to the Main-CEO as a fixed record -
+    what was being worked on, what was found, and whether anything needs a
+    decision from above. Pass hypothesis_id and outcome (one of build/
+    test_further/pivot/bury) whenever this report is about a specific
+    hypothesis's result. If needs_decision_from_above is true,
+    decision_context is required - say plainly what the Main-CEO actually
+    needs to decide, not just that something happened.
+    """
+    if needs_decision_from_above and not decision_context.strip():
+        return json.dumps({"error": "needs_decision_from_above=true requires a non-empty decision_context"})
+    if outcome and outcome not in HYPOTHESIS_OUTCOMES:
+        return json.dumps({"error": f"invalid outcome '{outcome}', must be one of {sorted(HYPOTHESIS_OUTCOMES)} or empty"})
+
+    record = {
+        "id": f"report_{uuid.uuid4().hex[:8]}",
+        "subsidiary_id": subsidiary_id,
+        "filed_at": datetime.now(timezone.utc).isoformat(),
+        "hypothesis_id": hypothesis_id or None,
+        "what_was_asked": what_was_asked,
+        "what_was_found": what_was_found,
+        "outcome": outcome or None,
+        "needs_decision_from_above": needs_decision_from_above,
+        "decision_context": decision_context or None,
+        "acknowledged": False,
+    }
+    _append("status_reports.jsonl", record)
+    return json.dumps({"filed": record["id"]})
+
+
+@tool("read_status_reports")
+def read_status_reports(subsidiary_id: str = "", needs_decision_only: bool = False) -> str:
+    """Read Sub-CEO status reports. Pass subsidiary_id to scope to one
+    subsidiary, or "" for all. Pass needs_decision_only=true to see just the
+    reports actually waiting on a Main-CEO decision, instead of every
+    routine "nothing to report" cycle.
+    """
+    reports = _read("status_reports.jsonl")
+    if subsidiary_id:
+        reports = [r for r in reports if r.get("subsidiary_id") == subsidiary_id]
+    if needs_decision_only:
+        reports = [r for r in reports if r.get("needs_decision_from_above")]
+    return json.dumps(reports, ensure_ascii=False)
+
+
+@tool("acknowledge_status_report")
+def acknowledge_status_report(report_id: str) -> str:
+    """Mark a status report as reviewed, so the same report doesn't keep
+    showing up as needing attention cycle after cycle.
+    """
+    reports = _read("status_reports.jsonl")
+    idx = next((i for i, r in enumerate(reports) if r.get("id") == report_id), None)
+    if idx is None:
+        return json.dumps({"error": f"no status report with id '{report_id}'"})
+    reports[idx]["acknowledged"] = True
+    _write("status_reports.jsonl", reports)
+    return json.dumps({"ok": True, "id": report_id})
+
+
+# --------------------------------------------------------------------------
+# Structured handoff: Main-CEO -> Sub-CEO (strategic direction). The
+# reverse of the above - previously there was no channel at all for the
+# Main-CEO to proactively steer a Sub-CEO; it could only ever react to what
+# came up to it. A genuinely new capability for main_ceo_agent, not an
+# extension of an existing one.
+# --------------------------------------------------------------------------
+
+@tool("set_strategic_direction")
+def set_strategic_direction(subsidiary_id: str, focus_area: str, reasoning: str) -> str:
+    """Main-CEO sets the current strategic direction/focus for a
+    subsidiary's Sub-CEO - e.g. "prioritize value-hypotheses over growth
+    experiments this quarter" or "hold off on paid channels until the
+    pivot proposal is decided". This does not override the Sub-CEO's own
+    tactical judgment (channel picks, hypothesis sizing) - it's the
+    higher-level frame the Sub-CEO should read and factor in, not a command
+    the Sub-CEO tools enforce mechanically.
+    """
+    record = {
+        "id": f"dir_{uuid.uuid4().hex[:8]}",
+        "subsidiary_id": subsidiary_id,
+        "set_at": datetime.now(timezone.utc).isoformat(),
+        "focus_area": focus_area,
+        "reasoning": reasoning,
+    }
+    _append("strategic_directions.jsonl", record)
+    return json.dumps({"filed": record["id"]})
+
+
+@tool("read_strategic_direction")
+def read_strategic_direction(subsidiary_id: str) -> str:
+    """Read the current (most recently set) strategic direction for this
+    subsidiary from the Main-CEO, or null if none has ever been set - no
+    direction set is a normal, valid state, not an error.
+    """
+    directions = [d for d in _read("strategic_directions.jsonl") if d.get("subsidiary_id") == subsidiary_id]
+    if not directions:
+        return json.dumps({"direction": None})
+    # Last in append order is the most recently written one - more reliable
+    # than sorting on set_at, which two calls in the same tick can tie on.
+    return json.dumps({"direction": directions[-1]}, ensure_ascii=False)
