@@ -8,8 +8,11 @@ from tools import (
     check_escalation,
     compare_channel_performance,
     evaluate_hypothesis,
+    is_system_paused,
     log_cycle_usage,
+    notify_new_pending_approvals,
     open_pull_request,
+    process_telegram_commands,
     read_channel_metrics,
     read_channels,
     read_hypotheses,
@@ -497,7 +500,7 @@ def _usage_line() -> str:
     )
 
 
-def send_cycle_summary(kickoff_error: Exception = None) -> None:
+def send_cycle_summary(kickoff_error: Exception = None, telegram_action_log: list = None) -> None:
     """Post a what-happened/what's-next digest of this cycle to Telegram,
     and save a condensed version as next cycle's continuity note. Called
     once after kickoff() finishes (or fails) - never raises itself, so a
@@ -508,14 +511,18 @@ def send_cycle_summary(kickoff_error: Exception = None) -> None:
     sees it.
     """
     try:
+        notify_new_pending_approvals()
         pending = json.loads(read_state.run()).get("pending_approvals", "?")
         lines = [f"API Sentinel Zyklus - {datetime.now(timezone.utc).isoformat()}"]
         if kickoff_error is not None:
             lines.append(f"WARNUNG: Der Crew-Lauf ist fehlgeschlagen: {kickoff_error}")
             lines.append("Nachfolgende Tasks haben moeglicherweise nicht mehr gelaufen.")
+        if telegram_action_log:
+            lines.append("Telegram-Kommandos diesen Zyklus verarbeitet:")
+            lines.extend(f"- {entry}" for entry in telegram_action_log)
         lines += [
             _usage_line(),
-            f"Offene Freigaben (approve.py): {pending}",
+            f"Offene Freigaben (approve.py / Telegram-Reply): {pending}",
         ]
         if _limit_hits:
             lines.append("WARNUNG: Sicherheitslimits diesen Zyklus ausgeloest:")
@@ -546,10 +553,19 @@ def send_cycle_summary(kickoff_error: Exception = None) -> None:
 
 if __name__ == "__main__":
     print("[api-sentinel] Autonomous Loop Started (Anthropic Claude)...")
-    try:
-        crew.kickoff()
-        print("[api-sentinel] Execution finished.")
-        send_cycle_summary()
-    except Exception as exc:
-        print(f"[api-sentinel] crew.kickoff() failed: {exc}")
-        send_cycle_summary(kickoff_error=exc)
+    telegram_action_log = process_telegram_commands()
+    paused, pause_note = is_system_paused()
+    if paused:
+        print(f"[api-sentinel] system paused ({pause_note}) - skipping this cycle.")
+        send_telegram_message(
+            f"API Sentinel Zyklus uebersprungen - System ist pausiert ({pause_note}). "
+            "Sende 'start', um fortzufahren."
+        )
+    else:
+        try:
+            crew.kickoff()
+            print("[api-sentinel] Execution finished.")
+            send_cycle_summary(telegram_action_log=telegram_action_log)
+        except Exception as exc:
+            print(f"[api-sentinel] crew.kickoff() failed: {exc}")
+            send_cycle_summary(kickoff_error=exc, telegram_action_log=telegram_action_log)

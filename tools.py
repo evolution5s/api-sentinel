@@ -743,3 +743,229 @@ def send_telegram_message(text: str) -> None:
         except requests.RequestException as exc:
             print(f"[telegram] failed to send cycle summary: {exc}")
             return
+
+
+# --------------------------------------------------------------------------
+# Telegram remote control (orchestration-level, not an agent tool - checked
+# directly from crew.py before each cron run, same reasoning as above: an
+# agent must never decide for itself whether to listen for operator
+# commands). Two things an operator can do by replying in Telegram, reusing
+# the existing human approval queue rather than adding a second one:
+#   - "stop"/"start": pause/resume the whole system across cron cycles.
+#   - reply "approve"/"reject" to a pending-approval notification (or type
+#     "<id> approve" directly): same effect as running approve.py.
+# --------------------------------------------------------------------------
+
+_TELEGRAM_OFFSET_FILE = "telegram_update_offset.txt"
+_SYSTEM_PAUSE_FILE = "system_paused.json"
+_APPROVAL_ID_RE = re.compile(r"appr_[0-9a-f]{8}")
+_STOP_WORDS = {"stop", "pause"}
+_START_WORDS = {"start", "resume", "weiter"}
+_APPROVE_WORDS = {"approve", "ja", "yes"}
+_REJECT_WORDS = {"reject", "nein", "no"}
+
+
+def is_system_paused() -> tuple[bool, str]:
+    """Whether the system is currently paused via a Telegram 'stop' command,
+    and the note explaining why. This is durable, cross-cycle state (not
+    per-run) - it stays paused until an explicit 'start'/'resume' clears it,
+    same file survives across every 6h cron invocation.
+    """
+    path = STATE_DIR / _SYSTEM_PAUSE_FILE
+    if not path.exists():
+        return False, ""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return False, ""
+    return bool(data.get("paused")), data.get("note", "")
+
+
+def set_system_paused(paused: bool, note: str = "") -> None:
+    _ensure_state_dir()
+    (STATE_DIR / _SYSTEM_PAUSE_FILE).write_text(
+        json.dumps(
+            {"paused": paused, "since": datetime.now(timezone.utc).isoformat(), "note": note},
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+
+def _read_telegram_offset() -> int:
+    path = STATE_DIR / _TELEGRAM_OFFSET_FILE
+    if not path.exists():
+        return 0
+    try:
+        return int(path.read_text(encoding="utf-8").strip())
+    except (ValueError, OSError):
+        return 0
+
+
+def _write_telegram_offset(offset: int) -> None:
+    _ensure_state_dir()
+    (STATE_DIR / _TELEGRAM_OFFSET_FILE).write_text(str(offset), encoding="utf-8")
+
+
+def _fetch_telegram_updates() -> list:
+    """Fetch new Telegram messages since the last processed update, scoped
+    to TELEGRAM_CHAT_ID only (never trust any other chat). Advances the
+    persisted offset immediately after a successful fetch, even for
+    messages that turn out not to be recognized commands, so a stray
+    message can never wedge processing in a retry loop. Returns [] and
+    never raises on any failure - Telegram being unreachable must never
+    block or crash a cron cycle.
+    """
+    token = os.getenv("TELEGRAM_BOT_TOKEN")
+    chat_id = os.getenv("TELEGRAM_CHAT_ID")
+    if not token or not chat_id:
+        return []
+
+    try:
+        resp = requests.get(
+            f"https://api.telegram.org/bot{token}/getUpdates",
+            params={"offset": _read_telegram_offset()},
+            timeout=15,
+        )
+        resp.raise_for_status()
+        result = resp.json().get("result", [])
+    except (requests.RequestException, ValueError) as exc:
+        print(f"[telegram] failed to fetch updates: {exc}")
+        return []
+
+    if not result:
+        return []
+    _write_telegram_offset(result[-1]["update_id"] + 1)
+
+    messages = []
+    for update in result:
+        message = update.get("message") or {}
+        if str(message.get("chat", {}).get("id", "")) != str(chat_id):
+            continue
+        text = (message.get("text") or "").strip()
+        if not text:
+            continue
+        reply_to = message.get("reply_to_message") or {}
+        messages.append({"text": text, "reply_to_text": reply_to.get("text") or ""})
+    return messages
+
+
+def _classify_command(text: str, reply_to_text: str):
+    """Classify one already-fetched Telegram message as a command. Returns
+    (action, approval_id) where action is one of "pause"/"resume"/
+    "approve"/"reject" (approval_id is None for pause/resume), or None if
+    the message isn't a recognized command - the operator may just be
+    chatting, that's not an error, it's silently ignored.
+
+    Two ways to approve/reject: reply directly to the notification message
+    that announced the pending approval (matched via the appr_... id in
+    reply_to_text), or type "<id> approve"/"<id> reject" directly if that
+    original message has scrolled out of view.
+    """
+    normalized = text.strip().lower()
+
+    if normalized in _STOP_WORDS:
+        return "pause", None
+    if normalized in _START_WORDS:
+        return "resume", None
+
+    decision = "approve" if normalized in _APPROVE_WORDS else "reject" if normalized in _REJECT_WORDS else None
+    if decision:
+        match = _APPROVAL_ID_RE.search(reply_to_text)
+        return (decision, match.group(0)) if match else None
+
+    id_match = _APPROVAL_ID_RE.search(text)
+    if id_match:
+        remainder = normalized.replace(id_match.group(0).lower(), "").strip()
+        if remainder in _APPROVE_WORDS:
+            return "approve", id_match.group(0)
+        if remainder in _REJECT_WORDS:
+            return "reject", id_match.group(0)
+
+    return None
+
+
+def _apply_telegram_commands(messages: list) -> list:
+    """Apply already-parsed Telegram commands: mutate the pause flag and/or
+    the approval queue, and send a short confirmation back per command.
+    Split out from the network fetch so the command logic itself is
+    testable with a canned message list, without hitting Telegram. Returns
+    a human-readable log of what happened, for the cycle summary.
+    """
+    import approve  # local import: avoids a circular import (approve.py imports from tools)
+
+    log = []
+    records = None
+
+    for msg in messages:
+        command = _classify_command(msg.get("text", ""), msg.get("reply_to_text", ""))
+        if command is None:
+            continue
+        action, target_id = command
+
+        if action == "pause":
+            set_system_paused(True, "per Telegram-Kommando 'stop'")
+            log.append("System pausiert (Telegram)")
+            send_telegram_message("System pausiert. Sende 'start', um fortzufahren.")
+            continue
+        if action == "resume":
+            set_system_paused(False)
+            log.append("System fortgesetzt (Telegram)")
+            send_telegram_message("System fortgesetzt.")
+            continue
+
+        if records is None:
+            records = approve._load()
+        record = next((r for r in records if r.get("id") == target_id), None)
+        if record is None or record.get("status") != "pending":
+            continue
+        status = "approved" if action == "approve" else "rejected"
+        records = approve.decide(records, target_id, status, "via Telegram")
+        log.append(f"{target_id} {status} (Telegram)")
+        send_telegram_message(f"{target_id}: {status}.")
+
+    if records is not None:
+        approve._save(records)
+
+    return log
+
+
+def process_telegram_commands() -> list:
+    """Check Telegram for operator commands sent since the last cycle and
+    act on them - see _classify_command for the supported syntax. Always
+    runs, even while the system is paused, so a 'start' can still be seen.
+    Never raises; a Telegram/network failure must never block or crash a
+    cron cycle. Returns a human-readable log of what it did, for the cycle
+    summary and Railway logs.
+    """
+    try:
+        messages = _fetch_telegram_updates()
+        return _apply_telegram_commands(messages) if messages else []
+    except Exception as exc:
+        print(f"[telegram] command processing failed: {exc}")
+        return []
+
+
+def notify_new_pending_approvals() -> None:
+    """Send a separate Telegram message for each pending approval that
+    hasn't been announced yet, so there's something concrete to reply
+    'approve'/'reject' to (see process_telegram_commands). Tracked via a
+    telegram_notified flag written onto the record itself so nothing is
+    announced twice across cycles.
+    """
+    approvals = _read_jsonl("approval_queue.jsonl")
+    changed = False
+    for record in approvals:
+        if record.get("status") != "pending" or record.get("telegram_notified"):
+            continue
+        send_telegram_message(
+            f"Neue Freigabe angefragt: {record['id']}\n"
+            f"Kategorie: {record.get('category')}\n"
+            f"Antrag: {record.get('proposal')}\n"
+            f"Begruendung: {record.get('reasoning')}\n\n"
+            "Antworte auf diese Nachricht mit 'approve' oder 'reject'."
+        )
+        record["telegram_notified"] = True
+        changed = True
+    if changed:
+        _write_jsonl("approval_queue.jsonl", approvals)

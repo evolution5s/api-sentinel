@@ -693,6 +693,134 @@ def test_send_telegram_message_degrades_gracefully_on_bad_token():
         os.environ.pop("TELEGRAM_CHAT_ID", None)
 
 
+# --- tools.py: Telegram remote control ---------------------------------------
+
+def test_system_pause_roundtrip():
+    reset_state()
+    assert tools.is_system_paused() == (False, "")
+    tools.set_system_paused(True, "per Telegram-Kommando 'stop'")
+    paused, note = tools.is_system_paused()
+    assert paused is True and note == "per Telegram-Kommando 'stop'"
+    tools.set_system_paused(False)
+    assert tools.is_system_paused() == (False, "")
+
+
+def test_process_telegram_commands_skips_without_credentials():
+    had_token = os.environ.pop("TELEGRAM_BOT_TOKEN", None)
+    had_chat = os.environ.pop("TELEGRAM_CHAT_ID", None)
+    try:
+        assert tools.process_telegram_commands() == []  # must not raise
+    finally:
+        if had_token is not None:
+            os.environ["TELEGRAM_BOT_TOKEN"] = had_token
+        if had_chat is not None:
+            os.environ["TELEGRAM_CHAT_ID"] = had_chat
+
+
+def test_fetch_telegram_updates_degrades_gracefully_on_bad_token():
+    os.environ["TELEGRAM_BOT_TOKEN"] = "invalid-token-for-checkup"
+    os.environ["TELEGRAM_CHAT_ID"] = "0"
+    try:
+        assert tools._fetch_telegram_updates() == []  # real network call, bad token -> must not raise
+    finally:
+        os.environ.pop("TELEGRAM_BOT_TOKEN", None)
+        os.environ.pop("TELEGRAM_CHAT_ID", None)
+
+
+def test_classify_command_stop_and_start():
+    assert tools._classify_command("stop", "") == ("pause", None)
+    assert tools._classify_command("  Pause  ", "") == ("pause", None)
+    assert tools._classify_command("start", "") == ("resume", None)
+    assert tools._classify_command("Resume", "") == ("resume", None)
+
+
+def test_classify_command_approve_reject_via_reply():
+    reply_text = "Neue Freigabe angefragt: appr_ab12cd34\nKategorie: spend"
+    assert tools._classify_command("approve", reply_text) == ("approve", "appr_ab12cd34")
+    assert tools._classify_command("ja", reply_text) == ("approve", "appr_ab12cd34")
+    assert tools._classify_command("reject", reply_text) == ("reject", "appr_ab12cd34")
+    assert tools._classify_command("nein", reply_text) == ("reject", "appr_ab12cd34")
+    # a plain approve/reject with nothing to reply to isn't a recognized command
+    assert tools._classify_command("approve", "") is None
+
+
+def test_classify_command_approve_reject_via_typed_id():
+    assert tools._classify_command("appr_ab12cd34 approve", "") == ("approve", "appr_ab12cd34")
+    assert tools._classify_command("approve appr_ab12cd34", "") == ("approve", "appr_ab12cd34")
+    assert tools._classify_command("appr_ab12cd34 reject", "") == ("reject", "appr_ab12cd34")
+
+
+def test_classify_command_unrecognized_text_is_ignored():
+    assert tools._classify_command("just chatting, not a command", "") is None
+    assert tools._classify_command("appr_ab12cd34 maybe?", "") is None
+
+
+def test_apply_telegram_commands_pause_and_resume():
+    reset_state()
+    had_token = os.environ.pop("TELEGRAM_BOT_TOKEN", None)
+    had_chat = os.environ.pop("TELEGRAM_CHAT_ID", None)
+    try:
+        log = tools._apply_telegram_commands([{"text": "stop", "reply_to_text": ""}])
+        assert tools.is_system_paused()[0] is True
+        assert any("pausiert" in entry for entry in log)
+
+        log = tools._apply_telegram_commands([{"text": "start", "reply_to_text": ""}])
+        assert tools.is_system_paused()[0] is False
+        assert any("fortgesetzt" in entry for entry in log)
+    finally:
+        if had_token is not None:
+            os.environ["TELEGRAM_BOT_TOKEN"] = had_token
+        if had_chat is not None:
+            os.environ["TELEGRAM_CHAT_ID"] = had_chat
+
+
+def test_apply_telegram_commands_approve_via_reply():
+    reset_state()
+    had_token = os.environ.pop("TELEGRAM_BOT_TOKEN", None)
+    had_chat = os.environ.pop("TELEGRAM_CHAT_ID", None)
+    try:
+        appr = json.loads(tools.request_approval.run(category="publish", proposal="p", reasoning="r"))
+        request_id = appr["queued"]
+        notification_text = f"Neue Freigabe angefragt: {request_id}\nKategorie: publish"
+
+        log = tools._apply_telegram_commands([{"text": "approve", "reply_to_text": notification_text}])
+        assert any(request_id in entry and "approved" in entry for entry in log)
+        stored = next(r for r in tools._read_jsonl("approval_queue.jsonl") if r["id"] == request_id)
+        assert stored["status"] == "approved"
+
+        # already decided - a second reply must not flip it or error
+        log = tools._apply_telegram_commands([{"text": "reject", "reply_to_text": notification_text}])
+        assert log == []
+        stored = next(r for r in tools._read_jsonl("approval_queue.jsonl") if r["id"] == request_id)
+        assert stored["status"] == "approved"
+    finally:
+        if had_token is not None:
+            os.environ["TELEGRAM_BOT_TOKEN"] = had_token
+        if had_chat is not None:
+            os.environ["TELEGRAM_CHAT_ID"] = had_chat
+
+
+def test_notify_new_pending_approvals_marks_and_is_idempotent():
+    reset_state()
+    had_token = os.environ.pop("TELEGRAM_BOT_TOKEN", None)
+    had_chat = os.environ.pop("TELEGRAM_CHAT_ID", None)
+    try:
+        appr = json.loads(tools.request_approval.run(category="publish", proposal="p", reasoning="r"))
+        tools.notify_new_pending_approvals()
+        stored = next(r for r in tools._read_jsonl("approval_queue.jsonl") if r["id"] == appr["queued"])
+        assert stored["telegram_notified"] is True
+
+        # calling again must not error and must not un-mark it
+        tools.notify_new_pending_approvals()
+        stored = next(r for r in tools._read_jsonl("approval_queue.jsonl") if r["id"] == appr["queued"])
+        assert stored["telegram_notified"] is True
+    finally:
+        if had_token is not None:
+            os.environ["TELEGRAM_BOT_TOKEN"] = had_token
+        if had_chat is not None:
+            os.environ["TELEGRAM_CHAT_ID"] = had_chat
+
+
 def test_sync_signups_from_github_via_read_state():
     reset_state()
     state = json.loads(tools.read_state.run())
