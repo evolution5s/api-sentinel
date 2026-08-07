@@ -80,9 +80,76 @@ def _patch_max_iterations_final_answer_role() -> bool:
     return bool(patched_modules)
 
 
+def _patch_disable_strict_tool_schemas() -> bool:
+    """Root cause (verified directly in crewai.utilities.agent_utils, both
+    the installed 1.15.9 and the pinned 1.15.11): convert_tools_to_openai_
+    schema() unconditionally bakes "strict": True into every tool's schema,
+    with no per-tool or per-agent way to opt out. Anthropic's native tool-use
+    API enforces a hard cap of 20 "strict" tools per request and rejects the
+    whole call with a 400 the moment a single agent has 21+ tools ("Too many
+    strict tools (21). The maximum number of strict tools supported is 20.")
+    - not a rare edge case, a threshold this repo's own agents were always
+    going to cross as more tools get added over time. Reproduced in
+    production: ceo_agent crossed 20 tools and every task assigned to it
+    failed crew.kickoff() outright.
+
+    Same behavior otherwise, minimal fix: after crewai builds each tool's
+    OpenAI-format schema, strip the "strict" flag it hardcodes so Anthropic
+    never counts these tools against its strict-tool cap. Every tool in this
+    repo already validates its own arguments and returns a JSON error
+    instead of crashing on bad input (see tools.py/holding.py), so turning
+    off provider-side strict-schema enforcement removes no real safety net
+    here - it only removes an artificial ceiling on how many tools one
+    agent can have.
+    """
+    try:
+        from crewai.utilities import agent_utils
+    except ImportError as exc:
+        print(f"[crewai_patches] could not import strict-tools patch target: {exc}")
+        return False
+
+    if not hasattr(agent_utils, "convert_tools_to_openai_schema"):
+        print(
+            "[crewai_patches] WARNING: convert_tools_to_openai_schema not found - "
+            "strict-tools patch not applied, the 20-strict-tools 400 may recur"
+        )
+        return False
+
+    original_convert = agent_utils.convert_tools_to_openai_schema
+
+    def _convert_tools_without_strict(tools):
+        openai_tools, available_functions, tool_name_mapping = original_convert(tools)
+        for schema in openai_tools:
+            function = schema.get("function")
+            if isinstance(function, dict):
+                function.pop("strict", None)
+        return openai_tools, available_functions, tool_name_mapping
+
+    patched_modules = []
+    for module_path in ("crewai.utilities.agent_utils", "crewai.agents.crew_agent_executor"):
+        try:
+            module = __import__(module_path, fromlist=["convert_tools_to_openai_schema"])
+        except ImportError:
+            continue
+        if not hasattr(module, "convert_tools_to_openai_schema"):
+            continue
+        module.convert_tools_to_openai_schema = _convert_tools_without_strict
+        patched_modules.append(module_path)
+
+    if patched_modules:
+        print(f"[crewai_patches] patched convert_tools_to_openai_schema (strict disabled) in: {patched_modules}")
+    else:
+        print(
+            "[crewai_patches] WARNING: convert_tools_to_openai_schema not patched anywhere - "
+            "the 20-strict-tools 400 may recur"
+        )
+    return bool(patched_modules)
+
+
 def apply_patches() -> None:
     """Apply every patch in this module. Called once, at import time, from
     crew.py - before any Agent/Task is constructed, since the patch has to
     be in place before an agent could ever reach its max_iter cap.
     """
     _patch_max_iterations_final_answer_role()
+    _patch_disable_strict_tool_schemas()

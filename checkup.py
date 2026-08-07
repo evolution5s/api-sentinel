@@ -1703,6 +1703,33 @@ def test_max_iterations_patch_applied_in_both_known_modules():
     assert cae.handle_max_iterations_exceeded is eae.handle_max_iterations_exceeded
 
 
+def test_strict_tools_patch_removes_strict_flag_from_schema():
+    from crewai.utilities.agent_utils import convert_tools_to_openai_schema
+    openai_tools, _, _ = convert_tools_to_openai_schema([tools.read_state, tools.write_hypothesis])
+    assert len(openai_tools) == 2
+    for schema in openai_tools:
+        assert "strict" not in schema["function"], (
+            "Anthropic rejects a request with 21+ tools marked 'strict' - "
+            "the patch must strip this flag from every tool's schema"
+        )
+
+
+def test_strict_tools_patch_applied_in_both_known_modules():
+    import crewai.agents.crew_agent_executor as cae
+    from crewai.utilities import agent_utils
+    assert agent_utils.convert_tools_to_openai_schema is cae.convert_tools_to_openai_schema
+
+
+def test_ceo_agent_real_tool_schema_has_no_strict_flags():
+    # Regression check tied to the actual production crash: ceo_agent's real
+    # tool list (21 tools as of this addition) must never produce a schema
+    # Anthropic would reject for exceeding its 20-strict-tools cap.
+    from crewai.utilities.agent_utils import convert_tools_to_openai_schema
+    openai_tools, _, _ = convert_tools_to_openai_schema(crew.ceo_agent.tools)
+    assert len(openai_tools) == len(crew.ceo_agent.tools)
+    assert all("strict" not in schema["function"] for schema in openai_tools)
+
+
 # --- agent_profile.json: model/token/iteration profile toggle --------------
 
 def test_agent_profile_file_has_both_profiles_fully_specified():
