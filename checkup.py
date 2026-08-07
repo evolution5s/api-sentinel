@@ -1088,6 +1088,49 @@ def test_main_ceo_review_task_assigned_to_main_ceo():
     assert crew.crew.tasks[3] is crew.task_main_ceo_review
 
 
+def test_agents_have_explicit_retry_limit():
+    # crewai defaults to 2 (3 total attempts, each with a full fresh
+    # max_iter/max_execution_time) if left unset - verify it's pinned to 1
+    # on every agent instead of silently drifting back to that default.
+    for agent in (crew.growth_agent, crew.dev_agent, crew.ceo_agent, crew.main_ceo_agent):
+        assert agent.max_retry_limit == 1
+
+
+def test_only_first_task_is_unconditional():
+    from crewai.tasks.conditional_task import ConditionalTask
+    assert not isinstance(crew.task_channel_strategy, ConditionalTask)
+    for task in (crew.task_growth, crew.task_ceo, crew.task_main_ceo_review, crew.task_dev):
+        assert isinstance(task, ConditionalTask)
+        assert task.condition is crew._within_cycle_budget
+
+
+def test_cycle_token_budget_gate_allows_under_budget():
+    from crewai import Crew
+    crew._limit_hits.clear()
+    original = Crew.calculate_usage_metrics
+    try:
+        Crew.calculate_usage_metrics = lambda self: type("U", (), {"total_tokens": 0})()
+        assert crew._within_cycle_budget(None) is True
+        assert crew._limit_hits == []
+    finally:
+        Crew.calculate_usage_metrics = original
+        crew._limit_hits.clear()
+
+
+def test_cycle_token_budget_gate_blocks_over_budget():
+    from crewai import Crew
+    crew._limit_hits.clear()
+    original = Crew.calculate_usage_metrics
+    try:
+        over_budget = crew.CYCLE_TOKEN_BUDGET + 1
+        Crew.calculate_usage_metrics = lambda self: type("U", (), {"total_tokens": over_budget})()
+        assert crew._within_cycle_budget(None) is False
+        assert any("Zyklus-Token-Budget" in hit for hit in crew._limit_hits)
+    finally:
+        Crew.calculate_usage_metrics = original
+        crew._limit_hits.clear()
+
+
 def test_send_cycle_summary_never_raises_without_a_crew_run():
     reset_state()
     had_token = os.environ.pop("TELEGRAM_BOT_TOKEN", None)

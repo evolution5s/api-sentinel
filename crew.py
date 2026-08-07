@@ -3,6 +3,7 @@ import os
 from datetime import datetime, timezone
 
 from crewai import Agent, Crew, Process, Task, LLM
+from crewai.tasks.conditional_task import ConditionalTask
 
 from tools import (
     check_escalation,
@@ -98,17 +99,36 @@ main_ceo_llm = LLM(max_tokens=4000, **_ANTHROPIC_KWARGS)
 
 # Agents mit dem Claude-LLM konfigurieren.
 # Pro Agent gesetzte Kappungen gegen Budget-Ausreisser in einem einzelnen
-# Cron-Lauf (verifiziert gegen die tatsaechlich installierte crewai-Version
-# 1.15.9 - siehe Agent.model_fields, nicht angenommen):
+# Cron-Lauf (verifiziert gegen die tatsaechlich installierte crewai-Version,
+# 1.15.9 lokal und 1.15.11 gepinnt, beide geprueft - siehe Agent.model_fields,
+# nicht angenommen):
 #   - max_iter: bereits vorhanden, unveraendert - harte Obergrenze fuer
-#     Tool-Aufrufe/Denkschritte einer einzelnen Task.
-#   - max_execution_time (neu, Sekunden): harte Wall-Clock-Grenze pro Task -
-#     faengt Faelle ab, in denen wenige, aber sehr lange/teure Schritte
-#     (nicht viele kleine) das Budget sprengen wuerden. Ein Ueberschreiten
-#     wirft TimeoutError, das crew.kickoff() nach oben durchreicht und vom
-#     bestehenden kickoff_error-Pfad in send_cycle_summary() gemeldet wird.
-#   - max_rpm (neu): zusaetzliches Sicherheitsnetz gegen einen Agenten, der
-#     in kurzer Zeit ungewoehnlich viele Requests abfeuert.
+#     Tool-Aufrufe/Denkschritte einer einzelnen Task-AUSFUEHRUNG.
+#   - max_execution_time (Sekunden): harte Wall-Clock-Grenze pro Task-
+#     AUSFUEHRUNG - faengt Faelle ab, in denen wenige, aber sehr lange/teure
+#     Schritte (nicht viele kleine) das Budget sprengen wuerden. Ein
+#     Ueberschreiten wirft TimeoutError, das crew.kickoff() nach oben
+#     durchreicht und vom bestehenden kickoff_error-Pfad in
+#     send_cycle_summary() gemeldet wird.
+#   - max_rpm: zusaetzliches Sicherheitsnetz gegen einen Agenten, der in
+#     kurzer Zeit ungewoehnlich viele Requests abfeuert.
+#   - max_retry_limit (neu, explizit statt crewai's Default 2): wenn eine
+#     Task mit einem Fehler abbricht, wiederholt crewai sie automatisch -
+#     und jeder Retry startet mit VOLLEM max_iter/max_execution_time neu
+#     (verifiziert: agent._handle_execution_error() ruft self.execute_task()
+#     komplett neu auf). Bei einem deterministisch fehlschlagenden Fehler
+#     (wie dem thinking.disabled-Bug, der jeden Lauf abgebrochen hat) heisst
+#     das: bis zum 3-fachen des eigentlichen Budgets, bevor endgueltig
+#     aufgegeben wird. 1 statt 2 begrenzt das auf hoechstens das Doppelte -
+#     genug Toleranz fuer einen echten transienten Fehler (Netzwerk-Hickser),
+#     aber kein 3x-Multiplikator mehr bei einem wiederkehrenden Bug.
+#
+# Was diese Vier NICHT abdecken: eine Grenze ueber den GESAMTEN Zyklus
+# (alle 5 Tasks zusammen) - jede der obigen Kappungen wirkt nur pro
+# einzelner Task-Ausfuehrung. ceo_agent laeuft zweimal pro Zyklus (Channel-
+# Strategie + Build-Measure-Learn), ohne dass sein Budget dafuer irgendwo
+# addiert sichtbar waere. Das schliesst CYCLE_TOKEN_BUDGET weiter unten,
+# direkt vor den Task-Definitionen (siehe dort).
 growth_agent = Agent(
     role="Growth Engine / Dev Relations",
     goal="Draft content matching the currently active hypothesis and measure real reach after it's approved and posted",
@@ -123,6 +143,7 @@ growth_agent = Agent(
     max_iter=30,
     max_execution_time=600,
     max_rpm=20,
+    max_retry_limit=1,
     verbose=True,
 )
 
@@ -139,6 +160,7 @@ dev_agent = Agent(
     max_iter=15,
     max_execution_time=300,
     max_rpm=20,
+    max_retry_limit=1,
     verbose=True,
 )
 
@@ -176,6 +198,7 @@ ceo_agent = Agent(
     max_iter=50,
     max_execution_time=900,
     max_rpm=20,
+    max_retry_limit=1,
     verbose=True,
 )
 
@@ -209,6 +232,7 @@ main_ceo_agent = Agent(
     max_iter=25,
     max_execution_time=600,
     max_rpm=20,
+    max_retry_limit=1,
     verbose=True,
 )
 
@@ -232,6 +256,38 @@ def _make_iteration_watchdog(agent: Agent, label: str):
         if executor is not None and executor.iterations >= agent.max_iter:
             _limit_hits.append(f"{label}: max_iter-Kappe ({agent.max_iter}) erreicht, finale Antwort erzwungen")
     return _watchdog
+
+
+# --------------------------------------------------------------------------
+# Zyklus-Budget-Schutz: die einzige Grenze oben, die tatsaechlich ueber den
+# GANZEN Zyklus wirkt statt nur pro einzelner Task-Ausfuehrung. Ohne das
+# haette der Bug-Zyklus mit 1,52 Mio. Tokens ungebremst weiterlaufen
+# koennen - mit CYCLE_TOKEN_BUDGET waere er bei 1 Mio. gestoppt worden.
+#
+# Implementiert ueber crewai's ConditionalTask (offizieller, dokumentierter
+# Mechanismus - kein Hack, verifiziert in crewai.tasks.conditional_task auf
+# beiden installierten Versionen): eine ConditionalTask wird nur ausgefuehrt,
+# wenn ihre condition-Funktion True zurueckgibt, sonst uebersprungen -
+# angewendet auf alle Tasks ausser der ersten (die darf per
+# ConditionalTask-Constraint nicht selbst conditional sein, braucht aber
+# ohnehin kein Budget-Gate, da vor ihr noch nichts verbraucht wurde).
+#
+# crew.calculate_usage_metrics() liest live-kumulierte Nutzung direkt von
+# jedem Agenten-LLM (nicht nur den am Ende gecachten Wert) und funktioniert
+# deshalb auch mitten im Lauf zuverlaessig - verifiziert im Quellcode
+# (crewai/crew.py), nicht angenommen.
+CYCLE_TOKEN_BUDGET = 1_000_000
+
+
+def _within_cycle_budget(_previous_task_output) -> bool:
+    total = crew.calculate_usage_metrics().total_tokens
+    if total >= CYCLE_TOKEN_BUDGET:
+        _limit_hits.append(
+            f"Zyklus-Token-Budget ({CYCLE_TOKEN_BUDGET:,}) erreicht "
+            f"({total:,} verbraucht) - verbleibende Tasks diesen Zyklus uebersprungen"
+        )
+        return False
+    return True
 
 
 # Tasks definieren
@@ -313,7 +369,8 @@ task_channel_strategy = Task(
     callback=_make_iteration_watchdog(ceo_agent, "Sub-CEO (Channel-Strategie)"),
 )
 
-task_growth = Task(
+task_growth = ConditionalTask(
+    condition=_within_cycle_budget,
     description=(
         "Call read_state to see current signups, then read_hypotheses(status="
         "'active') to see what's currently being tested. For each active "
@@ -344,7 +401,8 @@ task_growth = Task(
     callback=_make_iteration_watchdog(growth_agent, "Growth"),
 )
 
-task_ceo = Task(
+task_ceo = ConditionalTask(
+    condition=_within_cycle_budget,
     description=(
         "Run the Build-Measure-Learn loop: "
         "0) Call read_state() first. If total_hypotheses is 0 (nothing has "
@@ -419,7 +477,8 @@ task_ceo = Task(
     callback=_make_iteration_watchdog(ceo_agent, "Sub-CEO (Build-Measure-Learn)"),
 )
 
-task_main_ceo_review = Task(
+task_main_ceo_review = ConditionalTask(
+    condition=_within_cycle_budget,
     description=(
         "Run the holding's governance review for this cycle:\n"
         "1) Call read_pivot_proposals(status='pending'). For each: weigh it "
@@ -461,7 +520,8 @@ task_main_ceo_review = Task(
     callback=_make_iteration_watchdog(main_ceo_agent, "Main-CEO"),
 )
 
-task_dev = Task(
+task_dev = ConditionalTask(
+    condition=_within_cycle_budget,
     description=(
         "Read the CEO's report above. If and only if it says a new or changed "
         "landing page variant is needed, call open_pull_request to add it as "
@@ -511,7 +571,10 @@ def _usage_line() -> str:
         f"(teurer, einmalig pro Cache-Fenster) - CrewAI cached role/goal/"
         f"backstory + Tool-Definitionen pro Agent automatisch, sobald der "
         f"gemeinsame Praefix (Tools+System) das Modell-Minimum erreicht; "
-        f"{usage['successful_requests']} Requests, max_tokens/Call: "
+        f"{usage['successful_requests']} Requests, "
+        f"{usage['total_tokens']}/{CYCLE_TOKEN_BUDGET:,} Zyklus-Budget "
+        f"({round(100 * (usage['total_tokens'] or 0) / CYCLE_TOKEN_BUDGET)}%); "
+        f"max_tokens/Call: "
         f"Growth={growth_llm.max_tokens} Dev={dev_llm.max_tokens} "
         f"Sub-CEO={ceo_llm.max_tokens} Main-CEO={main_ceo_llm.max_tokens}"
     )
