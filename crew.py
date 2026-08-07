@@ -61,21 +61,31 @@ if not ANTHROPIC_KEY:
 # geprueft): AnthropicThinkingConfig.type ist dort ein Literal["enabled",
 # "disabled"] - "adaptive" (Sonnet 5s tatsaechlicher On-Modus laut
 # Anthropic) wird von crewai's eigener Pydantic-Validierung abgelehnt,
-# noch bevor ein API-Call passiert. "enabled" wuerde zwar crewai passieren,
-# aber bei Sonnet 5 serverseitig mit 400 abgelehnt werden (budget_tokens
-# ist fuer dieses Modell entfernt, nur "adaptive" ist der gueltige
-# On-Modus). Deshalb:
-#   - Denken AN (Sub-CEO/Main-CEO): thinking gar nicht setzen - Sonnet 5
-#     laeuft dann laut Anthropic-Doku bereits automatisch adaptiv. Das ist
-#     inhaltlich identisch zu einem expliziten "adaptive", nur eben nicht
-#     explizit im Code ausdrueckbar mit dieser crewai-Version.
-#   - Denken AUS (Growth/Dev): thinking={"type": "disabled"} - das ist bei
-#     Sonnet 5 ein gueltiger, von crewai unterstuetzter Wert.
+# noch bevor ein API-Call passiert.
+#
+# thinking={"type": "disabled"} wurde hier bewusst wieder entfernt - das
+# war die Ursache des "thinking.disabled.budget_tokens: Extra inputs are
+# not permitted"-Fehlers, der jeden Cron-Lauf abgebrochen hat.
+# Root Cause verifiziert: AnthropicThinkingConfig(type="disabled")
+# .model_dump() liefert IMMER {"type": "disabled", "budget_tokens": None}
+# mit, und crewai's _prepare_completion_params() serialisiert das ohne
+# exclude_none=True in den API-Call - Anthropic lehnt budget_tokens als
+# Feld unter type="disabled" komplett ab, auch als null. Ueber den
+# oeffentlichen thinking=-Parameter laesst sich das nicht umgehen, da
+# Pydantic jeden Input in genau dieses Modell validiert. Das ist ein
+# crewai-Bug (bestaetigt in 1.15.9 und 1.15.11), keine Fehlkonfiguration
+# hier - ein Upstream-Report waere angebracht.
+#
+# Konsequenz: thinking bleibt fuer alle vier Agenten unGESETZT. Sonnet 5
+# laeuft dann laut Anthropic-Doku ohnehin automatisch adaptiv - fuer
+# Sub-CEO/Main-CEO war das immer schon die Absicht; fuer Growth/Dev
+# verliert das den zuvor angestrebten "kein Denken noetig"-Sparvorteil,
+# aber ein zuverlaessig laufender Cron-Job hat Vorrang vor der
+# Fein-Optimierung.
 _ANTHROPIC_KWARGS = {"model": "anthropic/claude-sonnet-5", "api_key": ANTHROPIC_KEY}
-_THINKING_DISABLED = {"type": "disabled"}
 
-growth_llm = LLM(max_tokens=1500, thinking=_THINKING_DISABLED, **_ANTHROPIC_KWARGS)
-dev_llm = LLM(max_tokens=8000, thinking=_THINKING_DISABLED, **_ANTHROPIC_KWARGS)
+growth_llm = LLM(max_tokens=1500, **_ANTHROPIC_KWARGS)
+dev_llm = LLM(max_tokens=8000, **_ANTHROPIC_KWARGS)
 ceo_llm = LLM(max_tokens=8000, **_ANTHROPIC_KWARGS)
 main_ceo_llm = LLM(max_tokens=4000, **_ANTHROPIC_KWARGS)
 
