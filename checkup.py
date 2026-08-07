@@ -90,6 +90,9 @@ SAMPLE_HYP = {
     "price_point_monthly": 20,
     "break_even_horizon_months": 6,
     "break_even_users": 9,  # ceil(1000 / (20 * 6))
+    "impact_score": 3,
+    "confidence_score": 3,
+    "primary_variable_tested": "audience",  # required for a first attempt (no prior_hypothesis_id)
 }
 
 SAMPLE_PIVOT = {
@@ -480,6 +483,32 @@ def test_write_hypothesis_pivot_followup_requires_variable_and_reasoning():
     assert result.get("ok") is True
 
 
+# --- tools.py: one-variable rule on first attempts too (four-fixes addendum, point 2) --
+
+def test_write_hypothesis_first_attempt_requires_primary_variable_tested():
+    reset_state()
+    bad = dict(SAMPLE_HYP)
+    del bad["primary_variable_tested"]
+    result = json.loads(tools.write_hypothesis.run(hypothesis=json.dumps(bad)))
+    assert "error" in result and "primary_variable_tested" in result["error"]
+
+
+def test_write_hypothesis_first_attempt_rejects_invalid_primary_variable():
+    reset_state()
+    bad = {**SAMPLE_HYP, "primary_variable_tested": "everything_at_once"}
+    result = json.loads(tools.write_hypothesis.run(hypothesis=json.dumps(bad)))
+    assert "error" in result and "primary_variable_tested" in result["error"]
+
+
+def test_write_hypothesis_first_attempt_succeeds_with_primary_variable():
+    reset_state()
+    result = json.loads(tools.write_hypothesis.run(hypothesis=json.dumps(SAMPLE_HYP)))
+    assert result.get("ok") is True
+    stored = json.loads(tools.read_hypotheses.run())[0]
+    assert stored["primary_variable_tested"] == "audience"
+    assert stored["holding_constant_notes"] is None
+
+
 def test_write_hypothesis_parallelism_limit():
     reset_state()
     for i in range(2):
@@ -493,11 +522,74 @@ def test_write_hypothesis_parallelism_limit():
     assert "error" in result, "expected the 3rd active hypothesis on the same variant to be rejected"
 
 
+# --- tools.py: MAX_ACTIVE_HYPOTHESES cap (four-fixes addendum, point 4) ----
+
+def test_write_hypothesis_max_active_cap_enforced():
+    reset_state()
+    for i in range(tools.MAX_ACTIVE_HYPOTHESES):
+        h = {**SAMPLE_HYP, "id": f"hyp_cap_{i}", "landing_page_variant_id": f"lp_v{i}_cap"}
+        result = json.loads(tools.write_hypothesis.run(hypothesis=json.dumps(h)))
+        assert result.get("ok") is True, result
+    overflow = {**SAMPLE_HYP, "id": "hyp_cap_overflow", "landing_page_variant_id": "lp_v_overflow"}
+    result = json.loads(tools.write_hypothesis.run(hypothesis=json.dumps(overflow)))
+    assert "error" in result and "already status='active'" in result["error"], result
+
+
+def test_write_hypothesis_max_active_cap_frees_up_after_evaluation():
+    reset_state()
+    for i in range(tools.MAX_ACTIVE_HYPOTHESES):
+        h = {**SAMPLE_HYP, "id": f"hyp_cap_{i}", "landing_page_variant_id": f"lp_v{i}_cap"}
+        tools.write_hypothesis.run(hypothesis=json.dumps(h))
+    tools.write_hypothesis.run(hypothesis=json.dumps({
+        "id": "hyp_cap_0", "status": "evaluated", "outcome": "bury", "bury_reasoning": "weak signal",
+    }))
+    freed = {**SAMPLE_HYP, "id": "hyp_cap_new", "landing_page_variant_id": "lp_v_new"}
+    result = json.loads(tools.write_hypothesis.run(hypothesis=json.dumps(freed)))
+    assert result.get("ok") is True, result
+
+
 def test_read_hypotheses_status_filter():
     reset_state()
     tools.write_hypothesis.run(hypothesis=json.dumps(SAMPLE_HYP))
     assert len(json.loads(tools.read_hypotheses.run(status="active"))) == 1
     assert len(json.loads(tools.read_hypotheses.run(status="evaluated"))) == 0
+
+
+# --- tools.py: mandatory time-box (four-fixes addendum, point 1) -----------
+
+def test_read_due_hypotheses_not_due_before_duration_or_trigger():
+    reset_state()
+    tools.write_hypothesis.run(hypothesis=json.dumps(SAMPLE_HYP))  # duration_days=10, created "now"
+    assert json.loads(tools.read_due_hypotheses.run()) == []
+
+
+def test_read_due_hypotheses_due_when_duration_elapsed():
+    reset_state()
+    created_at = datetime.now(timezone.utc) - timedelta(days=11)
+    hyp = {**SAMPLE_HYP, "created_at": created_at.isoformat()}
+    tools.write_hypothesis.run(hypothesis=json.dumps(hyp))
+    due = json.loads(tools.read_due_hypotheses.run())
+    assert len(due) == 1 and due[0]["id"] == SAMPLE_HYP["id"] and due[0]["reason"] == "duration_elapsed"
+
+
+def test_read_due_hypotheses_due_early_via_sample_size_trigger():
+    reset_state()
+    hyp = {**SAMPLE_HYP, "sample_size_trigger": 500}
+    tools.write_hypothesis.run(hypothesis=json.dumps(hyp))  # duration_days=10, not elapsed yet
+    tools.write_hypothesis.run(hypothesis=json.dumps({
+        "id": SAMPLE_HYP["id"], "measured": {"reach_estimate": 600, "reach_source": "estimated_upvotes"},
+    }))
+    due = json.loads(tools.read_due_hypotheses.run())
+    assert len(due) == 1 and due[0]["reason"] == "sample_size_trigger_met" and due[0]["reach_estimate"] == 600
+
+
+def test_read_due_hypotheses_ignores_non_active():
+    reset_state()
+    tools.write_hypothesis.run(hypothesis=json.dumps({
+        **SAMPLE_HYP, "created_at": (datetime.now(timezone.utc) - timedelta(days=11)).isoformat(),
+        "status": "buried", "bury_reasoning": "no longer relevant",
+    }))
+    assert json.loads(tools.read_due_hypotheses.run()) == []
 
 
 def test_evaluate_hypothesis_without_reach_estimate_errors():
@@ -553,6 +645,67 @@ def test_compute_break_even_tool_rejects_non_positive():
         estimated_build_cost=0, price_point_monthly=20, break_even_horizon_months=6,
     ))
     assert "error" in result
+
+
+# --- tools.py: distilled knowledge base (four-fixes addendum, point 3) -----
+
+def test_write_knowledge_entry_requires_topic_and_takeaway():
+    reset_state()
+    result = json.loads(tools.write_knowledge_entry.run(
+        topic="  ", takeaway="works well", confidence="moderate",
+        source_hypothesis_ids=json.dumps(["hyp_x"]),
+    ))
+    assert "error" in result
+
+    result = json.loads(tools.write_knowledge_entry.run(
+        topic="Reddit organic", takeaway="  ", confidence="moderate",
+        source_hypothesis_ids=json.dumps(["hyp_x"]),
+    ))
+    assert "error" in result
+
+
+def test_write_knowledge_entry_rejects_invalid_confidence():
+    reset_state()
+    result = json.loads(tools.write_knowledge_entry.run(
+        topic="Reddit organic", takeaway="weak below ~50 karma", confidence="certain",
+        source_hypothesis_ids=json.dumps(["hyp_x"]),
+    ))
+    assert "error" in result
+
+
+def test_write_knowledge_entry_requires_nonempty_source_ids():
+    reset_state()
+    result = json.loads(tools.write_knowledge_entry.run(
+        topic="Reddit organic", takeaway="weak below ~50 karma", confidence="moderate",
+        source_hypothesis_ids=json.dumps([]),
+    ))
+    assert "error" in result
+
+    result = json.loads(tools.write_knowledge_entry.run(
+        topic="Reddit organic", takeaway="weak below ~50 karma", confidence="moderate",
+        source_hypothesis_ids="not a json array",
+    ))
+    assert "error" in result
+
+
+def test_write_knowledge_entry_and_read_knowledge_base_roundtrip():
+    reset_state()
+    result = json.loads(tools.write_knowledge_entry.run(
+        topic="Reddit organic on r/algotrading", takeaway="tested 4x, weak below ~50 karma accounts",
+        confidence="moderate", source_hypothesis_ids=json.dumps(["hyp_a", "hyp_b"]),
+        channel="reddit", tactic="thread_reply",
+    ))
+    assert result["ok"] is True
+
+    all_entries = json.loads(tools.read_knowledge_base.run())
+    assert len(all_entries) == 1
+    assert all_entries[0]["confidence"] == "moderate"
+    assert all_entries[0]["source_hypothesis_ids"] == ["hyp_a", "hyp_b"]
+
+    assert len(json.loads(tools.read_knowledge_base.run(topic="reddit organic"))) == 1  # case-insensitive substring
+    assert json.loads(tools.read_knowledge_base.run(topic="cold email")) == []
+    assert len(json.loads(tools.read_knowledge_base.run(channel="reddit"))) == 1
+    assert json.loads(tools.read_knowledge_base.run(channel="discord")) == []
 
 
 def test_evaluate_hypothesis_requires_break_even_users():
@@ -1777,13 +1930,14 @@ def test_crew_has_four_agents_and_five_tasks():
 def test_ceo_agent_tools_match_spec():
     tool_names = {t.name for t in crew.ceo_agent.tools}
     assert tool_names == {
-        "read_state", "read_hypotheses", "write_hypothesis", "evaluate_hypothesis",
+        "read_state", "read_hypotheses", "read_due_hypotheses", "write_hypothesis", "evaluate_hypothesis",
         "check_escalation", "compare_channel_performance", "request_approval",
         "read_channels", "write_channel", "compute_break_even",
         "file_task_order", "read_task_orders",
         "file_status_report", "read_strategic_direction",
         "file_pivot_proposal", "file_cross_subsidiary_request", "search_research_archive",
         "read_subsidiary_policies", "read_content_drafts", "log_research_finding", "read_research_findings",
+        "read_knowledge_base", "write_knowledge_entry",
     }, tool_names
 
 
@@ -1804,7 +1958,7 @@ def test_growth_dev_tools():
         "request_approval", "read_channel_metrics", "read_channels", "read_state", "read_hypotheses",
         "read_task_orders", "complete_task_order", "draft_content", "read_content_drafts",
         "check_community_risk", "get_account_stats", "log_research_finding", "read_research_findings",
-        "read_subsidiary_policies",
+        "read_subsidiary_policies", "read_knowledge_base",
     }
     assert {t.name for t in crew.dev_agent.tools} == {
         "open_pull_request", "read_task_orders", "complete_task_order", "check_approval_status",

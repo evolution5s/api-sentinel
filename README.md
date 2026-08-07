@@ -154,6 +154,7 @@ maßgebliche Anweisung, keine Paraphrase davon.
 | `get_account_stats` | Genuine/Werbe-Verhältnis pro Plattform prüfen |
 | `log_research_finding` / `read_research_findings` | Research-Evidence-Tier (siehe Kapitel 5) |
 | `read_subsidiary_policies` | Prüft, ob z.B. bezahlte Kanäle für diese Subsidiary erlaubt sind |
+| `read_knowledge_base` | Distillierte Erkenntnisse zu Themen/Kanälen/Taktiken lesen (siehe Kapitel 5.6) |
 
 **Was der Agent explizit NICHT tut:** selbst posten (immer Mensch-bestätigt),
 bezahlte Werbung selbst schalten oder vorschlagen (geht über
@@ -223,13 +224,28 @@ anderer Subsidiaries über `search_research_archive` ziehen, kontaktiert aber
 nie deren Sub-CEO direkt - das läuft immer über den Main-CEO
 (`file_cross_subsidiary_request`). Liest die eigenen Policies der Subsidiary
 (`read_subsidiary_policies`) als harte Nebenbedingung, nicht als etwas, um
-das man argumentativ herumkommt.
+das man argumentativ herumkommt. Nutzt `read_due_hypotheses` statt selbst
+verstrichene Zeit zu berechnen, damit keine aktive Hypothese unbemerkt über
+ihre eigene Zeitbox (`duration_days`, oder einen frühen
+`sample_size_trigger`) hinaus läuft, ohne durch die Vier-Wege-Bewertung zu
+gehen. Prüft `read_knowledge_base`, bevor eine neue Hypothese vorgeschlagen
+wird - derselbe günstige Erst-Schritt-Gedanke wie beim externen
+Research-Evidence-Tier, nur aus den eigenen vorherigen Hypothesen dieser
+Subsidiary distilliert - und schreibt einen neuen Eintrag
+(`write_knowledge_entry`), sobald eine Hypothese zu build/pivot/bury
+aufgelöst wird, damit auch das "warum es nicht passte" eines Pivots erhalten
+bleibt, nicht nur die Erfolge. Rangiert konkurrierende Hypothesen-Ideen nach
+`impact_score`/`confidence_score` genauso wie Kanäle rangiert werden, da nur
+`MAX_ACTIVE_HYPOTHESES` gleichzeitig laufen können - sich über zu viele
+Hypothesen gleichzeitig zu verzetteln gilt als der häufigere Fehler als die
+falsche zu wählen.
 
 **Tools:**
 | Tool | Zweck |
 |---|---|
 | `read_state` | Pipeline-Zustand lesen |
 | `read_hypotheses` / `write_hypothesis` | Hypothesen lesen/anlegen/aktualisieren |
+| `read_due_hypotheses` | Deterministisch prüfen, welche aktiven Hypothesen fällig sind (Zeitbox oder Sample-Trigger erreicht) |
 | `evaluate_hypothesis` | Echten Score + Vier-Wege-Outcome berechnen |
 | `check_escalation` | Rollierenden Score-Durchschnitt der Hypothesen-Linie prüfen |
 | `compare_channel_performance` | Kanäle nach echtem Durchschnitts-Score ranken |
@@ -245,6 +261,7 @@ das man argumentativ herumkommt.
 | `read_subsidiary_policies` | Eigene Policies (bezahlte Kanäle, Cold Email, ...) lesen |
 | `read_content_drafts` | Was Growth entworfen/gepostet hat, einsehen |
 | `log_research_finding` / `read_research_findings` | Research-Evidence-Tier |
+| `read_knowledge_base` / `write_knowledge_entry` | Distillierte Erkenntnisse lesen/schreiben (siehe Kapitel 5.6) |
 
 ### 3.4 Main-CEO der Open Claw Holding (`main_ceo_agent`)
 
@@ -344,12 +361,27 @@ Schritt 5 von `task_ceo`) braucht **vor** dem Start des Tests fixierte
 
 - `hypothesis_type`: `value` (löst ein echtes Nutzerproblem) oder `growth`
   (hilft bei Distribution/Skalierung von bereits Validiertem).
+- `impact_score`, `confidence_score` - eigenes ehrliches Urteil, gleiche
+  Form wie bei einem Kanal (Kapitel 6.1) - das Ranking-Signal, mit dem
+  konkurrierende Hypothesen-Ideen gegeneinander priorisiert werden, sobald
+  mehr Ideen als Kapazität vorhanden sind (Kapitel 5.8).
 - `estimated_build_cost`, `price_point_monthly`, `break_even_horizon_months`
   - grob geschätzte Kosten/Preis/Zeitrahmen für das *echte* Produkt/Feature,
     nicht für den Test selbst.
 - `break_even_users` - **nie** von Hand geschätzt, sondern via
   `compute_break_even()` (`scoring.compute_break_even_users`):
   `ceil(build_cost / (price_point_monthly * horizon_months))`.
+- `duration_days` - die verpflichtende Zeitbox (immer erforderlich), plus
+  optional `sample_size_trigger` für eine frühere Fälligkeit (Kapitel 5.6).
+- Genau eine ungetestete Variable pro Test: bei einem Pivot-Folgetest
+  `pivot_variable_changed`; beim ersten Versuch einer Linie (kein
+  `prior_hypothesis_id` gesetzt, auch die allererste Hypothese überhaupt)
+  `primary_variable_tested` - beide aus derselben Menge (`audience`/
+  `price`/`copy`/`channel`/`timing`). Nie mehrere echt ungetestete
+  Variablen in einen ersten Test bündeln (z.B. neue Zielgruppe *und* neuer
+  Preis gleichzeitig) - sonst lässt sich das Ergebnis keiner der beiden
+  Änderungen eindeutig zuordnen. Optional dazu `holding_constant_notes` -
+  was bewusst konstant gehalten wird.
 
 Dazu optionale, freitextliche Reasoning-Felder (keine neue Pass/Fail-Hürde,
 nur dokumentierte Abwägung): `defensibility_notes` (könnte ein Solo-
@@ -360,7 +392,10 @@ langsamere Adoption), `expansion_notes` (Upsell-/B2B-Potenzial, rein
 zukunftsgerichtet), `channel_fit_reasoning` (warum genau dieser Kanal zu
 genau dieser Zielgruppe passt).
 
-Vor einem echten Live-Experiment: Research-Evidence-Tier prüfen
+Vor der Formulierung einer neuen Hypothese: `read_knowledge_base(topic=...)`
+prüfen (Kapitel 5.7) - vielleicht existiert schon eine distillierte
+Erkenntnis zu diesem Thema/Kanal/Taktik aus einem früheren Zyklus. Danach,
+vor einem echten Live-Experiment: Research-Evidence-Tier prüfen
 (`read_research_findings`/`log_research_finding`) - Wettbewerbsprodukte,
 Forendiskussionen, Antworten auf einen echten `own_question_post`. Günstiger
 und schneller als ein Live-Test, aber schwächere Evidenz: kann
@@ -425,6 +460,12 @@ statt eigenständigem Weiterpivotieren.
   permanent und keine Löschung - der Record bleibt und kann bei geänderten
   Rahmenbedingungen später wieder aufgegriffen werden.
 
+Bei **build**, **pivot** und **bury** (nicht bei `test_further` - das ist
+eine Fortsetzung, noch keine Auflösung) wird zusätzlich ein
+`write_knowledge_entry`-Eintrag distilliert (Kapitel 5.7) - ein Pivot lässt
+sich genauso lehrreich zusammenfassen ("warum es nicht passte") wie ein
+Build ("das hat funktioniert").
+
 ### 5.5 Phasentrennung (Validierung vs. Skalierung)
 
 Es gibt keine separate "Phasen"-Maschinerie - die vorhandenen Mechanismen
@@ -432,6 +473,71 @@ implementieren das bereits: `test_further`/`pivot` **sind** die
 Validierungsphase (Content bleibt organisch, kein Produktlink, bevor
 `landing_page_live=true`), `build` löst die genehmigungspflichtige
 Skalierungsphase aus (Dev baut erst nach Freigabe).
+
+### 5.6 Fälligkeit und Zeitbox (`read_due_hypotheses`)
+
+Jede Hypothese braucht eine vor dem Start festgelegte Laufzeitgrenze -
+ohne sie könnte ein Experiment unbegrenzt weiterlaufen, ohne je durch die
+Vier-Wege-Bewertung gezwungen zu werden. `duration_days` ist dafür immer
+Pflicht (Kapitel 5.1). Zusätzlich kann optional `sample_size_trigger`
+gesetzt werden - ein `measured.reach_estimate`-Wert, bei dessen Erreichen
+die Hypothese schon **vor** Ablauf von `duration_days` fällig wird (nützlich
+für einen schnellen Kanal, der bereits früh ein echtes Signal liefert und
+nicht das volle Fenster abwarten muss).
+
+`read_due_hypotheses()` berechnet deterministisch, welche aktiven
+Hypothesen gerade fällig sind (Zeitbox abgelaufen ODER Sample-Trigger
+erreicht, je nachdem was zuerst eintritt) - `task_ceo` nutzt dieses Tool
+in Schritt 1 statt selbst Datumsarithmetik zu betreiben. Eine Hypothese, bei
+der keiner der beiden Mechanismen je greift, taucht dort einfach nie auf -
+der Sinn ist, jede Hypothese verlässlich durch ihre eigene Zeitbox zu
+zwingen, nicht die Bewertung dem Gefühl zu überlassen, wann sie "fertig
+wirkt".
+
+### 5.7 Distillierte Wissensbasis (`knowledge_base.jsonl`)
+
+`hypotheses.jsonl` ist ein Protokoll einzelner Versuche, kein
+akkumuliertes Wissen - ohne eine distilliertere Ebene darüber könnte das
+System dasselbe später in anderer Verpackung erneut testen, ohne es zu
+merken. `knowledge_base.jsonl` hält kurze, konsultierbare Takeaways pro
+Thema/Kanal/Taktik:
+
+- `write_knowledge_entry(topic, takeaway, confidence, source_hypothesis_ids,
+  channel="", tactic="")` - `confidence` ∈ `{low, moderate, high}`,
+  `source_hypothesis_ids` eine nicht-leere Liste der Hypothesen-IDs, aus
+  denen der Takeaway distilliert wurde. Wird bei jedem `build`/`pivot`/
+  `bury`-Outcome geschrieben (Kapitel 5.4), nicht nur bei Erfolgen.
+- `read_knowledge_base(topic="", channel="")` - `topic` matcht als
+  case-insensitive Teilstring, `channel` exakt. Der Sub-CEO (und, lesend,
+  Growth) konsultiert dies **vor** dem Formulieren einer neuen Hypothese
+  (Kapitel 5.1) - derselbe günstige-Erst-Schritt-Gedanke wie beim externen
+  Research-Evidence-Tier, nur aus den eigenen vorherigen Hypothesen dieser
+  Subsidiary distilliert statt aus externen Quellen.
+
+Beispiel-Eintrag: *"Reddit organic on r/algotrading: tested 4x, weak below
+~50 karma accounts, moderate confidence"* - kurz genug, um vor dem
+Schreiben der nächsten Hypothese tatsächlich gelesen zu werden, kein
+Report.
+
+### 5.8 Bullseye-Ranking für konkurrierende Hypothesen
+
+Dieselbe Brainstorm-Score-Test-Verdoppeln-Logik, die schon für Kanäle gilt
+(Kapitel 6.1), gilt eine Ebene höher auch für *was* getestet wird, wenn
+mehrere Hypothesen-Ideen gleichzeitig zur Wahl stehen - konkurrierende
+Value-Prop-Varianten, Zielgruppen-Segmente, Preishypothesen, nicht nur
+Kanäle für eine einzelne Hypothese.
+
+`MAX_ACTIVE_HYPOTHESES = 3` (`write_hypothesis` erzwingt das): eine neue
+Hypothese kann nicht `status='active'` werden, solange bereits drei andere
+aktiv sind - unabhängig vom bestehenden Parallelitäts-Limit pro
+`landing_page_variant_id` (max. 2). Gibt es mehr vielversprechende
+Hypothesen-Ideen als freie Kapazität, sollen sie nach `impact_score`/
+`confidence_score` gerankt werden - unter Einbeziehung der bereits pro
+Hypothese erfassten Break-even-, Defensibility-/Pricing- und
+Channel-Fit-Reasoning (Kapitel 5.1), nicht als separater, unverbundener
+Scoring-Durchgang. Dieselbe Kapp-Logik wie bei Kanälen: sich über zu viele
+Hypothesen gleichzeitig zu verzetteln gilt als der häufigere Fehler als die
+falsche zuerst zu wählen.
 
 ---
 
@@ -809,6 +915,7 @@ ist `/data` auf Railway (persistentes Volume), lokal/für Tests per
 | `task_orders.jsonl` | Sub-CEO → Growth/Dev Aufträge |
 | `content_drafts.jsonl` | Entworfene/geplante/entfernte Community-Posts |
 | `research_findings.jsonl` | Research-Evidence-Tier-Einträge |
+| `knowledge_base.jsonl` | Distillierte Takeaways pro Thema/Kanal/Taktik (siehe Kapitel 5.7) |
 | `usage_history.jsonl` | Token-Nutzung pro Zyklus |
 | `last_cycle_note.txt` | Kontinuitätsnotiz für den nächsten Zyklus |
 | `telegram_update_offset.txt` | Zuletzt verarbeitetes Telegram-Update |

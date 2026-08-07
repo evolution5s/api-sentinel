@@ -39,10 +39,19 @@ REQUIRED_HYPOTHESIS_FIELDS = {
     # already are - not something computed after the fact to fit a result.
     "hypothesis_type", "estimated_build_cost", "price_point_monthly",
     "break_even_horizon_months", "break_even_users",
+    # Bullseye-style ranking signal (four-fixes addendum, point 4) - same
+    # shape as channels.jsonl's impact_score/confidence_score, so competing
+    # hypothesis ideas can be ranked against each other the same way
+    # competing channels already are, instead of as a disconnected pass.
+    "impact_score", "confidence_score",
 }
 HYPOTHESIS_TYPES = {"value", "growth"}
 PIVOT_VARIABLES = {"audience", "price", "copy", "channel", "timing"}
 HYPOTHESIS_STATUSES = {"active", "evaluated", "buried"}
+# Same capping logic as MAX_CHANNELS_TESTING below - spreading thin across
+# too many hypotheses at once is the more common failure than picking the
+# wrong one first (four-fixes addendum, point 4).
+MAX_ACTIVE_HYPOTHESES = 3
 CHANNEL_STATUSES = {"not_tested", "bench", "testing", "retired"}
 MAX_CHANNELS_TESTING = 3
 MAX_TOTAL_CHANNELS = 20
@@ -278,6 +287,54 @@ def read_hypotheses(status: str = "") -> str:
     return json.dumps(hyps, ensure_ascii=False)
 
 
+@tool("read_due_hypotheses")
+def read_due_hypotheses() -> str:
+    """Deterministically compute which active hypotheses are due for
+    evaluation right now, instead of computing "has duration_days elapsed"
+    yourself from read_hypotheses() output - a hypothesis becomes due the
+    moment EITHER of its two time-box mechanisms is hit, whichever comes
+    first:
+    - duration_days has elapsed since created_at (always set, every
+      hypothesis has this), or
+    - measured.reach_estimate has already reached this hypothesis's own
+      sample_size_trigger, if one was set at creation (optional - lets a
+      fast channel that already has a real signal get evaluated without
+      waiting out the full window).
+
+    A hypothesis left active with neither ever being hit just never
+    appears here - the point is to force every hypothesis through the
+    four-way evaluation once its own time-box is reached, not to let one
+    quietly run indefinitely because evaluating it never felt urgent.
+    """
+    now = datetime.now(timezone.utc)
+    due = []
+    for h in _read_jsonl("hypotheses.jsonl"):
+        if h.get("status") != "active":
+            continue
+
+        reason = None
+        created_at = h.get("created_at", "")
+        duration_days = h.get("duration_days")
+        try:
+            created = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+        except ValueError:
+            created = None
+        if created is not None and duration_days is not None and now >= created + timedelta(days=duration_days):
+            reason = "duration_elapsed"
+
+        trigger = h.get("sample_size_trigger")
+        reach = (h.get("measured") or {}).get("reach_estimate")
+        if reason is None and trigger is not None and reach is not None and reach >= trigger:
+            reason = "sample_size_trigger_met"
+
+        if reason:
+            due.append({
+                "id": h.get("id"), "reason": reason, "created_at": created_at,
+                "duration_days": duration_days, "sample_size_trigger": trigger, "reach_estimate": reach,
+            })
+    return json.dumps(due, ensure_ascii=False)
+
+
 @tool("write_hypothesis")
 def write_hypothesis(hypothesis: str) -> str:
     """Create or update a hypothesis. `hypothesis` must be a JSON string of a
@@ -286,16 +343,44 @@ def write_hypothesis(hypothesis: str) -> str:
     landing_page_variant_id already has 2 other active hypotheses (section
     5.6 parallelism rule) - pick a different variant or wait instead.
 
-    New hypotheses require hypothesis_type ("value" or "growth") and the
-    economics that must be fixed before the experiment runs, not adjusted
-    afterward to fit the result: estimated_build_cost, price_point_monthly,
-    break_even_horizon_months, and break_even_users (get this last one from
-    compute_break_even() first - never estimate it by hand).
+    New hypotheses require hypothesis_type ("value" or "growth"), impact_score
+    and confidence_score (your own honest judgment, same shape as a
+    channel's - the ranking signal used to prioritize which candidate
+    hypothesis ideas actually get written this cycle, see
+    MAX_ACTIVE_HYPOTHESES below), and the economics that must be fixed
+    before the experiment runs, not adjusted afterward to fit the result:
+    estimated_build_cost, price_point_monthly, break_even_horizon_months,
+    and break_even_users (get this last one from compute_break_even() first
+    - never estimate it by hand).
 
-    If prior_hypothesis_id points at a hypothesis whose outcome was "pivot",
-    this new one must also say pivot_variable_changed (one of audience/
+    A time-box is mandatory: duration_days is always required. You may
+    additionally set sample_size_trigger (a measured.reach_estimate value
+    at which this hypothesis becomes due for evaluation early, before
+    duration_days elapses, for a fast channel that doesn't need the full
+    window to produce a real signal) - optional, defaults to none. Use
+    read_due_hypotheses() to see what's actually due, rather than computing
+    elapsed time yourself.
+
+    One-variable-at-a-time applies to every new hypothesis, not just
+    pivots: if prior_hypothesis_id points at a hypothesis whose outcome was
+    "pivot", this new one must say pivot_variable_changed (one of audience/
     price/copy/channel/timing) and pivot_reasoning - exactly one identified
-    variable, logged, per the pivot-then-retest rule.
+    variable, logged. If there's no prior_hypothesis_id (a first attempt -
+    including the very first hypothesis ever), primary_variable_tested is
+    required instead (same five values) - name the one untested assumption
+    this test is actually isolating; note what else you're holding constant
+    in the optional holding_constant_notes. Never bundle more than one
+    genuinely untested variable (e.g. a new audience AND a new price at
+    once) into a single first test - you won't be able to tell which part
+    of the result to credit.
+
+    Creating a new active hypothesis is rejected if this subsidiary already
+    has MAX_ACTIVE_HYPOTHESES hypotheses with status="active" (same
+    capping logic as the channel-testing cap - prioritize via
+    impact_score/confidence_score instead of running everything at once),
+    or if its landing_page_variant_id already has 2 other active
+    hypotheses (parallelism rule) - pick a different variant or wait
+    instead.
 
     Setting status="buried" requires a non-empty bury_reasoning - buried
     hypotheses are never deleted, only marked, so the reasoning has to be
@@ -342,7 +427,31 @@ def write_hypothesis(hypothesis: str) -> str:
                     })
                 if not (patch.get("pivot_reasoning") or "").strip():
                     return json.dumps({"error": "this hypothesis follows a 'pivot' outcome - pivot_reasoning is required"})
+        else:
+            # First attempt (including the very first hypothesis ever) -
+            # the one-variable rule applies here too, not just to pivots
+            # (four-fixes addendum, point 2). No prior to diff against, so
+            # this is a self-declared "what am I actually isolating" field
+            # rather than something mechanically diffable, same trust model
+            # as pivot_variable_changed above.
+            if patch.get("primary_variable_tested") not in PIVOT_VARIABLES:
+                return json.dumps({
+                    "error": "a first-attempt hypothesis (no prior_hypothesis_id) requires "
+                             f"primary_variable_tested, one of {sorted(PIVOT_VARIABLES)} - name the one "
+                             "untested assumption this test isolates; don't bundle more than one "
+                             "genuinely untested variable into a single first test"
+                })
         if patch.get("status", "active") == "active":
+            active_count = sum(1 for h in hyps if h.get("status") == "active")
+            if active_count >= MAX_ACTIVE_HYPOTHESES:
+                return json.dumps({
+                    "error": f"{active_count} hypotheses are already status='active' "
+                             f"(max {MAX_ACTIVE_HYPOTHESES}) - rank candidate ideas by impact_score/"
+                             "confidence_score and the economics/defensibility/channel-fit reasoning "
+                             "already captured per hypothesis, same Bullseye logic as the channel cap, "
+                             "and only write the highest-priority one(s); move a hypothesis to "
+                             "'evaluated'/'buried' first to free capacity"
+                })
             channel_record = next(
                 (c for c in _read_jsonl("channels.jsonl") if c.get("id") == patch["channel"]), None
             )
@@ -377,6 +486,9 @@ def write_hypothesis(hypothesis: str) -> str:
             "pricing_tier_reasoning": None,
             "expansion_notes": None,
             "channel_fit_reasoning": None,
+            "sample_size_trigger": None,
+            "primary_variable_tested": None,
+            "holding_constant_notes": None,
             **patch,
         }
         hyps.append(record)
@@ -549,6 +661,92 @@ def compute_break_even(estimated_build_cost: float, price_point_monthly: float, 
     except ValueError as exc:
         return json.dumps({"error": str(exc)})
     return json.dumps({"break_even_users": break_even_users})
+
+
+# --------------------------------------------------------------------------
+# Distilled knowledge base (four-fixes addendum, point 3) - hypotheses.jsonl
+# is a log of individual attempts, not accumulated knowledge: without this,
+# the system can re-test the same thing in a different wrapper later
+# without noticing. Short, consultable takeaways per topic/channel/tactic,
+# checked BEFORE generating a new hypothesis - the same cheap-first-step
+# spirit as the research-evidence tier, just distilled from this
+# subsidiary's own prior hypotheses instead of external sources.
+# --------------------------------------------------------------------------
+
+KNOWLEDGE_CONFIDENCE_LEVELS = {"low", "moderate", "high"}
+
+
+@tool("write_knowledge_entry")
+def write_knowledge_entry(
+    topic: str, takeaway: str, confidence: str, source_hypothesis_ids: str,
+    channel: str = "", tactic: str = "",
+) -> str:
+    """Distill a short, consultable takeaway into the knowledge base -
+    call this whenever a hypothesis resolves to build/pivot/bury (not
+    test_further, that's a continuation, not yet a resolved takeaway). A
+    pivot's "why it didn't fit" is worth distilling just as much as a
+    build's "this worked" - don't only log the wins.
+
+    topic: what this is actually about (e.g. "Reddit organic on
+    r/algotrading" or "$5/mo price point for solo devs").
+    takeaway: one or two sentences, e.g. "tested 4x, weak below ~50 karma
+    accounts, moderate confidence" - short enough to actually get read
+    before writing a new hypothesis, not a report.
+    confidence: one of low/moderate/high - your own honest read of how
+    much this takeaway should be trusted, given how many hypotheses back
+    it (a single data point is "low", regardless of how clean the result
+    looked).
+    source_hypothesis_ids: JSON array string of the hypothesis id(s) this
+    takeaway is distilled from, e.g. '["hyp_ab12cd34"]' - always at least
+    one, so the takeaway traces back to real evidence.
+    channel / tactic: optional, filterable tags (e.g. channel="reddit",
+    tactic="own_question_post") when the takeaway is specific to one.
+    """
+    if not topic.strip():
+        return json.dumps({"error": "topic must not be empty"})
+    if not takeaway.strip():
+        return json.dumps({"error": "takeaway must not be empty"})
+    if confidence not in KNOWLEDGE_CONFIDENCE_LEVELS:
+        return json.dumps({
+            "error": f"invalid confidence '{confidence}', must be one of {sorted(KNOWLEDGE_CONFIDENCE_LEVELS)}"
+        })
+    try:
+        source_ids = json.loads(source_hypothesis_ids)
+    except json.JSONDecodeError as exc:
+        return json.dumps({"error": f"invalid JSON for source_hypothesis_ids: {exc}"})
+    if not isinstance(source_ids, list) or not source_ids:
+        return json.dumps({"error": "source_hypothesis_ids must be a non-empty JSON array of hypothesis ids"})
+
+    record = {
+        "id": f"knowledge_{uuid.uuid4().hex[:8]}",
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "topic": topic,
+        "takeaway": takeaway,
+        "confidence": confidence,
+        "source_hypothesis_ids": source_ids,
+        "channel": channel or None,
+        "tactic": tactic or None,
+    }
+    _append_jsonl("knowledge_base.jsonl", record)
+    return json.dumps({"ok": True, "id": record["id"]})
+
+
+@tool("read_knowledge_base")
+def read_knowledge_base(topic: str = "", channel: str = "") -> str:
+    """Read distilled takeaways before generating a new hypothesis - check
+    whether this topic/channel/tactic has already been tested before
+    proposing it again in a different wrapper without noticing. topic
+    matches as a case-insensitive substring against each entry's topic;
+    channel matches exactly. Both empty returns every entry, most recent
+    last.
+    """
+    entries = _read_jsonl("knowledge_base.jsonl")
+    if topic:
+        topic_lower = topic.strip().lower()
+        entries = [e for e in entries if topic_lower in (e.get("topic") or "").lower()]
+    if channel:
+        entries = [e for e in entries if e.get("channel") == channel]
+    return json.dumps(entries, ensure_ascii=False)
 
 
 # --------------------------------------------------------------------------

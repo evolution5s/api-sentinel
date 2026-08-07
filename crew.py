@@ -36,7 +36,9 @@ from tools import (
     read_channel_metrics,
     read_channels,
     read_content_drafts,
+    read_due_hypotheses,
     read_hypotheses,
+    read_knowledge_base,
     read_last_cycle_note,
     read_research_findings,
     read_state,
@@ -46,6 +48,7 @@ from tools import (
     send_telegram_message,
     write_channel,
     write_hypothesis,
+    write_knowledge_entry,
 )
 from holding import (
     acknowledge_status_report,
@@ -176,7 +179,7 @@ growth_agent = Agent(
         request_approval, read_channel_metrics, read_channels, read_state, read_hypotheses,
         read_task_orders, complete_task_order, draft_content, read_content_drafts,
         check_community_risk, get_account_stats, log_research_finding, read_research_findings,
-        read_subsidiary_policies,
+        read_subsidiary_policies, read_knowledge_base,
     ],
     max_iter=AGENT_PROFILE["agents"]["growth"]["max_iter"],
     max_execution_time=AGENT_PROFILE["agents"]["growth"]["max_execution_time"],
@@ -249,17 +252,31 @@ ceo_agent = Agent(
         "paid_channels_allowed, cold_email_allowed - as a hard constraint on "
         "channel/hypothesis judgment, not something to reason around; if a "
         "policy is actually blocking something worth doing, that's a case "
-        "for file_cross_subsidiary_request to the Main-CEO, not a workaround."
+        "for file_cross_subsidiary_request to the Main-CEO, not a workaround. "
+        "Uses read_due_hypotheses instead of computing elapsed duration by "
+        "hand, so no active hypothesis quietly runs past its own time-box "
+        "(duration_days, or an early sample_size_trigger) without being "
+        "forced through the four-way evaluation. Checks read_knowledge_base "
+        "before proposing a new hypothesis - the same cheap-first-step "
+        "spirit as the external research-evidence tier, just distilled from "
+        "this subsidiary's own prior hypotheses - and writes a new entry "
+        "(write_knowledge_entry) whenever one resolves to build/pivot/bury, "
+        "so a pivot's 'why it didn't fit' is preserved, not just wins. Ranks "
+        "candidate hypothesis ideas by impact_score/confidence_score the "
+        "same way channels are ranked, since only MAX_ACTIVE_HYPOTHESES can "
+        "run at once - spreading thin across too many at a time is treated "
+        "as the more common failure than picking the wrong one."
     ),
     llm=ceo_llm,
     tools=[
-        read_state, read_hypotheses, write_hypothesis, evaluate_hypothesis,
+        read_state, read_hypotheses, read_due_hypotheses, write_hypothesis, evaluate_hypothesis,
         check_escalation, compare_channel_performance, request_approval,
         read_channels, write_channel, compute_break_even,
         file_task_order, read_task_orders,
         file_status_report, read_strategic_direction,
         file_pivot_proposal, file_cross_subsidiary_request, search_research_archive,
         read_subsidiary_policies, read_content_drafts, log_research_finding, read_research_findings,
+        read_knowledge_base, write_knowledge_entry,
     ],
     max_iter=AGENT_PROFILE["agents"]["sub_ceo"]["max_iter"],
     max_execution_time=AGENT_PROFILE["agents"]["sub_ceo"]["max_execution_time"],
@@ -575,8 +592,11 @@ task_ceo = ConditionalTask(
         "this task - the bootstrap one in step 0, or a pivot follow-up in "
         "step 5 - needs hypothesis_type ('value': solves a real problem for "
         "the user, or 'growth': helps distribution/scaling of something "
-        "already validated as valuable) and its own economics fixed BEFORE "
-        "it runs, never adjusted afterward to fit the result: "
+        "already validated as valuable), your own honest impact_score and "
+        "confidence_score (same shape as a channel's - this is what lets "
+        "you rank competing hypothesis ideas against each other, see the "
+        "MAX_ACTIVE_HYPOTHESES note below), and its own economics fixed "
+        "BEFORE it runs, never adjusted afterward to fit the result: "
         "estimated_build_cost (rough token/time cost of the real product/"
         "feature this would become if it succeeds - not the cost of the "
         "test itself), price_point_monthly, and break_even_horizon_months. "
@@ -586,7 +606,33 @@ task_ceo = ConditionalTask(
         "A landing page costing a few dollars to build has a very different "
         "bar than something needing real Dev-agent effort - size the "
         "economics honestly per hypothesis, there is no one fixed target. "
-        "Alongside the required economics, also reason through these "
+        "duration_days is always required (the mandatory time-box); you may "
+        "also set sample_size_trigger (a measured.reach_estimate value that "
+        "makes this hypothesis due for evaluation early, before duration_days "
+        "elapses - useful for a fast channel that produces a real signal "
+        "well before the window closes). Use read_due_hypotheses() in step 1 "
+        "below rather than computing elapsed time yourself. "
+        "One-variable-at-a-time is not just a pivot rule: for a first "
+        "attempt (no prior_hypothesis_id - including the bootstrap "
+        "hypothesis in step 0), set primary_variable_tested to the one "
+        "untested assumption (audience/price/copy/channel/timing) this test "
+        "actually isolates, and optionally holding_constant_notes for what "
+        "else you're deliberately keeping fixed. Never bundle a new "
+        "audience AND a new price into one first test - you won't know "
+        "which part drove the result. "
+        "Only MAX_ACTIVE_HYPOTHESES hypotheses (write_hypothesis enforces "
+        "this) can be status='active' at once - the same Bullseye logic "
+        "already applied to channels, one level up: if you have more "
+        "worthwhile hypothesis ideas than remaining capacity, rank them by "
+        "impact_score/confidence_score (weighing the economics/"
+        "defensibility/channel-fit reasoning below) and only write the "
+        "highest-priority one(s) - spreading thin across too many at once "
+        "is the more common failure than picking the wrong one first. "
+        "Before writing any new hypothesis, call read_knowledge_base(topic="
+        "...) - a short, distilled takeaway (not the raw hypothesis log) "
+        "on this topic/channel/tactic may already exist from a prior cycle; "
+        "don't re-test the same thing in a different wrapper without "
+        "noticing. Alongside the required economics, also reason through these "
         "(optional free-text fields on write_hypothesis - not a new "
         "pass/fail bar, just recorded reasoning that should shape your "
         "choices between comparable options): defensibility_notes - could "
@@ -623,7 +669,8 @@ task_ceo = ConditionalTask(
         "empty (nothing has ever been written - the very first cycle ever), "
         "the loop has nothing to start from yet: formulate and write exactly "
         "one initial hypothesis via write_hypothesis to actually kick it "
-        "off, including hypothesis_type and the economics above. Pick a "
+        "off, including hypothesis_type, impact_score/confidence_score, "
+        "primary_variable_tested, and the economics above. Pick a "
         "channel from whichever the channel-strategy step above left as "
         "status='testing', size it with the same judgment you'd apply to "
         "any hypothesis (a concrete statement, category, "
@@ -632,8 +679,10 @@ task_ceo = ConditionalTask(
         "predecessor. This step only ever fires once, when the system is "
         "completely empty - once any hypothesis exists, new ones only ever "
         "come from step 5 below, as a pivot follow-up to an evaluated one.\n"
-        "1) Call read_hypotheses(status='active') and find any hypothesis "
-        "whose duration_days has elapsed since created_at.\n"
+        "1) Call read_due_hypotheses() to see which active hypotheses are "
+        "actually due right now (duration_days elapsed, or an early "
+        "sample_size_trigger met) - don't compute this yourself from "
+        "read_hypotheses() output.\n"
         "2) For each due hypothesis, first make sure measured.reach_estimate "
         "is set (use the Growth report above; if it's still missing, leave "
         "the hypothesis active and note that it can't be scored yet). If it "
@@ -684,6 +733,14 @@ task_ceo = ConditionalTask(
         "revisited later if the context changes (new channel, new pricing, "
         "market shift) - say so in your report rather than treating it as "
         "closed forever.\n"
+        "   - for build/pivot/bury specifically (not test_further, that's a "
+        "continuation, not a resolution yet): also call write_knowledge_"
+        "entry(topic=..., takeaway=..., confidence=..., "
+        "source_hypothesis_ids=[hypothesis_id], ...) to distill what this "
+        "result actually means for next time - a pivot's 'why it didn't "
+        "fit' is worth recording just as much as a build's 'this worked'. "
+        "Keep the takeaway short enough to actually get read before the "
+        "next hypothesis is written, not a report.\n"
         "3) After evaluating, call check_escalation(hypothesis_id) "
         "regardless of the outcome above - that's a separate, bigger-picture "
         "check (rolling average across the lineage) from the per-hypothesis "
@@ -718,16 +775,18 @@ task_ceo = ConditionalTask(
         "why (write_hypothesis requires both whenever prior_hypothesis_id "
         "points at a 'pivot' outcome). Don't change several things at once - "
         "that makes the next result uninterpretable. Give it its own fresh "
-        "economics (hypothesis_type, estimated_build_cost, "
-        "price_point_monthly, break_even_horizon_months, and a fresh "
-        "compute_break_even call for break_even_users) rather than copying "
-        "the prior hypothesis's numbers unchecked. Call write_hypothesis to "
-        "create it - if it's rejected for hitting the parallelism limit on "
-        "that landing_page_variant_id, pick a different variant or hold off. "
-        "Pivot attempts on one lineage are capped (evaluate_hypothesis "
-        "enforces this automatically by returning 'bury' once the cap is "
-        "hit) - don't try to talk a hypothesis that's already spent its "
-        "pivot budget into one more retest.\n"
+        "impact_score/confidence_score and economics (hypothesis_type, "
+        "estimated_build_cost, price_point_monthly, break_even_horizon_months, "
+        "and a fresh compute_break_even call for break_even_users) rather "
+        "than copying the prior hypothesis's numbers unchecked. Call "
+        "write_hypothesis to create it - if it's rejected for hitting "
+        "MAX_ACTIVE_HYPOTHESES or the parallelism limit on that "
+        "landing_page_variant_id, either free capacity (evaluate another due "
+        "hypothesis first) or hold this retest for next cycle instead of "
+        "forcing it. Pivot attempts on one lineage are capped (evaluate_"
+        "hypothesis enforces this automatically by returning 'bury' once the "
+        "cap is hit) - don't try to talk a hypothesis that's already spent "
+        "its pivot budget into one more retest.\n"
         "6) If a pivot retest needs a new or changed landing page variant, "
         "file a file_task_order(to_role='dev', ...) for it explicitly - "
         "don't just mention it in your report and assume Dev will notice. "
@@ -750,6 +809,7 @@ task_ceo = ConditionalTask(
         "Status report: for each evaluated hypothesis, its score/outcome "
         "(build/test_further/pivot/bury) and the economics behind it, what "
         "happened next, and the new retest started for any pivot. Any "
+        "knowledge_base entries written for a resolved hypothesis. Any "
         "pending approval, escalation, or status report filed for the "
         "Main-CEO. Pending Dev work stated as task orders filed, not just "
         "narrated."
