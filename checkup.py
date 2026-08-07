@@ -59,6 +59,23 @@ def _seed_testing_channel(channel_id="reddit"):
     }))
 
 
+def _allow_paid_channels():
+    """Most existing paid-channel tests predate the paid_channels_allowed
+    policy gate and want to test the approval-queue mechanics specifically,
+    not the policy gate - this flips the policy on first via the real
+    update_subsidiary_policies flow (approval-gated, same as production).
+    """
+    holding.read_subsidiaries.run()  # bootstraps api-sentinel
+    appr = json.loads(tools.request_approval.run(category="pricing", proposal="allow paid channels", reasoning="r"))
+    approvals = tools._read_jsonl("approval_queue.jsonl")
+    approvals[0]["status"] = "approved"
+    tools._write_jsonl("approval_queue.jsonl", approvals)
+    holding.update_subsidiary_policies.run(
+        subsidiary_id="api-sentinel", policies_patch=json.dumps({"paid_channels_allowed": True}),
+        approved_request_id=appr["queued"], reasoning="test setup",
+    )
+
+
 SAMPLE_HYP = {
     "id": "hyp_test_0001",
     "statement": "test statement",
@@ -693,8 +710,20 @@ def test_write_channel_status_change_with_reason_logs_history():
     assert entry["status_history"][-1] == {"at": entry["updated_at"], "from": "testing", "to": "bench", "reason": "scored -0.5 over 3 tests"}
 
 
+def test_write_channel_paid_rejects_when_policy_disallows():
+    reset_state()
+    # default policy: paid_channels_allowed=False - blocked before the
+    # approval-queue check even runs, regardless of approved_request_id.
+    result = json.loads(tools.write_channel.run(channel=json.dumps({
+        "id": "reddit_ads", "name": "Reddit Ads", "category": "paid_ads", "is_paid": True,
+        "impact_score": 3, "confidence_score": 2, "status": "testing",
+    })))
+    assert "error" in result and "paid_channels_allowed" in result["error"]
+
+
 def test_write_channel_paid_requires_approved_spend_request():
     reset_state()
+    _allow_paid_channels()
     result = json.loads(tools.write_channel.run(channel=json.dumps({
         "id": "reddit_ads", "name": "Reddit Ads", "category": "paid_ads", "is_paid": True,
         "impact_score": 3, "confidence_score": 2, "status": "testing",
@@ -704,9 +733,10 @@ def test_write_channel_paid_requires_approved_spend_request():
 
 def test_write_channel_paid_succeeds_with_approved_spend_request():
     reset_state()
+    _allow_paid_channels()
     appr = json.loads(tools.request_approval.run(category="spend", proposal="$1500 reddit ads test", reasoning="r"))
     approvals = tools._read_jsonl("approval_queue.jsonl")
-    approvals[0]["status"] = "approved"
+    approvals[-1]["status"] = "approved"
     tools._write_jsonl("approval_queue.jsonl", approvals)
     result = json.loads(tools.write_channel.run(channel=json.dumps({
         "id": "reddit_ads", "name": "Reddit Ads", "category": "paid_ads", "is_paid": True,
@@ -718,6 +748,7 @@ def test_write_channel_paid_succeeds_with_approved_spend_request():
 
 def test_write_channel_paid_rejects_pending_approval():
     reset_state()
+    _allow_paid_channels()
     appr = json.loads(tools.request_approval.run(category="spend", proposal="$1500 reddit ads test", reasoning="r"))
     result = json.loads(tools.write_channel.run(channel=json.dumps({
         "id": "reddit_ads", "name": "Reddit Ads", "category": "paid_ads", "is_paid": True,
@@ -887,6 +918,165 @@ def test_open_pull_request_requires_token():
             os.environ["GITHUB_TOKEN"] = had_token
 
 
+# --- tools.py: research-evidence tier --------------------------------------
+
+def test_log_research_finding_rejects_invalid_type():
+    reset_state()
+    result = json.loads(tools.log_research_finding.run(
+        hypothesis_id="hyp_x", finding_type="made_up", source="s", summary="text",
+    ))
+    assert "error" in result
+
+
+def test_log_research_finding_requires_summary():
+    reset_state()
+    result = json.loads(tools.log_research_finding.run(
+        hypothesis_id="hyp_x", finding_type="forum_discussion", source="s", summary="  ",
+    ))
+    assert "error" in result
+
+
+def test_log_research_finding_and_read_roundtrip():
+    reset_state()
+    result = json.loads(tools.log_research_finding.run(
+        hypothesis_id="hyp_x", finding_type="competitor_product",
+        source="https://example.com/competitor", summary="Existing tool does X but not Y",
+    ))
+    assert result["ok"] is True
+    found = json.loads(tools.read_research_findings.run(hypothesis_id="hyp_x"))
+    assert len(found) == 1 and found[0]["finding_type"] == "competitor_product"
+    assert json.loads(tools.read_research_findings.run(hypothesis_id="hyp_other")) == []
+
+
+# --- tools.py: content drafting ---------------------------------------------
+
+def _draft_kwargs(**overrides):
+    kwargs = dict(
+        hypothesis_id=SAMPLE_HYP["id"], platform="reddit", post_type="thread_reply",
+        target_community="r/algotrading", text="Ran into the same issue last week, fixed it by checking the rate limit headers first.",
+        is_promotional=False, include_product_link=False, rules_checked=True,
+        rules_notes="self-promo allowed max 1/10 posts, checked the wiki just now",
+    )
+    kwargs.update(overrides)
+    return kwargs
+
+
+def test_draft_content_rejects_invalid_platform():
+    reset_state()
+    result = json.loads(tools.draft_content.run(**_draft_kwargs(platform="cold_email")))
+    assert "error" in result
+
+
+def test_draft_content_rejects_invalid_post_type():
+    reset_state()
+    result = json.loads(tools.draft_content.run(**_draft_kwargs(post_type="advertisement")))
+    assert "error" in result
+
+
+def test_draft_content_requires_rules_checked():
+    reset_state()
+    result = json.loads(tools.draft_content.run(**_draft_kwargs(rules_checked=False)))
+    assert "error" in result and "rules_checked" in result["error"]
+
+
+def test_draft_content_requires_rules_notes():
+    reset_state()
+    result = json.loads(tools.draft_content.run(**_draft_kwargs(rules_notes="  ")))
+    assert "error" in result
+
+
+def test_draft_content_rejects_markdown_header():
+    reset_state()
+    result = json.loads(tools.draft_content.run(**_draft_kwargs(text="## Summary\nThis fixes it.")))
+    assert "error" in result and any("markdown header" in v for v in result["violations"])
+
+
+def test_draft_content_rejects_bullet_list():
+    reset_state()
+    result = json.loads(tools.draft_content.run(**_draft_kwargs(text="Steps:\n- do this\n- then that")))
+    assert "error" in result and any("bullet" in v for v in result["violations"])
+
+
+def test_draft_content_rejects_ai_phrasing():
+    reset_state()
+    result = json.loads(tools.draft_content.run(**_draft_kwargs(text="Great question. In conclusion, this approach works well.")))
+    assert "error" in result and any("in conclusion" in v for v in result["violations"])
+
+
+def test_draft_content_rejects_over_length():
+    reset_state()
+    result = json.loads(tools.draft_content.run(**_draft_kwargs(text="x" * 700, post_type="thread_reply")))
+    assert "error" in result and any("exceeds" in v for v in result["violations"])
+
+
+def test_draft_content_rejects_unknown_hypothesis():
+    reset_state()
+    result = json.loads(tools.draft_content.run(**_draft_kwargs(hypothesis_id="hyp_does_not_exist")))
+    assert "error" in result
+
+
+def test_draft_content_link_requires_landing_page_live():
+    reset_state()
+    tools.write_hypothesis.run(hypothesis=json.dumps(SAMPLE_HYP))
+    result = json.loads(tools.draft_content.run(**_draft_kwargs(include_product_link=True)))
+    assert "error" in result and "landing_page_live" in result["error"]
+
+
+def test_draft_content_succeeds_and_read_content_drafts_roundtrip():
+    reset_state()
+    tools.write_hypothesis.run(hypothesis=json.dumps(SAMPLE_HYP))
+    result = json.loads(tools.draft_content.run(**_draft_kwargs()))
+    assert result["ok"] is True and result["status"] == "drafted"
+    drafts = json.loads(tools.read_content_drafts.run(hypothesis_id=SAMPLE_HYP["id"]))
+    assert len(drafts) == 1 and drafts[0]["status"] == "drafted"
+    assert json.loads(tools.read_content_drafts.run(status="posted")) == []
+
+
+# --- tools.py: community risk + account stats -------------------------------
+
+def test_check_community_risk_low_with_no_removals():
+    reset_state()
+    result = json.loads(tools.check_community_risk.run(platform="reddit", target_community="r/algotrading"))
+    assert result["risk"] == "low" and result["removal_count_last_30d"] == 0
+
+
+def test_check_community_risk_high_after_two_removals():
+    reset_state()
+    tools.write_hypothesis.run(hypothesis=json.dumps(SAMPLE_HYP))
+    now = datetime.now(timezone.utc).isoformat()
+    for i in range(2):
+        tools._append_jsonl("content_drafts.jsonl", {
+            "id": f"draft_removed{i}", "platform": "reddit", "target_community": "r/algotrading",
+            "removed": True, "removed_reason": "mod removed", "removed_at": now,
+        })
+    result = json.loads(tools.check_community_risk.run(platform="reddit", target_community="r/algotrading"))
+    assert result["risk"] == "high" and result["removal_count_last_30d"] == 2
+
+
+def test_get_account_stats_ratio():
+    reset_state()
+    tools.write_hypothesis.run(hypothesis=json.dumps(SAMPLE_HYP))
+    tools.draft_content.run(**_draft_kwargs(is_promotional=False))
+    tools.draft_content.run(**_draft_kwargs(is_promotional=True, text="Just launched something that solves this - link in profile."))
+    result = json.loads(tools.get_account_stats.run(platform="reddit"))
+    assert result["total_posts_drafted"] == 2
+    assert result["promotional_count"] == 1
+    assert result["promotional_ratio"] == 0.5
+
+
+# --- tools.py: write_hypothesis - new optional fields default cleanly ------
+
+def test_write_hypothesis_defaults_new_optional_fields():
+    reset_state()
+    tools.write_hypothesis.run(hypothesis=json.dumps(SAMPLE_HYP))
+    stored = json.loads(tools.read_hypotheses.run())[0]
+    assert stored["landing_page_live"] is False
+    assert stored["defensibility_notes"] is None
+    assert stored["pricing_tier_reasoning"] is None
+    assert stored["expansion_notes"] is None
+    assert stored["channel_fit_reasoning"] is None
+
+
 # --- tools.py: cross-cycle continuity + usage log ---------------------------
 
 def test_cycle_note_roundtrip():
@@ -994,6 +1184,28 @@ def test_classify_command_unrecognized_text_is_ignored():
     assert tools._classify_command("appr_ab12cd34 maybe?", "") is None
 
 
+def test_classify_command_live():
+    assert tools._classify_command("live: hyp_test_0001", "") == ("live", "hyp_test_0001")
+    assert tools._classify_command("live:", "") is None
+
+
+def test_classify_command_posted():
+    assert tools._classify_command("posted: draft_ab12cd34 https://reddit.com/r/x/y", "") == (
+        "posted", ("draft_ab12cd34", "https://reddit.com/r/x/y")
+    )
+    assert tools._classify_command("posted: no draft id here", "") is None
+    assert tools._classify_command("posted: draft_ab12cd34", "") is None  # no url
+
+
+def test_classify_command_removed():
+    assert tools._classify_command("removed: draft_ab12cd34 mod took it down", "") == (
+        "removed", ("draft_ab12cd34", "mod took it down")
+    )
+    assert tools._classify_command("removed: draft_ab12cd34", "") == (
+        "removed", ("draft_ab12cd34", "removed (no reason given)")
+    )
+
+
 def test_apply_telegram_commands_pause_and_resume():
     reset_state()
     had_token = os.environ.pop("TELEGRAM_BOT_TOKEN", None)
@@ -1032,6 +1244,53 @@ def test_apply_telegram_commands_approve_via_reply():
         assert log == []
         stored = next(r for r in tools._read_jsonl("approval_queue.jsonl") if r["id"] == request_id)
         assert stored["status"] == "approved"
+    finally:
+        if had_token is not None:
+            os.environ["TELEGRAM_BOT_TOKEN"] = had_token
+        if had_chat is not None:
+            os.environ["TELEGRAM_CHAT_ID"] = had_chat
+
+
+def test_apply_telegram_commands_live_marks_hypothesis():
+    reset_state()
+    had_token = os.environ.pop("TELEGRAM_BOT_TOKEN", None)
+    had_chat = os.environ.pop("TELEGRAM_CHAT_ID", None)
+    try:
+        tools.write_hypothesis.run(hypothesis=json.dumps(SAMPLE_HYP))
+        log = tools._apply_telegram_commands([{"text": f"live: {SAMPLE_HYP['id']}", "reply_to_text": ""}])
+        assert any("landing_page_live" in entry for entry in log)
+        stored = json.loads(tools.read_hypotheses.run())[0]
+        assert stored["landing_page_live"] is True
+
+        log = tools._apply_telegram_commands([{"text": "live: hyp_does_not_exist", "reply_to_text": ""}])
+        assert log == []  # unrecognized target, no crash, nothing logged as applied
+    finally:
+        if had_token is not None:
+            os.environ["TELEGRAM_BOT_TOKEN"] = had_token
+        if had_chat is not None:
+            os.environ["TELEGRAM_CHAT_ID"] = had_chat
+
+
+def test_apply_telegram_commands_posted_and_removed_mark_draft():
+    reset_state()
+    had_token = os.environ.pop("TELEGRAM_BOT_TOKEN", None)
+    had_chat = os.environ.pop("TELEGRAM_CHAT_ID", None)
+    try:
+        tools.write_hypothesis.run(hypothesis=json.dumps(SAMPLE_HYP))
+        drafted = json.loads(tools.draft_content.run(**_draft_kwargs()))
+        draft_id = drafted["id"]
+
+        log = tools._apply_telegram_commands([{
+            "text": f"posted: {draft_id} https://reddit.com/r/algotrading/comments/xyz", "reply_to_text": "",
+        }])
+        assert any("gepostet" in entry for entry in log)
+        stored = next(d for d in tools._read_jsonl("content_drafts.jsonl") if d["id"] == draft_id)
+        assert stored["status"] == "posted" and stored["post_url"] == "https://reddit.com/r/algotrading/comments/xyz"
+
+        log = tools._apply_telegram_commands([{"text": f"removed: {draft_id} mod took it down", "reply_to_text": ""}])
+        assert any("entfernt" in entry for entry in log)
+        stored = next(d for d in tools._read_jsonl("content_drafts.jsonl") if d["id"] == draft_id)
+        assert stored["status"] == "removed" and stored["removed"] is True and stored["removed_reason"] == "mod took it down"
     finally:
         if had_token is not None:
             os.environ["TELEGRAM_BOT_TOKEN"] = had_token
@@ -1126,7 +1385,8 @@ def test_register_subsidiary_succeeds_once_approved():
         subsidiary=json.dumps({"id": "second-co", "name": "Second Co", "focus": "test"}),
         approved_request_id=appr["queued"],
     ))
-    assert result == {"ok": True, "id": "second-co"}
+    assert result["ok"] is True and result["id"] == "second-co"
+    assert result["policies"] == holding.SUBSIDIARY_POLICY_DEFAULTS
     subs = json.loads(holding.read_subsidiaries.run())
     assert {s["id"] for s in subs} == {"api-sentinel", "second-co"}
 
@@ -1142,6 +1402,60 @@ def test_register_subsidiary_rejects_duplicate_id():
         approved_request_id=appr["queued"],
     ))
     assert "error" in result
+
+
+def test_read_subsidiary_policies_defaults_to_conservative_baseline():
+    reset_state()
+    holding.read_subsidiaries.run()  # bootstraps api-sentinel
+    policies = json.loads(holding.read_subsidiary_policies.run(subsidiary_id="api-sentinel"))
+    assert policies == holding.SUBSIDIARY_POLICY_DEFAULTS
+
+
+def test_read_subsidiary_policies_unknown_subsidiary():
+    reset_state()
+    result = json.loads(holding.read_subsidiary_policies.run(subsidiary_id="does-not-exist"))
+    assert "error" in result
+
+
+def test_update_subsidiary_policies_requires_approval():
+    reset_state()
+    holding.read_subsidiaries.run()
+    result = json.loads(holding.update_subsidiary_policies.run(
+        subsidiary_id="api-sentinel", policies_patch=json.dumps({"paid_channels_allowed": True}),
+        approved_request_id="appr_doesnotexist", reasoning="r",
+    ))
+    assert "error" in result
+
+
+def test_update_subsidiary_policies_rejects_unknown_keys():
+    reset_state()
+    holding.read_subsidiaries.run()
+    result = json.loads(holding.update_subsidiary_policies.run(
+        subsidiary_id="api-sentinel", policies_patch=json.dumps({"made_up_policy": True}),
+        approved_request_id="appr_doesnotexist", reasoning="r",
+    ))
+    assert "error" in result
+
+
+def test_update_subsidiary_policies_roundtrip():
+    reset_state()
+    holding.read_subsidiaries.run()
+    appr = json.loads(tools.request_approval.run(category="pricing", proposal="allow paid channels", reasoning="r"))
+    approvals = tools._read_jsonl("approval_queue.jsonl")
+    approvals[0]["status"] = "approved"
+    tools._write_jsonl("approval_queue.jsonl", approvals)
+
+    result = json.loads(holding.update_subsidiary_policies.run(
+        subsidiary_id="api-sentinel", policies_patch=json.dumps({"paid_channels_allowed": True}),
+        approved_request_id=appr["queued"], reasoning="re-testing paid ads for this subsidiary",
+    ))
+    assert result["ok"] is True
+    assert result["policies"]["paid_channels_allowed"] is True
+    # other policies stay at their defaults, only the touched key changed
+    assert result["policies"]["cold_email_allowed"] is False
+
+    policies = json.loads(holding.read_subsidiary_policies.run(subsidiary_id="api-sentinel"))
+    assert policies["paid_channels_allowed"] is True
 
 
 def test_set_subsidiary_status_requires_reason():
@@ -1442,6 +1756,7 @@ def test_ceo_agent_tools_match_spec():
         "file_task_order", "read_task_orders",
         "file_status_report", "read_strategic_direction",
         "file_pivot_proposal", "file_cross_subsidiary_request", "search_research_archive",
+        "read_subsidiary_policies", "read_content_drafts", "log_research_finding", "read_research_findings",
     }, tool_names
 
 
@@ -1453,13 +1768,16 @@ def test_main_ceo_agent_tools_match_spec():
         "read_cross_subsidiary_requests", "resolve_cross_subsidiary_request",
         "read_status_reports", "acknowledge_status_report", "set_strategic_direction",
         "search_research_archive", "request_approval",
+        "read_subsidiary_policies", "update_subsidiary_policies",
     }, tool_names
 
 
 def test_growth_dev_tools():
     assert {t.name for t in crew.growth_agent.tools} == {
         "request_approval", "read_channel_metrics", "read_channels", "read_state", "read_hypotheses",
-        "read_task_orders", "complete_task_order",
+        "read_task_orders", "complete_task_order", "draft_content", "read_content_drafts",
+        "check_community_risk", "get_account_stats", "log_research_finding", "read_research_findings",
+        "read_subsidiary_policies",
     }
     assert {t.name for t in crew.dev_agent.tools} == {
         "open_pull_request", "read_task_orders", "complete_task_order", "check_approval_status",

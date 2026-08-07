@@ -18,21 +18,27 @@ crewai_patches.apply_patches()
 
 from tools import (
     check_approval_status,
+    check_community_risk,
     check_escalation,
     compare_channel_performance,
     complete_task_order,
     compute_break_even,
+    draft_content,
     evaluate_hypothesis,
     file_task_order,
+    get_account_stats,
     is_system_paused,
     log_cycle_usage,
+    log_research_finding,
     notify_new_pending_approvals,
     open_pull_request,
     process_telegram_commands,
     read_channel_metrics,
     read_channels,
+    read_content_drafts,
     read_hypotheses,
     read_last_cycle_note,
+    read_research_findings,
     read_state,
     read_task_orders,
     request_approval,
@@ -52,11 +58,13 @@ from holding import (
     read_status_reports,
     read_strategic_direction,
     read_subsidiaries,
+    read_subsidiary_policies,
     register_subsidiary,
     resolve_cross_subsidiary_request,
     search_research_archive,
     set_strategic_direction,
     set_subsidiary_status,
+    update_subsidiary_policies,
 )
 
 _previous_cycle_note = read_last_cycle_note()
@@ -139,13 +147,26 @@ main_ceo_llm = LLM(max_tokens=AGENT_PROFILE["agents"]["main_ceo"]["max_tokens"],
 # direkt vor den Task-Definitionen (siehe dort).
 growth_agent = Agent(
     role="Growth Engine / Dev Relations",
-    goal="Draft content matching the currently active hypothesis and measure real reach after it's approved and posted",
+    goal="Draft genuine, organic community content matching the currently active hypothesis, measure real reach after it's approved and posted, and keep every account's posting history within its community's rules and its 90/10 genuine-to-promotional ratio",
     backstory=(
-        "Technical marketer for the Freqtrade/CCXT quant-bot community. Drafts "
-        "posts and measures results, but has no publishing authority of its own "
-        "- every piece of content goes through request_approval first, and "
-        "every reach number comes from read_channel_metrics, never a guess. "
-        "Concrete work comes from the Sub-CEO as task orders "
+        "Technical marketer for the Freqtrade/CCXT and quant-bot communities. "
+        "Drafts real posts (draft_content) in its own plain words - never "
+        "publishing them itself, that's always a human, confirmed back via a "
+        "Telegram 'posted:' reply. Every reach number comes from "
+        "read_channel_metrics, never a guess. One account per product per "
+        "platform: before drafting for a community, checks that community's "
+        "own current rules (rules_checked/rules_notes on every single draft, "
+        "not just once per platform) and check_community_risk for that "
+        "community's recent post-removal history - repeated removals mean "
+        "cool off and rethink the approach there, not try again unchanged. "
+        "Watches get_account_stats to keep each platform's content roughly "
+        "90% genuinely useful/curious and only 10% promotional on a rolling "
+        "basis - a 'own_question_post' asking something real is itself a "
+        "valid, non-promotional way to learn (log_research_finding records "
+        "what came back from it). Never includes a product link before "
+        "read_hypotheses shows landing_page_live=true for that hypothesis, "
+        "and prefers a profile/signature link over an inline one even once "
+        "it is live. Concrete work comes from the Sub-CEO as task orders "
         "(read_task_orders(to_role='growth', status='open')) - that's the "
         "authoritative ask, not a paraphrase of it; call complete_task_order "
         "with the real result when done, don't just narrate it in prose."
@@ -153,7 +174,9 @@ growth_agent = Agent(
     llm=growth_llm,
     tools=[
         request_approval, read_channel_metrics, read_channels, read_state, read_hypotheses,
-        read_task_orders, complete_task_order,
+        read_task_orders, complete_task_order, draft_content, read_content_drafts,
+        check_community_risk, get_account_stats, log_research_finding, read_research_findings,
+        read_subsidiary_policies,
     ],
     max_iter=AGENT_PROFILE["agents"]["growth"]["max_iter"],
     max_execution_time=AGENT_PROFILE["agents"]["growth"]["max_execution_time"],
@@ -221,7 +244,12 @@ ceo_agent = Agent(
         "loops in the Aufsichtsrat. Can pull historical data from other "
         "subsidiaries via search_research_archive, but never contacts "
         "another subsidiary's Sub-CEO directly - that always goes through "
-        "the Main-CEO (file_cross_subsidiary_request)."
+        "the Main-CEO (file_cross_subsidiary_request). Reads this "
+        "subsidiary's own policies (read_subsidiary_policies) - e.g. "
+        "paid_channels_allowed, cold_email_allowed - as a hard constraint on "
+        "channel/hypothesis judgment, not something to reason around; if a "
+        "policy is actually blocking something worth doing, that's a case "
+        "for file_cross_subsidiary_request to the Main-CEO, not a workaround."
     ),
     llm=ceo_llm,
     tools=[
@@ -231,6 +259,7 @@ ceo_agent = Agent(
         file_task_order, read_task_orders,
         file_status_report, read_strategic_direction,
         file_pivot_proposal, file_cross_subsidiary_request, search_research_archive,
+        read_subsidiary_policies, read_content_drafts, log_research_finding, read_research_findings,
     ],
     max_iter=AGENT_PROFILE["agents"]["sub_ceo"]["max_iter"],
     max_execution_time=AGENT_PROFILE["agents"]["sub_ceo"]["max_execution_time"],
@@ -268,7 +297,14 @@ main_ceo_agent = Agent(
         "connecting new external tools always goes through request_approval "
         "to the Aufsichtsrat first, no exceptions - register_subsidiary "
         "itself enforces this, but the same discipline applies to every "
-        "judgment call this role makes."
+        "judgment call this role makes. Sets each subsidiary's general "
+        "policies (update_subsidiary_policies - paid_channels_allowed, "
+        "cold_email_allowed, data_collection_allowed, risk_tolerance) only "
+        "behind an already-approved request_approval, same discipline as "
+        "register_subsidiary; every subsidiary starts conservative "
+        "(everything off/low) by default and only loosens with a real, "
+        "board-approved reason, never because a Sub-CEO would find it "
+        "convenient."
     ),
     llm=main_ceo_llm,
     tools=[
@@ -277,6 +313,7 @@ main_ceo_agent = Agent(
         read_cross_subsidiary_requests, resolve_cross_subsidiary_request,
         read_status_reports, acknowledge_status_report, set_strategic_direction,
         search_research_archive, request_approval,
+        read_subsidiary_policies, update_subsidiary_policies,
     ],
     max_iter=AGENT_PROFILE["agents"]["main_ceo"]["max_iter"],
     max_execution_time=AGENT_PROFILE["agents"]["main_ceo"]["max_execution_time"],
@@ -356,12 +393,28 @@ task_channel_strategy = Task(
         "first. No direction set is a normal, valid state - most cycles "
         "will have none. If one is set, read it as the frame for this "
         "cycle's channel and hypothesis judgment calls, not as a command "
-        "that overrides your own tactical read of the data below.\n"
+        "that overrides your own tactical read of the data below. Also call "
+        "read_subsidiary_policies(subsidiary_id='api-sentinel') - if "
+        "paid_channels_allowed is false (the default), do not spend any "
+        "time brainstorming or scoring paid channels this cycle, they "
+        "cannot move to 'testing' regardless of score; cold_email_allowed "
+        "is separately irrelevant here since cold email isn't a supported "
+        "channel/content platform at all right now (legal risk under EU "
+        "ePrivacy/GDPR and German UWG, not a policy toggle you can work "
+        "around).\n"
         "1) Call read_channels() to see the current roster. If it's empty, "
-        "brainstorm a first set of candidate channels for this niche "
-        "(Freqtrade/CCXT quant-bot users) and write each one with "
-        "write_channel. If it already has entries - including a partial set "
-        "from an earlier interrupted attempt - do NOT brainstorm a fresh "
+        "brainstorm a first set of candidate organic channels for this "
+        "niche (Freqtrade/CCXT and broader quant-trading-bot users) and "
+        "write each one with write_channel. Concrete api-sentinel-specific "
+        "candidates worth considering (not an exhaustive or mandatory "
+        "list - use your own judgment on fit, and drop ones that turn out "
+        "not to fit): r/algotrading, r/quantfinance, r/quant, the "
+        "QuantConnect community forum and Discord, Elite Trader, "
+        "Trade2Win, and quant.stackexchange.com (which also exposes a "
+        "real view_count per question - a genuine, non-guessed reach "
+        "signal worth wiring into metrics_channel reasoning). If the "
+        "roster already has entries - including a partial set from an "
+        "earlier interrupted attempt - do NOT brainstorm a fresh "
         "batch from scratch: work with what's already there (it persists "
         "across retries), fill in any channel that's missing required "
         "fields, and only add genuinely new candidates if the existing set "
@@ -392,16 +445,19 @@ task_channel_strategy = Task(
         "candidate sitting idle, promote it - don't leave test capacity "
         "unused, but don't force a low-scoring channel in just to fill the "
         "cap.\n"
-        "4) A paid channel (is_paid=true) needs an approved spend request "
-        "before it can become 'testing' - reuses the existing approval "
-        "queue, no separate gate. Weigh paid spend honestly using real "
-        "numbers, not enthusiasm: Reddit's own $5/day minimum only buys "
-        "2-3 clicks, nowhere near a signal; a test that actually produces "
-        "learnable data realistically runs $1,500-3,000 over 2-3 weeks; "
-        "and below roughly $1,000/month, organic channels have generally "
-        "outperformed paid ones by a wide margin for early-stage products. "
-        "This is input to your scoring, not a rule that excludes paid "
-        "channels outright - if you still think it's worth testing, file "
+        "4) A paid channel (is_paid=true) needs both this subsidiary's "
+        "policies to actually allow it (paid_channels_allowed=true - check "
+        "in step 0; false by default, and that's the expected state for "
+        "now, this subsidiary is organic-only until a human decides "
+        "otherwise) AND an approved spend request before it can become "
+        "'testing' - write_channel enforces both, in that order. If "
+        "paid_channels_allowed is false, don't file the spend request at "
+        "all, there's nothing for a human to usefully approve yet. If it "
+        "is ever true and you still think a paid test is worth it, weigh "
+        "it honestly using real numbers, not enthusiasm: Reddit's own "
+        "$5/day minimum only buys 2-3 clicks, nowhere near a signal; a "
+        "test that actually produces learnable data realistically runs "
+        "$1,500-3,000 over 2-3 weeks. File "
         "request_approval(category='spend', ...) with the concrete "
         "platform/budget/rationale, and only pass its id as "
         "approved_request_id to write_channel once it comes back approved.\n"
@@ -456,16 +512,57 @@ task_growth = ConditionalTask(
         "into (short technical post vs. thread vs. changelog digest, etc.) "
         "and note which format seems to fit each channel's audience best - "
         "this is input for the CEO's channel decision, not a decision you "
-        "make yourself. "
-        "Do not draft or post new content, and never propose or place paid "
-        "ad spend yourself - both go through request_approval and are only "
-        "acted on by a human after approval. Check the state, don't assume "
-        "something was already approved."
+        "make yourself.\n"
+        "2) Content creation is real work here, not something to skip: for "
+        "each active hypothesis (or an explicit task order asking for it), "
+        "consider drafting one genuine piece of organic community content "
+        "via draft_content. Read read_subsidiary_policies first if unsure "
+        "whether a channel is in scope at all this cycle (paid channels "
+        "still need channel-strategy's approval regardless of content). "
+        "Before drafting for any specific community: call "
+        "check_community_risk(platform, target_community) - 'high' risk "
+        "means cool off there and rethink the approach, not draft anyway - "
+        "and get_account_stats(platform) to see whether that platform is "
+        "already near/over its 10% promotional share; if it is, the next "
+        "draft should be is_promotional=false (a genuine "
+        "own_question_post is a completely legitimate way to both "
+        "contribute and learn - log_research_finding(finding_type="
+        "'own_question_post_replies', ...) once real replies come in). "
+        "Write like a moderately engaged human would actually type in that "
+        "community - short, plain, a little imperfect, genuinely useful or "
+        "curious on its own even if nobody clicks anything - not a report; "
+        "draft_content's own style checks reject markdown headers, bullet "
+        "lists, and stock AI phrasing mechanically, but the rest of the "
+        "'does this read like a person' judgment is yours. Check that "
+        "specific community's current self-promotion rules before drafting "
+        "and pass what you found as rules_notes (rules_checked=true) - "
+        "every single time, rules vary a lot between communities and "
+        "change over time, a check from three cycles ago doesn't count. "
+        "Only include_product_link if read_hypotheses shows "
+        "landing_page_live=true for that hypothesis (most won't yet, "
+        "that's expected in the validation phase - it's not a required "
+        "field, and an own_question_post usually shouldn't have one at "
+        "all), and prefer a profile/signature link over an inline one even "
+        "once it is live. draft_content only writes a draft - follow up "
+        "with request_approval(category='publish', ...) once it reads "
+        "right; a human posts it by hand and confirms via a Telegram "
+        "'posted:' reply, so don't report it as posted yourself. Call "
+        "read_content_drafts to check on anything drafted in a prior cycle "
+        "that may have been posted/removed since, and mention any removal "
+        "in your report - that's a real signal for next cycle's channel "
+        "judgment, not just for you.\n"
+        "3) Never propose or place paid ad spend yourself - that goes "
+        "through request_approval and channel-strategy's own gate, and is "
+        "only acted on by a human after approval. Check the state, don't "
+        "assume something was already approved."
     ),
     agent=growth_agent,
     expected_output=(
         "Per active hypothesis: estimated_reach, reach_source, fetch_note if any. "
-        "Plus a short cross-platform format comparison for the CEO to weigh. "
+        "A short cross-platform format comparison for the CEO to weigh. "
+        "Any content drafted this cycle (platform, target_community, "
+        "post_type, whether it's pending approval) and any status change on "
+        "previously drafted content (posted/removed). "
         "Any task orders acted on marked complete with their real result."
     ),
     callback=_make_iteration_watchdog(growth_agent, "Growth"),
@@ -488,7 +585,40 @@ task_ceo = ConditionalTask(
         "that number yourself - and include it on the write_hypothesis call. "
         "A landing page costing a few dollars to build has a very different "
         "bar than something needing real Dev-agent effort - size the "
-        "economics honestly per hypothesis, there is no one fixed target.\n"
+        "economics honestly per hypothesis, there is no one fixed target. "
+        "Alongside the required economics, also reason through these "
+        "(optional free-text fields on write_hypothesis - not a new "
+        "pass/fail bar, just recorded reasoning that should shape your "
+        "choices between comparable options): defensibility_notes - could "
+        "a solo developer rebuild this in an afternoon with an LLM? Prefer "
+        "the more defensible option when cost/effort is comparable, but a "
+        "weak-moat product can still be worth building for speed-to-market "
+        "- say which case this is. Things that actually raise "
+        "defensibility: an accumulating data set, ongoing monitoring "
+        "infrastructure rather than a one-off script, integration depth/"
+        "switching costs, non-obvious domain knowledge. pricing_tier_"
+        "reasoning - price_point_monthly is a real trade-off, never "
+        "default to 'cheapest': a very low price (~EUR5/month) needs a "
+        "large, sharply-felt pain point and volume; a higher tier "
+        "(~EUR29-99/month) needs far less volume for the same break-even "
+        "but slower adoption and a higher perceived-value bar - state "
+        "which trade-off this hypothesis is making and why. "
+        "expansion_notes - forward-looking only, not required to have an "
+        "answer: usage-based add-ons, a power-user tier, a B2B tier worth "
+        "watching for later even at this validation stage. "
+        "channel_fit_reasoning - why the channel you picked (from "
+        "channel-strategy's testing set) actually fits this specific "
+        "hypothesis's audience, not just that it happened to be available. "
+        "Before proposing a live experiment, check "
+        "read_research_findings(hypothesis_id) for anything already logged "
+        "- a competitor product, a forum discussion, replies to a genuine "
+        "question Growth posted - and log_research_finding yourself for "
+        "anything relevant you already know. This research-evidence tier "
+        "is cheaper and faster than a live experiment and a sensible "
+        "default first step, but it is weaker evidence: it can support "
+        "'test_further'/'pivot' reasoning, never a 'build' outcome on its "
+        "own - only evaluate_hypothesis's real score from actual signups "
+        "does that.\n"
         "0) Call read_hypotheses() with no filter first. If it's completely "
         "empty (nothing has ever been written - the very first cycle ever), "
         "the loop has nothing to start from yet: formulate and write exactly "

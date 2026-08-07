@@ -48,6 +48,32 @@ MAX_CHANNELS_TESTING = 3
 MAX_TOTAL_CHANNELS = 20
 REQUIRED_CHANNEL_FIELDS = {"id", "name", "category", "is_paid", "impact_score", "confidence_score"}
 
+# This subsidiary's own id in _holding/subsidiaries.jsonl (see holding.py's
+# _bootstrap_default_subsidiary). Read directly rather than importing
+# holding.py, which imports STATE_DIR from this module - importing back
+# would be circular.
+OWN_SUBSIDIARY_ID = "api-sentinel"
+_SUBSIDIARY_POLICY_DEFAULTS = {
+    "paid_channels_allowed": False,
+    "cold_email_allowed": False,
+    "data_collection_allowed": False,
+    "risk_tolerance": "low",
+}
+
+
+def _read_own_policies() -> dict:
+    """Conservative-by-default read of this subsidiary's holding-level
+    policies (paid_channels_allowed etc., set via Main-CEO's
+    update_subsidiary_policies). Falls back to the same conservative
+    defaults holding.py bootstraps with if the holding registry doesn't
+    exist yet, so this never blocks on init order between the two layers.
+    """
+    subs = read_jsonl(STATE_DIR / "_holding", "subsidiaries.jsonl")
+    sub = next((s for s in subs if s.get("id") == OWN_SUBSIDIARY_ID), None)
+    if sub is None:
+        return dict(_SUBSIDIARY_POLICY_DEFAULTS)
+    return {**_SUBSIDIARY_POLICY_DEFAULTS, **(sub.get("policies") or {})}
+
 
 # --------------------------------------------------------------------------
 # STATE_DIR / JSONL primitives
@@ -346,6 +372,11 @@ def write_hypothesis(hypothesis: str) -> str:
             "prior_score": None,
             "extension_used": False,
             "next_step": None,
+            "landing_page_live": False,
+            "defensibility_notes": None,
+            "pricing_tier_reasoning": None,
+            "expansion_notes": None,
+            "channel_fit_reasoning": None,
             **patch,
         }
         hyps.append(record)
@@ -628,7 +659,10 @@ def write_channel(channel: str, reason: str = "") -> str:
     - at most 3 channels may have status="testing" at once. Bullseye's
       central lesson is that startups fail by spreading thin across many
       channels at once, not by picking the "wrong" one first.
-    - a paid channel (is_paid=true) cannot move to status="testing" without
+    - a paid channel (is_paid=true) cannot move to status="testing" at all
+      unless this subsidiary's policies have paid_channels_allowed=true
+      (read_subsidiary_policies) - check that before spending time
+      brainstorming paid channels. If allowed, it also still needs
       approved_request_id pointing at an approval_queue.jsonl entry with
       status="approved" and category="spend" - this reuses the existing
       human approval queue, it does not add a separate spend gate.
@@ -698,6 +732,14 @@ def write_channel(channel: str, reason: str = "") -> str:
                          f"max {MAX_CHANNELS_TESTING}) - move one to bench/retired first, or hold off"
             })
         if record.get("is_paid"):
+            if not _read_own_policies().get("paid_channels_allowed"):
+                return json.dumps({
+                    "error": "this subsidiary's policies have paid_channels_allowed=false - a paid "
+                             "channel cannot move to status='testing' at all right now. This is a "
+                             "Main-CEO-level setting (update_subsidiary_policies), not something to "
+                             "work around here - use an organic channel instead or escalate via "
+                             "file_cross_subsidiary_request if you think the policy should change."
+                })
             approved_request_id = record.get("approved_request_id")
             approval = None
             if approved_request_id:
@@ -921,6 +963,259 @@ def open_pull_request(branch_name: str, file_path: str, file_content: str, pr_ti
 
 
 # --------------------------------------------------------------------------
+# Research-evidence tier (Validated Learning addendum, section 4) - a
+# cheaper, weaker-than-a-live-experiment validation step: existing
+# competitor products, forum discussions, a genuine question post's
+# replies. Logged for reasoning context; never enough on its own to push a
+# hypothesis to "build" - only evaluate_hypothesis's real score off
+# signups.jsonl does that.
+# --------------------------------------------------------------------------
+
+RESEARCH_FINDING_TYPES = {"competitor_product", "forum_discussion", "own_question_post_replies", "other"}
+
+
+@tool("log_research_finding")
+def log_research_finding(hypothesis_id: str, finding_type: str, source: str, summary: str) -> str:
+    """Log a piece of research evidence tied to a hypothesis - cheaper and
+    faster than a live experiment, and a sensible default first step
+    before proposing one. Examples: an existing competitor product,
+    a relevant forum discussion you found, or the replies you got on a
+    genuine question post (draft_content's "own_question_post" post_type is
+    itself a validation method that feeds this tier).
+
+    finding_type must be one of competitor_product/forum_discussion/
+    own_question_post_replies/other. This is weaker evidence than a live
+    experiment - it can support reasoning
+    toward "test_further" or "pivot", but evaluate_hypothesis's real score
+    (from actual signups.jsonl conversions) is still the only thing that
+    can produce a "build" outcome.
+    """
+    if finding_type not in RESEARCH_FINDING_TYPES:
+        return json.dumps({
+            "error": f"invalid finding_type '{finding_type}', must be one of {sorted(RESEARCH_FINDING_TYPES)}"
+        })
+    if not summary.strip():
+        return json.dumps({"error": "summary must not be empty"})
+    record = {
+        "id": f"research_{uuid.uuid4().hex[:8]}",
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "hypothesis_id": hypothesis_id,
+        "finding_type": finding_type,
+        "source": source,
+        "summary": summary,
+    }
+    _append_jsonl("research_findings.jsonl", record)
+    return json.dumps({"ok": True, "id": record["id"]})
+
+
+@tool("read_research_findings")
+def read_research_findings(hypothesis_id: str = "") -> str:
+    """Return logged research-evidence records from research_findings.jsonl,
+    optionally filtered to one hypothesis_id, or "" for all.
+    """
+    findings = _read_jsonl("research_findings.jsonl")
+    if hypothesis_id:
+        findings = [f for f in findings if f.get("hypothesis_id") == hypothesis_id]
+    return json.dumps(findings, ensure_ascii=False)
+
+
+# --------------------------------------------------------------------------
+# Content drafting (Channel Selection addendum) - organic community content
+# only (cold email is excluded, not just for style but for EU
+# ePrivacy/GDPR/German UWG legal reasons). Drafting is separate from
+# posting: a human always posts by hand and confirms it via a Telegram
+# "posted: <draft_id> <url>" reply, same pattern as the existing
+# approve/reject/stop/start remote control.
+# --------------------------------------------------------------------------
+
+CONTENT_PLATFORMS = {"reddit", "discord", "quant_stackexchange", "forum_other"}
+CONTENT_POST_TYPES = {"thread_reply", "own_question_post", "own_hypothesis_post"}
+CONTENT_LENGTH_CAPS = {"thread_reply": 600, "own_question_post": 500, "own_hypothesis_post": 1500}
+_AI_TELL_PATTERNS = [
+    (re.compile(r"^#{1,6}\s", re.MULTILINE), "a markdown header"),
+    (re.compile(r"^\s*[-*]\s", re.MULTILINE), "a bullet-list line"),
+    (re.compile(r"\bin conclusion\b", re.IGNORECASE), '"in conclusion"'),
+    (re.compile(r"\bin summary\b", re.IGNORECASE), '"in summary"'),
+    (re.compile(r"\bas an ai\b", re.IGNORECASE), '"as an AI"'),
+    (re.compile(r"\bi hope this helps\b", re.IGNORECASE), '"I hope this helps"'),
+]
+
+
+def _find_style_violations(text: str) -> list:
+    return [f"contains {label} - reads as AI-generated, not a quick human post" for pattern, label in _AI_TELL_PATTERNS if pattern.search(text)]
+
+
+@tool("draft_content")
+def draft_content(
+    hypothesis_id: str, platform: str, post_type: str, target_community: str, text: str,
+    is_promotional: bool, include_product_link: bool, rules_checked: bool, rules_notes: str,
+) -> str:
+    """Draft one piece of organic community content (your own words, not
+    boilerplate) for human review before anything is posted. This tool
+    only writes a draft to content_drafts.jsonl with status="drafted" - it
+    never posts anything itself and does not request approval on its own;
+    follow up with request_approval(category="publish"), then wait for a
+    human "posted: <draft_id> <url>" Telegram reply before treating it as
+    live.
+
+    platform: one of reddit/discord/quant_stackexchange/forum_other. Cold
+    email is not a supported platform here - excluded for legal reasons (EU
+    ePrivacy/GDPR, German UWG), not a style choice, so don't try to route
+    around it via forum_other.
+
+    post_type: one of thread_reply/own_question_post/own_hypothesis_post
+    - "thread_reply": a genuine reply inside someone else's existing thread.
+    - "own_question_post": a real, curious question - itself a validation
+      method (log_research_finding's own_question_post_replies tier), not
+      promotion. Usually should NOT include_product_link.
+    - "own_hypothesis_post": you starting a thread about the problem/idea
+      itself.
+
+    Enforced, mechanical checks (tone/quality judgment beyond this is
+    yours - these only catch what a heuristic actually can catch):
+    - rules_checked must be true, with non-empty rules_notes describing
+      what you found - check THIS community's current self-promotion
+      rules before EVERY post, not once per platform; rules vary a lot
+      between communities and change over time.
+    - text must not read like an LLM wrote it: no markdown headers, no
+      bullet lists, no "in conclusion"/"in summary"/"as an AI"/"I hope
+      this helps". Short, plain, imperfect prose only - like a moderately
+      engaged human typed it, not a report.
+    - length cap by post_type: thread_reply<=600, own_question_post<=500,
+      own_hypothesis_post<=1500 chars - a real forum reply is a paragraph,
+      not an essay.
+    - include_product_link requires hypothesis_id to point at a hypothesis
+      with landing_page_live=true - never link to a page that doesn't
+      exist yet. That flag is only set by a human "live: <hypothesis_id>"
+      Telegram reply once a PR is actually merged (merging is always a
+      human step), so the system never fabricates "live" on its own.
+    """
+    if platform not in CONTENT_PLATFORMS:
+        return json.dumps({"error": f"invalid platform '{platform}', must be one of {sorted(CONTENT_PLATFORMS)}"})
+    if post_type not in CONTENT_POST_TYPES:
+        return json.dumps({"error": f"invalid post_type '{post_type}', must be one of {sorted(CONTENT_POST_TYPES)}"})
+    if not rules_checked:
+        return json.dumps({
+            "error": "rules_checked must be true - check this community's own posting/self-promo rules "
+                     "before drafting, every single time, not just once per platform"
+        })
+    if not rules_notes.strip():
+        return json.dumps({"error": "rules_notes must describe what you found when checking this community's rules"})
+    if not target_community.strip():
+        return json.dumps({"error": "target_community must not be empty"})
+
+    violations = _find_style_violations(text)
+    length_cap = CONTENT_LENGTH_CAPS[post_type]
+    if len(text) > length_cap:
+        violations.append(f"{len(text)} chars exceeds the {length_cap}-char cap for post_type={post_type}")
+    if violations:
+        return json.dumps({"error": "draft rejected by style checks", "violations": violations})
+
+    hyps = _read_jsonl("hypotheses.jsonl")
+    hyp = next((h for h in hyps if h.get("id") == hypothesis_id), None)
+    if hyp is None:
+        return json.dumps({"error": f"no hypothesis with id '{hypothesis_id}'"})
+    if include_product_link and not hyp.get("landing_page_live"):
+        return json.dumps({
+            "error": "include_product_link=true but this hypothesis's landing_page_live is not true yet "
+                     "- draft without the link, or wait for the human 'live: <hypothesis_id>' confirmation"
+        })
+
+    draft_id = f"draft_{uuid.uuid4().hex[:8]}"
+    record = {
+        "id": draft_id,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "hypothesis_id": hypothesis_id,
+        "platform": platform,
+        "post_type": post_type,
+        "target_community": target_community,
+        "text": text,
+        "is_promotional": is_promotional,
+        "include_product_link": include_product_link,
+        "rules_checked": rules_checked,
+        "rules_notes": rules_notes,
+        "status": "drafted",
+        "approved_request_id": None,
+        "posted_at": None,
+        "post_url": None,
+        "removed": False,
+        "removed_reason": None,
+        "removed_at": None,
+    }
+    _append_jsonl("content_drafts.jsonl", record)
+    return json.dumps({"ok": True, "id": draft_id, "status": "drafted"})
+
+
+@tool("read_content_drafts")
+def read_content_drafts(hypothesis_id: str = "", status: str = "") -> str:
+    """Return drafted/posted/removed content records from
+    content_drafts.jsonl, optionally filtered by hypothesis_id and/or
+    status (drafted/posted/removed).
+    """
+    drafts = _read_jsonl("content_drafts.jsonl")
+    if hypothesis_id:
+        drafts = [d for d in drafts if d.get("hypothesis_id") == hypothesis_id]
+    if status:
+        drafts = [d for d in drafts if d.get("status") == status]
+    return json.dumps(drafts, ensure_ascii=False)
+
+
+@tool("check_community_risk")
+def check_community_risk(platform: str, target_community: str) -> str:
+    """Check this specific community's recent post-removal history before
+    posting again - a removed post is a real signal, not noise. Counts
+    status="removed" drafts for this platform+community in the last 30
+    days; risk="high" at 2+ removals in that window (treat as a cooldown
+    signal / rethink the approach there), else "low". Read
+    recent_removals' reasons, not just the count, before deciding what to
+    change.
+    """
+    if platform not in CONTENT_PLATFORMS:
+        return json.dumps({"error": f"invalid platform '{platform}', must be one of {sorted(CONTENT_PLATFORMS)}"})
+    cutoff = datetime.now(timezone.utc) - timedelta(days=30)
+    recent_removals = []
+    for d in _read_jsonl("content_drafts.jsonl"):
+        if d.get("platform") != platform or d.get("target_community") != target_community or not d.get("removed"):
+            continue
+        removed_at = d.get("removed_at")
+        try:
+            if removed_at and datetime.fromisoformat(removed_at) >= cutoff:
+                recent_removals.append({
+                    "id": d.get("id"), "removed_at": removed_at, "removed_reason": d.get("removed_reason"),
+                })
+        except ValueError:
+            continue
+    risk = "high" if len(recent_removals) >= 2 else "low"
+    return json.dumps({
+        "platform": platform, "target_community": target_community,
+        "removal_count_last_30d": len(recent_removals), "risk": risk, "recent_removals": recent_removals,
+    })
+
+
+@tool("get_account_stats")
+def get_account_stats(platform: str) -> str:
+    """Return this platform's genuine-vs-promotional content ratio across
+    all drafted content (one account per product per platform, so this is
+    effectively that account's own stats). Target is roughly 90% genuinely
+    useful/curious content to 10% promotional, tracked on a rolling basis
+    across all drafts - not a per-post rule.
+    """
+    if platform not in CONTENT_PLATFORMS:
+        return json.dumps({"error": f"invalid platform '{platform}', must be one of {sorted(CONTENT_PLATFORMS)}"})
+    drafts = [d for d in _read_jsonl("content_drafts.jsonl") if d.get("platform") == platform]
+    total = len(drafts)
+    promotional = sum(1 for d in drafts if d.get("is_promotional"))
+    return json.dumps({
+        "platform": platform,
+        "total_posts_drafted": total,
+        "promotional_count": promotional,
+        "genuine_count": total - promotional,
+        "promotional_ratio": round(promotional / total, 3) if total else None,
+        "target_promotional_ratio": 0.10,
+    })
+
+
+# --------------------------------------------------------------------------
 # Cycle notification (orchestration-level, not an agent tool - called
 # directly from crew.py after kickoff() so delivery never depends on an
 # agent remembering to call it)
@@ -971,6 +1266,7 @@ def send_telegram_message(text: str) -> None:
 _TELEGRAM_OFFSET_FILE = "telegram_update_offset.txt"
 _SYSTEM_PAUSE_FILE = "system_paused.json"
 _APPROVAL_ID_RE = re.compile(r"appr_[0-9a-f]{8}")
+_DRAFT_ID_RE = re.compile(r"draft_[0-9a-f]{8}")
 _STOP_WORDS = {"stop", "pause"}
 _START_WORDS = {"start", "resume", "weiter"}
 _APPROVE_WORDS = {"approve", "ja", "yes"}
@@ -1064,15 +1360,26 @@ def _fetch_telegram_updates() -> list:
 
 def _classify_command(text: str, reply_to_text: str):
     """Classify one already-fetched Telegram message as a command. Returns
-    (action, approval_id) where action is one of "pause"/"resume"/
-    "approve"/"reject" (approval_id is None for pause/resume), or None if
-    the message isn't a recognized command - the operator may just be
-    chatting, that's not an error, it's silently ignored.
+    (action, payload) or None if the message isn't a recognized command -
+    the operator may just be chatting, that's not an error, it's silently
+    ignored. Payload shape depends on action:
+    - "pause"/"resume": payload is None.
+    - "approve"/"reject": payload is the appr_... approval id.
+    - "live": payload is the hypothesis_id to mark landing_page_live=true,
+      confirming a PR has actually been merged (a human-only step this
+      system otherwise has no way to observe).
+    - "posted": payload is (draft_id, url) - a human confirming they
+      actually posted a draft from content_drafts.jsonl.
+    - "removed": payload is (draft_id, reason) - a human confirming a
+      previously-posted draft got taken down, feeding check_community_risk.
 
     Two ways to approve/reject: reply directly to the notification message
     that announced the pending approval (matched via the appr_... id in
     reply_to_text), or type "<id> approve"/"<id> reject" directly if that
-    original message has scrolled out of view.
+    original message has scrolled out of view. "live:"/"posted:"/
+    "removed:" are always typed directly (there's no single notification
+    message to reply to for those), as "live: <hypothesis_id>",
+    "posted: <draft_id> <url>", "removed: <draft_id> <reason>".
     """
     normalized = text.strip().lower()
 
@@ -1093,6 +1400,26 @@ def _classify_command(text: str, reply_to_text: str):
             return "approve", id_match.group(0)
         if remainder in _REJECT_WORDS:
             return "reject", id_match.group(0)
+
+    if normalized.startswith("live:"):
+        hypothesis_id = text.split(":", 1)[1].strip()
+        return ("live", hypothesis_id) if hypothesis_id else None
+
+    if normalized.startswith("posted:"):
+        rest = text.split(":", 1)[1].strip()
+        draft_match = _DRAFT_ID_RE.search(rest)
+        if not draft_match:
+            return None
+        url = rest[draft_match.end():].strip()
+        return ("posted", (draft_match.group(0), url)) if url else None
+
+    if normalized.startswith("removed:"):
+        rest = text.split(":", 1)[1].strip()
+        draft_match = _DRAFT_ID_RE.search(rest)
+        if not draft_match:
+            return None
+        reason = rest[draft_match.end():].strip() or "removed (no reason given)"
+        return "removed", (draft_match.group(0), reason)
 
     return None
 
@@ -1124,6 +1451,50 @@ def _apply_telegram_commands(messages: list) -> list:
             set_system_paused(False)
             log.append("System fortgesetzt (Telegram)")
             send_telegram_message("System fortgesetzt.")
+            continue
+
+        if action == "live":
+            hypothesis_id = target_id
+            hyps = _read_jsonl("hypotheses.jsonl")
+            idx = next((i for i, h in enumerate(hyps) if h.get("id") == hypothesis_id), None)
+            if idx is None:
+                send_telegram_message(f"Keine Hypothese mit id '{hypothesis_id}' gefunden.")
+                continue
+            hyps[idx]["landing_page_live"] = True
+            _write_jsonl("hypotheses.jsonl", hyps)
+            log.append(f"{hypothesis_id} landing_page_live=true (Telegram)")
+            send_telegram_message(f"{hypothesis_id}: landing_page_live gesetzt.")
+            continue
+
+        if action == "posted":
+            draft_id, url = target_id
+            drafts = _read_jsonl("content_drafts.jsonl")
+            idx = next((i for i, d in enumerate(drafts) if d.get("id") == draft_id), None)
+            if idx is None:
+                send_telegram_message(f"Kein Draft mit id '{draft_id}' gefunden.")
+                continue
+            drafts[idx]["status"] = "posted"
+            drafts[idx]["posted_at"] = datetime.now(timezone.utc).isoformat()
+            drafts[idx]["post_url"] = url
+            _write_jsonl("content_drafts.jsonl", drafts)
+            log.append(f"{draft_id} als gepostet markiert (Telegram)")
+            send_telegram_message(f"{draft_id}: als gepostet markiert ({url}).")
+            continue
+
+        if action == "removed":
+            draft_id, reason = target_id
+            drafts = _read_jsonl("content_drafts.jsonl")
+            idx = next((i for i, d in enumerate(drafts) if d.get("id") == draft_id), None)
+            if idx is None:
+                send_telegram_message(f"Kein Draft mit id '{draft_id}' gefunden.")
+                continue
+            drafts[idx]["status"] = "removed"
+            drafts[idx]["removed"] = True
+            drafts[idx]["removed_reason"] = reason
+            drafts[idx]["removed_at"] = datetime.now(timezone.utc).isoformat()
+            _write_jsonl("content_drafts.jsonl", drafts)
+            log.append(f"{draft_id} als entfernt markiert (Telegram)")
+            send_telegram_message(f"{draft_id}: als entfernt markiert ({reason}).")
             continue
 
         if records is None:

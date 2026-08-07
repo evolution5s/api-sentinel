@@ -36,6 +36,19 @@ REQUIRED_PIVOT_FIELDS = {
 }
 REQUIRED_SUBSIDIARY_FIELDS = {"id", "name", "focus"}
 
+# General prerequisites every subsidiary operates under by default - the
+# Main-CEO can instruct any Sub-CEO to build essentially any company, but
+# every one of them has to clear these first, regardless of what it does.
+# Per-subsidiary, adjustable (e.g. re-allow paid channels for one specific
+# subsidiary later) but never silently - only via update_subsidiary_policies,
+# which is approval-gated the same way register_subsidiary already is.
+SUBSIDIARY_POLICY_DEFAULTS = {
+    "paid_channels_allowed": False,
+    "cold_email_allowed": False,
+    "data_collection_allowed": False,
+    "risk_tolerance": "low",
+}
+
 
 def _read(filename: str) -> list:
     return read_jsonl(HOLDING_DIR, filename)
@@ -65,6 +78,7 @@ def _bootstrap_default_subsidiary() -> dict:
         "state_dir": str(SUBSIDIARY_STATE_DIR),
         "created_at": datetime.now(timezone.utc).isoformat(),
         "status_history": [],
+        "policies": dict(SUBSIDIARY_POLICY_DEFAULTS),
         "notes": (
             "Pre-existing subsidiary, auto-registered when the Main-CEO/"
             "Sub-CEO holding layer was added."
@@ -131,6 +145,12 @@ def register_subsidiary(subsidiary: str, approved_request_id: str) -> str:
     if any(s.get("id") == patch["id"] for s in subs):
         return json.dumps({"error": f"subsidiary '{patch['id']}' is already registered"})
 
+    # Policies default to the general prerequisites (no paid channels, no
+    # cold email, no data collection, low risk tolerance) unless the patch
+    # explicitly overrides one - a new subsidiary never silently inherits a
+    # looser policy than the baseline just because nobody mentioned it.
+    policies = {**SUBSIDIARY_POLICY_DEFAULTS, **(patch.get("policies") or {})}
+
     record = {
         "created_at": datetime.now(timezone.utc).isoformat(),
         "status": "active",
@@ -140,10 +160,73 @@ def register_subsidiary(subsidiary: str, approved_request_id: str) -> str:
             "reason": f"spin-off approved via {approved_request_id}",
         }],
         **patch,
+        "policies": policies,
     }
     subs.append(record)
     _write("subsidiaries.jsonl", subs)
-    return json.dumps({"ok": True, "id": patch["id"]})
+    return json.dumps({"ok": True, "id": patch["id"], "policies": policies})
+
+
+@tool("read_subsidiary_policies")
+def read_subsidiary_policies(subsidiary_id: str) -> str:
+    """Read the general prerequisites a subsidiary currently operates
+    under (paid_channels_allowed, cold_email_allowed, data_collection_
+    allowed, risk_tolerance). Every subsidiary has these, defaulting to the
+    conservative baseline (no paid channels, no cold email, no data
+    collection, low risk) unless a human explicitly loosened one via
+    update_subsidiary_policies. A Sub-CEO should check this before
+    generating channel candidates or hypotheses that would touch any of
+    these - e.g. never brainstorm paid-ads channels while
+    paid_channels_allowed is false.
+    """
+    subs = _all_subsidiaries()
+    sub = next((s for s in subs if s.get("id") == subsidiary_id), None)
+    if sub is None:
+        return json.dumps({"error": f"no subsidiary with id '{subsidiary_id}'"})
+    return json.dumps(sub.get("policies") or dict(SUBSIDIARY_POLICY_DEFAULTS), ensure_ascii=False)
+
+
+@tool("update_subsidiary_policies")
+def update_subsidiary_policies(subsidiary_id: str, policies_patch: str, approved_request_id: str, reasoning: str) -> str:
+    """Main-CEO adjusts a subsidiary's general prerequisites - e.g.
+    re-allowing paid channels for one specific subsidiary. Requires
+    approved_request_id pointing at an approved entry in the human approval
+    queue, same as register_subsidiary - loosening a prerequisite like "no
+    paid ads" or "no cold email" is exactly the kind of decision that needs
+    the Aufsichtsrat's sign-off, never something a Sub-CEO or the Main-CEO
+    grants itself. `policies_patch` is a JSON object with only the keys
+    being changed, e.g. '{"paid_channels_allowed": true}'.
+    """
+    try:
+        patch = json.loads(policies_patch)
+    except json.JSONDecodeError as exc:
+        return json.dumps({"error": f"invalid JSON: {exc}"})
+
+    unknown = set(patch.keys()) - set(SUBSIDIARY_POLICY_DEFAULTS.keys())
+    if unknown:
+        return json.dumps({"error": f"unknown policy keys: {sorted(unknown)}, must be a subset of {sorted(SUBSIDIARY_POLICY_DEFAULTS.keys())}"})
+
+    approvals = read_jsonl(SUBSIDIARY_STATE_DIR, "approval_queue.jsonl")
+    approval = next((a for a in approvals if a.get("id") == approved_request_id), None)
+    if not approval or approval.get("status") != "approved":
+        return json.dumps({
+            "error": "update_subsidiary_policies requires approved_request_id pointing at an "
+                     "approved entry in the human approval queue - file request_approval first"
+        })
+
+    subs = _all_subsidiaries()
+    idx = next((i for i, s in enumerate(subs) if s.get("id") == subsidiary_id), None)
+    if idx is None:
+        return json.dumps({"error": f"no subsidiary with id '{subsidiary_id}'"})
+
+    current = {**SUBSIDIARY_POLICY_DEFAULTS, **(subs[idx].get("policies") or {})}
+    subs[idx]["policies"] = {**current, **patch}
+    subs[idx].setdefault("policy_history", []).append({
+        "at": datetime.now(timezone.utc).isoformat(), "changed": patch,
+        "approved_request_id": approved_request_id, "reasoning": reasoning,
+    })
+    _write("subsidiaries.jsonl", subs)
+    return json.dumps({"ok": True, "id": subsidiary_id, "policies": subs[idx]["policies"]})
 
 
 @tool("set_subsidiary_status")
