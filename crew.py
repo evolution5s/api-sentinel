@@ -52,6 +52,7 @@ from tools import (
 )
 from holding import (
     acknowledge_status_report,
+    assess_subsidiary_trajectory,
     decide_pivot_proposal,
     file_cross_subsidiary_request,
     file_pivot_proposal,
@@ -215,7 +216,9 @@ ceo_agent = Agent(
     role="Sub-CEO of API Sentinel (reports to the Main-CEO)",
     goal=(
         "Evaluate due hypotheses, formulate follow-up hypotheses, and grow API "
-        "Sentinel into a profitable bootstrapped business - without ever "
+        "Sentinel into a profitable, revenue-generating bootstrapped business "
+        "- movement toward actual paying customers is the real measure of "
+        "progress here, not the number of experiments run - without ever "
         "fabricating a number, bypassing the human approval queue, or deciding "
         "a fundamental strategy change alone"
     ),
@@ -265,7 +268,13 @@ ceo_agent = Agent(
         "candidate hypothesis ideas by impact_score/confidence_score the "
         "same way channels are ranked, since only MAX_ACTIVE_HYPOTHESES can "
         "run at once - spreading thin across too many at a time is treated "
-        "as the more common failure than picking the wrong one."
+        "as the more common failure than picking the wrong one. That "
+        "ranking is itself in service of revenue, not novelty: impact_score "
+        "should reflect how much a hypothesis actually moves toward a "
+        "paying, profitable business if it succeeds, not which experiment "
+        "would just produce the most interesting data - same standard "
+        "applies to channel picks and pivot-variable choices whenever "
+        "there's real discretion involved."
     ),
     llm=ceo_llm,
     tools=[
@@ -288,12 +297,16 @@ ceo_agent = Agent(
 main_ceo_agent = Agent(
     role="Main-CEO of the Open Claw Holding",
     goal=(
-        "Steer the holding's subsidiaries strategically: review pivot "
-        "proposals, cross-subsidiary requests, and status reports from "
-        "Sub-CEOs, set strategic direction where it's actually warranted, "
-        "manage the subsidiary registry (including the dormant-state "
-        "lifecycle), and loop in the Aufsichtsrat for anything with real "
-        "reach - never decide big-impact moves alone"
+        "Steer the holding's subsidiaries strategically toward becoming "
+        "actual profitable, revenue-generating businesses - not just toward "
+        "running more experiments: review pivot proposals, cross-subsidiary "
+        "requests, and status reports from Sub-CEOs, make sure every "
+        "subsidiary has been told that revenue is the point at least once, "
+        "keep an eye on whether each subsidiary's trajectory is actually "
+        "moving that way, set strategic direction where it's actually "
+        "warranted, manage the subsidiary registry (including the "
+        "dormant-state lifecycle), and loop in the Aufsichtsrat for "
+        "anything with real reach - never decide big-impact moves alone"
     ),
     backstory=(
         "Runs the holding above individual subsidiaries' Sub-CEOs. With only "
@@ -304,13 +317,27 @@ main_ceo_agent = Agent(
         "(read_status_reports) - especially ones flagged as needing a "
         "decision, e.g. every 'build' outcome always surfaces here before "
         "anyone starts building - and acknowledges them once reviewed "
-        "(acknowledge_status_report) so they don't keep resurfacing. Can set "
-        "a Sub-CEO's strategic direction (set_strategic_direction) when "
-        "there's a real reason to - a market shift, a pattern across several "
-        "reports, a decision that just got made - but this is the exception, "
-        "not a box to fill every cycle; it doesn't override the Sub-CEO's own "
-        "tactical judgment, it's the frame the Sub-CEO reads and works "
-        "within. Instantiating a new subsidiary, deploying new agents, or "
+        "(acknowledge_status_report) so they don't keep resurfacing. Every "
+        "subsidiary gets a revenue-framed strategic direction "
+        "(set_strategic_direction) at least once - checked via "
+        "read_strategic_direction, not left implicit - establishing that "
+        "the actual point is a viable, revenue-generating business, not an "
+        "indefinitely running series of experiments; this is a one-time "
+        "baseline per subsidiary, not tactical micromanagement. Beyond that "
+        "baseline, sets a NEW direction only when there's a real reason to - "
+        "a market shift, a pattern across several reports, a decision that "
+        "just got made - the exception, not a box to fill every cycle; it "
+        "doesn't override the Sub-CEO's own tactical judgment, it's the "
+        "frame the Sub-CEO reads and works within. Also checks "
+        "assess_subsidiary_trajectory every cycle, regardless of whether "
+        "anything was escalated - a subsidiary can run indefinitely without "
+        "a formal escalation ever firing while still visibly not moving "
+        "toward revenue (evaluated hypotheses piling up with no 'build' "
+        "among them); says so plainly in its own report when the counts "
+        "suggest that, without inventing a new escalation record of its own "
+        "- check_escalation (the Sub-CEO's per-lineage rolling-score check) "
+        "stays the one thing that actually triggers a formal pivot proposal. "
+        "Instantiating a new subsidiary, deploying new agents, or "
         "connecting new external tools always goes through request_approval "
         "to the Aufsichtsrat first, no exceptions - register_subsidiary "
         "itself enforces this, but the same discipline applies to every "
@@ -329,6 +356,7 @@ main_ceo_agent = Agent(
         read_pivot_proposals, decide_pivot_proposal,
         read_cross_subsidiary_requests, resolve_cross_subsidiary_request,
         read_status_reports, acknowledge_status_report, set_strategic_direction,
+        read_strategic_direction, assess_subsidiary_trajectory,
         search_research_archive, request_approval,
         read_subsidiary_policies, update_subsidiary_policies,
     ],
@@ -595,8 +623,13 @@ task_ceo = ConditionalTask(
         "already validated as valuable), your own honest impact_score and "
         "confidence_score (same shape as a channel's - this is what lets "
         "you rank competing hypothesis ideas against each other, see the "
-        "MAX_ACTIVE_HYPOTHESES note below), and its own economics fixed "
-        "BEFORE it runs, never adjusted afterward to fit the result: "
+        "MAX_ACTIVE_HYPOTHESES note below). impact_score should reflect how "
+        "much this hypothesis actually moves toward a paying, profitable "
+        "business if it succeeds - not which experiment sounds most "
+        "interesting or would produce the richest data; that's the real "
+        "point of the ranking, not just a tie-breaker. Every hypothesis "
+        "also needs its own economics fixed BEFORE it runs, never adjusted "
+        "afterward to fit the result: "
         "estimated_build_cost (rough token/time cost of the real product/"
         "feature this would become if it succeeds - not the cost of the "
         "test itself), price_point_monthly, and break_even_horizon_months. "
@@ -855,17 +888,42 @@ task_main_ceo_review = ConditionalTask(
         "set_subsidiary_status if there's a concrete reason to change one "
         "this cycle (e.g. a Sub-CEO reported its project done or paused) - "
         "never change status speculatively.\n"
-        "5) Only if the status reports above show a genuine reason to - a "
-        "pattern across several of them, a market shift, a decision that "
-        "just got made - call set_strategic_direction(subsidiary_id="
-        "'api-sentinel', focus_area=..., reasoning=...) to steer the "
-        "Sub-CEO's focus next cycle. This is the exception, not something "
-        "to do every cycle just to have done it - most cycles should set no "
-        "new direction, and that's a completely valid outcome too.\n"
-        "6) Never call register_subsidiary without an already-approved "
+        "5) For every active subsidiary, every cycle, regardless of what "
+        "steps 1-3 turned up: call assess_subsidiary_trajectory(subsidiary_"
+        "id=...) - a subsidiary-wide count of resolved outcomes "
+        "(build/pivot/bury), independent of whether the Sub-CEO escalated "
+        "anything. If it comes back possible_stall=true (several resolved "
+        "hypotheses, none of them 'build'), say so explicitly in your own "
+        "report - this is exactly the kind of thing that can otherwise run "
+        "indefinitely without ever surfacing, since no formal escalation "
+        "fires for it. Don't file a new record for this yourself and don't "
+        "treat it as equivalent to check_escalation's own trigger (that "
+        "stays the one thing that actually starts a formal pivot proposal, "
+        "from the Sub-CEO's side) - this is your own observation to raise, "
+        "not a mechanical gate.\n"
+        "6) Call read_strategic_direction(subsidiary_id=...) for every "
+        "active subsidiary. If it returns direction=null - this subsidiary "
+        "has NEVER had a strategic direction set, not even once - call "
+        "set_strategic_direction to establish one now, framed around "
+        "reaching a viable, revenue-generating business (e.g. "
+        "'validate and reach a profitable, paying-customer business model, "
+        "not open-ended hypothesis testing') - this establishes the actual "
+        "point of the exercise, it does not override the Sub-CEO's own "
+        "tactical channel/hypothesis judgment. Do this for every subsidiary "
+        "that's never had one, every cycle, not just once ever across the "
+        "whole holding - it's a one-time baseline per subsidiary, not a "
+        "one-time event for the whole system. Beyond that mandatory "
+        "baseline, only set a NEW direction on top of an existing one if "
+        "the status reports above show a genuine reason to - a pattern "
+        "across several of them, a market shift, a decision that just got "
+        "made. This part remains the exception, not something to do every "
+        "cycle just to have done it - most cycles should set no additional "
+        "direction beyond an already-established baseline, and that's a "
+        "completely valid outcome too.\n"
+        "7) Never call register_subsidiary without an already-approved "
         "request_approval backing it - the tool enforces this, but don't "
         "attempt it prematurely either.\n"
-        "7) Nothing to review this cycle is a completely normal, valid "
+        "8) Nothing to review this cycle is a completely normal, valid "
         "outcome - report it as such rather than inventing busywork."
     ),
     agent=main_ceo_agent,
@@ -873,9 +931,12 @@ task_main_ceo_review = ConditionalTask(
         "Status reports reviewed (if any needed a decision) with what was "
         "decided. Pivot proposals reviewed (if any) with decisions and "
         "reasoning. Cross-subsidiary requests resolved (if any). Current "
-        "subsidiary registry summary. Any strategic direction set (or "
-        "explicitly not set, and why not). Any request_approval filed for "
-        "board sign-off."
+        "subsidiary registry summary. Trajectory assessment per active "
+        "subsidiary (possible_stall flagged explicitly if true). Any "
+        "strategic direction set - the mandatory revenue-framed baseline if "
+        "this was the first time for that subsidiary, or an additional one "
+        "on top and why, or explicitly none beyond the baseline and why "
+        "not. Any request_approval filed for board sign-off."
     ),
     callback=_make_iteration_watchdog(main_ceo_agent, "Main-CEO"),
 )
@@ -926,10 +987,16 @@ def _task_summary(task: Task) -> str:
         return f"(Output nicht lesbar: {exc})"
 
 
-def _usage_line() -> str:
+def _compute_cycle_usage() -> dict:
+    """Reads crew.usage_metrics once and logs it via log_cycle_usage -
+    shared by _usage_headline()/_usage_detail_line() so the log write
+    happens exactly once per cycle regardless of which is called first.
+    Returns None if no kickoff() has run yet (e.g. mid-test, or a crash
+    before the crew ever started).
+    """
     metrics = getattr(crew, "usage_metrics", None)
     if metrics is None:
-        return "LLM-Nutzung: nicht verfuegbar"
+        return None
     usage = {
         "total_tokens": getattr(metrics, "total_tokens", None),
         "prompt_tokens": getattr(metrics, "prompt_tokens", None),
@@ -939,10 +1006,25 @@ def _usage_line() -> str:
         "successful_requests": getattr(metrics, "successful_requests", None),
     }
     log_cycle_usage(usage)
+    return usage
+
+
+def _usage_headline(usage: dict) -> str:
+    """The single most-glanced-at number in the whole report - kept as its
+    own standalone line at the very top (see send_cycle_summary), not
+    folded mid-sentence into the fuller breakdown below it.
+    """
+    if usage is None:
+        return "Gesamt-Tokens diesen Zyklus: nicht verfuegbar"
+    return f"Gesamt-Tokens diesen Zyklus: {usage['total_tokens']}"
+
+
+def _usage_detail_line(usage: dict) -> str:
+    if usage is None:
+        return "LLM-Nutzung: nicht verfuegbar"
     return (
         f"Agent-Profil: '{AGENT_PROFILE['name']}' ({AGENT_PROFILE['model']}). "
-        f"LLM-Nutzung diesen Zyklus: {usage['total_tokens']} tokens gesamt "
-        f"({usage['prompt_tokens']} prompt, {usage['completion_tokens']} completion), "
+        f"Aufteilung: {usage['prompt_tokens']} prompt, {usage['completion_tokens']} completion. "
         f"Prompt-Cache: {usage['cached_prompt_tokens']} tokens gelesen "
         f"(guenstig), {usage['cache_creation_tokens']} tokens neu geschrieben "
         f"(teurer, einmalig pro Cache-Fenster) - CrewAI cached role/goal/"
@@ -970,7 +1052,15 @@ def send_cycle_summary(kickoff_error: Exception = None, telegram_action_log: lis
     try:
         notify_new_pending_approvals()
         pending = json.loads(read_state.run()).get("pending_approvals", "?")
-        lines = [f"API Sentinel Zyklus - {datetime.now(timezone.utc).isoformat()}"]
+        usage = _compute_cycle_usage()
+        # Total tokens is the single most-glanced-at number in this report -
+        # kept as its own standalone line right at the top, ahead of even
+        # the profile/model detail line below, so it's unmissable rather
+        # than folded mid-sentence into a longer paragraph.
+        lines = [
+            f"API Sentinel Zyklus - {datetime.now(timezone.utc).isoformat()}",
+            _usage_headline(usage),
+        ]
         if kickoff_error is not None:
             lines.append(f"WARNUNG: Der Crew-Lauf ist fehlgeschlagen: {kickoff_error}")
             lines.append("Nachfolgende Tasks haben moeglicherweise nicht mehr gelaufen.")
@@ -978,7 +1068,7 @@ def send_cycle_summary(kickoff_error: Exception = None, telegram_action_log: lis
             lines.append("Telegram-Kommandos diesen Zyklus verarbeitet:")
             lines.extend(f"- {entry}" for entry in telegram_action_log)
         lines += [
-            _usage_line(),
+            _usage_detail_line(usage),
             f"Offene Freigaben (approve.py / Telegram-Reply): {pending}",
         ]
         if _limit_hits:

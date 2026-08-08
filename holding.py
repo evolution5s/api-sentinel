@@ -447,6 +447,75 @@ def search_research_archive(query: str, subsidiary_id: str = "") -> str:
 
 
 # --------------------------------------------------------------------------
+# Subsidiary trajectory (revenue-focus addendum, point 1b) - a lightweight,
+# recurring view of a subsidiary's actual progress toward revenue,
+# independent of whatever is or isn't in the status-report/pivot-proposal
+# queues this cycle. Deliberately NOT a second escalation mechanism next to
+# check_escalation (which watches one hypothesis lineage's rolling score
+# right after an evaluation, from the Sub-CEO's side): this is a
+# subsidiary-wide count across every resolved hypothesis, read by the
+# Main-CEO every cycle regardless of what was escalated, and it files
+# nothing and persists no record of its own - the counts just inform the
+# Main-CEO's own cycle report.
+# --------------------------------------------------------------------------
+
+STALL_RESOLVED_THRESHOLD = 5
+
+
+@tool("assess_subsidiary_trajectory")
+def assess_subsidiary_trajectory(subsidiary_id: str) -> str:
+    """Deterministic view of whether a subsidiary's hypothesis history is
+    actually trending toward a revenue-generating outcome - counts of each
+    outcome (build/test_further/pivot/bury) across every hypothesis this
+    subsidiary has ever written, not just the ones flagged in a status
+    report or pivot proposal this cycle. Call this every cycle regardless
+    of whether anything else needs attention; it's cheap (reads one JSONL
+    file) and doesn't depend on the Sub-CEO having escalated anything.
+
+    possible_stall=true means at least STALL_RESOLVED_THRESHOLD hypotheses
+    have reached a resolved outcome (build/pivot/bury - test_further is a
+    continuation, not counted as resolved) and NONE of them was 'build' -
+    a real signal worth saying explicitly in your own report, even without
+    a formal Sub-CEO escalation. It is not itself an escalation trigger and
+    files nothing - weigh it in your own judgment alongside everything else
+    this cycle, same as any other read-only tool's output.
+    """
+    subs = _all_subsidiaries()
+    sub = next((s for s in subs if s.get("id") == subsidiary_id), None)
+    if sub is None:
+        return json.dumps({"error": f"no subsidiary with id '{subsidiary_id}'"})
+
+    state_dir_value = sub.get("state_dir")
+    if not state_dir_value:
+        return json.dumps({
+            "subsidiary_id": subsidiary_id, "outcome_counts": {}, "resolved_count": 0,
+            "possible_stall": False, "reason": "no state_dir on record yet - nothing to assess",
+        })
+
+    outcome_counts = {"build": 0, "test_further": 0, "pivot": 0, "bury": 0}
+    for h in read_jsonl(Path(state_dir_value), "hypotheses.jsonl"):
+        outcome = h.get("outcome")
+        if outcome in outcome_counts:
+            outcome_counts[outcome] += 1
+
+    resolved_count = outcome_counts["build"] + outcome_counts["pivot"] + outcome_counts["bury"]
+    build_count = outcome_counts["build"]
+    possible_stall = resolved_count >= STALL_RESOLVED_THRESHOLD and build_count == 0
+
+    return json.dumps({
+        "subsidiary_id": subsidiary_id,
+        "outcome_counts": outcome_counts,
+        "resolved_count": resolved_count,
+        "possible_stall": possible_stall,
+        "reason": (
+            f"{resolved_count} hypotheses resolved (build/pivot/bury), 0 reached 'build' yet"
+            if possible_stall else
+            f"{resolved_count} resolved so far, {build_count} reached 'build'"
+        ),
+    })
+
+
+# --------------------------------------------------------------------------
 # Structured handoff: Sub-CEO -> Main-CEO (status report). Generalizes the
 # pivot-proposal pattern to every cycle's report, not just fundamental-
 # strategy escalations - a fixed record instead of the Main-CEO having to

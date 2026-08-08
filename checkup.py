@@ -1750,6 +1750,57 @@ def test_search_research_archive_no_match():
     assert result["matches"] == []
 
 
+# --- holding.py: subsidiary trajectory (revenue-focus addendum, point 1b) --
+
+def test_assess_subsidiary_trajectory_unknown_subsidiary():
+    reset_state()
+    result = json.loads(holding.assess_subsidiary_trajectory.run(subsidiary_id="does-not-exist"))
+    assert "error" in result
+
+
+def _write_buried_hyp(i):
+    tools.write_hypothesis.run(hypothesis=json.dumps({
+        **SAMPLE_HYP, "id": f"hyp_bury_{i}", "landing_page_variant_id": f"lp_v{i}_bury",
+        "status": "buried", "outcome": "bury", "bury_reasoning": "weak signal",
+    }))
+
+
+def test_assess_subsidiary_trajectory_no_stall_below_threshold():
+    reset_state()
+    holding.read_subsidiaries.run()  # bootstraps api-sentinel with the real STATE_DIR
+    for i in range(holding.STALL_RESOLVED_THRESHOLD - 1):
+        _write_buried_hyp(i)
+    result = json.loads(holding.assess_subsidiary_trajectory.run(subsidiary_id="api-sentinel"))
+    assert result["resolved_count"] == holding.STALL_RESOLVED_THRESHOLD - 1
+    assert result["possible_stall"] is False
+
+
+def test_assess_subsidiary_trajectory_flags_possible_stall():
+    reset_state()
+    holding.read_subsidiaries.run()
+    for i in range(holding.STALL_RESOLVED_THRESHOLD):
+        _write_buried_hyp(i)
+    result = json.loads(holding.assess_subsidiary_trajectory.run(subsidiary_id="api-sentinel"))
+    assert result["resolved_count"] == holding.STALL_RESOLVED_THRESHOLD
+    assert result["outcome_counts"]["bury"] == holding.STALL_RESOLVED_THRESHOLD
+    assert result["outcome_counts"]["build"] == 0
+    assert result["possible_stall"] is True
+
+
+def test_assess_subsidiary_trajectory_no_stall_once_a_build_exists():
+    reset_state()
+    holding.read_subsidiaries.run()
+    for i in range(holding.STALL_RESOLVED_THRESHOLD):
+        _write_buried_hyp(i)
+    tools.write_hypothesis.run(hypothesis=json.dumps({
+        **SAMPLE_HYP, "id": "hyp_build_1", "landing_page_variant_id": "lp_v_build",
+        "status": "evaluated", "outcome": "build",
+    }))
+    result = json.loads(holding.assess_subsidiary_trajectory.run(subsidiary_id="api-sentinel"))
+    assert result["outcome_counts"]["build"] == 1
+    assert result["possible_stall"] is False
+
+
 # --- holding.py: status reports (Sub-CEO -> Main-CEO structured handoff) ----
 
 def test_file_status_report_needs_decision_requires_context():
@@ -1948,6 +1999,7 @@ def test_main_ceo_agent_tools_match_spec():
         "read_pivot_proposals", "decide_pivot_proposal",
         "read_cross_subsidiary_requests", "resolve_cross_subsidiary_request",
         "read_status_reports", "acknowledge_status_report", "set_strategic_direction",
+        "read_strategic_direction", "assess_subsidiary_trajectory",
         "search_research_archive", "request_approval",
         "read_subsidiary_policies", "update_subsidiary_policies",
     }, tool_names
@@ -2024,6 +2076,53 @@ def test_send_cycle_summary_never_raises_without_a_crew_run():
     try:
         crew.send_cycle_summary()  # no kickoff() happened; task.output is None on every task
     finally:
+        if had_token is not None:
+            os.environ["TELEGRAM_BOT_TOKEN"] = had_token
+
+
+def test_usage_headline_and_detail_split():
+    # _usage_line() used to fold "X tokens gesamt" mid-sentence into the
+    # agent-profile line - split into a standalone headline (checked here)
+    # plus the fuller detail line, per the token-total-upfront addendum.
+    fake_metrics = type("U", (), {
+        "total_tokens": 12345, "prompt_tokens": 10000, "completion_tokens": 2345,
+        "cached_prompt_tokens": 500, "cache_creation_tokens": 200, "successful_requests": 7,
+    })()
+    usage = {
+        "total_tokens": fake_metrics.total_tokens, "prompt_tokens": fake_metrics.prompt_tokens,
+        "cached_prompt_tokens": fake_metrics.cached_prompt_tokens,
+        "cache_creation_tokens": fake_metrics.cache_creation_tokens,
+        "completion_tokens": fake_metrics.completion_tokens,
+        "successful_requests": fake_metrics.successful_requests,
+    }
+    assert crew._usage_headline(usage) == "Gesamt-Tokens diesen Zyklus: 12345"
+    assert crew._usage_headline(None) == "Gesamt-Tokens diesen Zyklus: nicht verfuegbar"
+    detail = crew._usage_detail_line(usage)
+    assert "12345" not in detail.split(":")[0]  # not repeated as the line's own headline number
+    assert "10000 prompt" in detail and "2345 completion" in detail
+    assert crew._usage_detail_line(None) == "LLM-Nutzung: nicht verfuegbar"
+
+
+def test_usage_headline_is_first_line_in_cycle_summary():
+    reset_state()
+    had_token = os.environ.pop("TELEGRAM_BOT_TOKEN", None)
+    captured = []
+    original_send = crew.send_telegram_message
+    original_metrics = crew.crew.usage_metrics
+    try:
+        crew.send_telegram_message = lambda text: captured.append(text)
+        crew.crew.usage_metrics = type("U", (), {
+            "total_tokens": 999, "prompt_tokens": 900, "completion_tokens": 99,
+            "cached_prompt_tokens": 0, "cache_creation_tokens": 0, "successful_requests": 3,
+        })()
+        crew.send_cycle_summary()
+        assert captured, "expected send_telegram_message to be called"
+        lines = captured[0].split("\n")
+        assert lines[0].startswith("API Sentinel Zyklus - ")
+        assert lines[1] == "Gesamt-Tokens diesen Zyklus: 999"
+    finally:
+        crew.send_telegram_message = original_send
+        crew.crew.usage_metrics = original_metrics
         if had_token is not None:
             os.environ["TELEGRAM_BOT_TOKEN"] = had_token
 

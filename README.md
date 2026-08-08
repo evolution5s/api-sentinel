@@ -30,7 +30,7 @@
 ## 1. Überblick
 
 API Sentinel ist eine autonome, mehrstufige Simulation eines kleinen
-Software-Unternehmens (Holding mit einer Subsidiary), die alle 6 Stunden als
+Software-Unternehmens (Holding mit einer Subsidiary), die alle 3 Stunden als
 Cron-Job auf Railway läuft und dabei einen strikten
 **Build-Measure-Learn-Loop** (Lean Startup) auf Basis von vier
 [CrewAI](https://github.com/crewAIInc/crewAI)-Agenten durchläuft, die auf
@@ -74,7 +74,7 @@ Zentrale Design-Prinzipien, die sich durch den gesamten Code ziehen:
 ## 2. Ablauf eines Zyklus
 
 Ein Zyklus ist ein einzelner Aufruf von `python crew.py`, den Railway per
-Cron alle 6 Stunden auslöst (`railway.json`, `cronSchedule: "0 */6 * * *"`).
+Cron alle 3 Stunden auslöst (`railway.json`, `cronSchedule: "0 */3 * * *"`).
 Ablauf im Detail (siehe `crew.py`, Block `if __name__ == "__main__":`):
 
 1. **Telegram-Kommandos verarbeiten** (`process_telegram_commands()`) - läuft
@@ -197,9 +197,11 @@ funktioniert.
 einmal als `task_ceo` (Build-Measure-Learn, nach Growth).
 
 **Goal:** Fällige Hypothesen bewerten, Folge-Hypothesen formulieren und API
-Sentinel zu einem profitablen, bootstrapped Geschäft entwickeln - ohne
-jemals eine Zahl zu erfinden, die menschliche Freigabe-Queue zu umgehen oder
-allein eine fundamentale Strategieänderung zu entscheiden.
+Sentinel zu einem profitablen, **umsatzgenerierenden** bootstrapped Geschäft
+entwickeln - Bewegung hin zu echten zahlenden Kunden ist das eigentliche
+Fortschrittsmaß, nicht die Anzahl durchgeführter Experimente - ohne jemals
+eine Zahl zu erfinden, die menschliche Freigabe-Queue zu umgehen oder allein
+eine fundamentale Strategieänderung zu entscheiden.
 
 **Backstory (Kernpunkte):** Datengetriebener SaaS-Sub-CEO mit striktem
 Build-Measure-Learn-Loop für eine Subsidiary der Holding. Hat keinen Zugriff
@@ -238,7 +240,12 @@ bleibt, nicht nur die Erfolge. Rangiert konkurrierende Hypothesen-Ideen nach
 `impact_score`/`confidence_score` genauso wie Kanäle rangiert werden, da nur
 `MAX_ACTIVE_HYPOTHESES` gleichzeitig laufen können - sich über zu viele
 Hypothesen gleichzeitig zu verzetteln gilt als der häufigere Fehler als die
-falsche zu wählen.
+falsche zu wählen. Dieses Ranking steht selbst im Dienst des Umsatzes, nicht
+der Neuartigkeit: `impact_score` soll widerspiegeln, wie sehr eine Hypothese
+bei Erfolg tatsächlich Richtung zahlendes, profitables Geschäft bewegt -
+nicht, welches Experiment die interessantesten Daten liefern würde. Derselbe
+Maßstab gilt für Kanal-Wahl und Pivot-Richtung, wann immer echtes Ermessen
+im Spiel ist.
 
 **Tools:**
 | Tool | Zweck |
@@ -268,12 +275,16 @@ falsche zu wählen.
 **Rolle im Loop:** Führt `task_main_ceo_review` aus - Governance-Review nach
 Sub-CEO und Growth, vor Dev.
 
-**Goal:** Die Subsidiaries der Holding strategisch steuern: Pivot-Vorschläge,
-Cross-Subsidiary-Anfragen und Status-Reports der Sub-CEOs prüfen,
-strategische Ausrichtung setzen, wo tatsächlich gerechtfertigt, das
-Subsidiary-Register (inkl. Dormant-Lifecycle) pflegen, und bei allem mit
-echter Tragweite das Aufsichtsrat einbeziehen - nie allein Entscheidungen
-mit großer Wirkung treffen.
+**Goal:** Die Subsidiaries der Holding strategisch **Richtung profitables,
+umsatzgenerierendes Geschäft** steuern, nicht nur Richtung "mehr
+Experimente": Pivot-Vorschläge, Cross-Subsidiary-Anfragen und
+Status-Reports der Sub-CEOs prüfen, sicherstellen, dass jeder Subsidiary
+mindestens einmal gesagt wurde, dass Umsatz der Punkt der Übung ist, die
+Trajektorie jeder Subsidiary im Blick behalten, strategische Ausrichtung
+setzen, wo tatsächlich gerechtfertigt, das Subsidiary-Register (inkl.
+Dormant-Lifecycle) pflegen, und bei allem mit echter Tragweite das
+Aufsichtsrat einbeziehen - nie allein Entscheidungen mit großer Wirkung
+treffen.
 
 **Backstory (Kernpunkte):** Leitet die Holding über den einzelnen Sub-CEOs.
 Mit heute nur `api-sentinel` registriert haben die meisten Zyklen nichts zu
@@ -284,9 +295,27 @@ eine vollständige, gültige Antwort. Liest Sub-CEO-Status-Reports
 verlangen, z.B. jedes `build`-Outcome landet hier immer, bevor irgendjemand
 zu bauen beginnt - und quittiert sie nach Prüfung
 (`acknowledge_status_report`), damit sie nicht jeden Zyklus erneut
-auftauchen. Kann eine strategische Ausrichtung für einen Sub-CEO setzen
-(`set_strategic_direction`), wenn es einen echten Grund gibt - das ist die
-Ausnahme, keine Pflichtübung. Das Instanziieren einer neuen Subsidiary,
+auftauchen. Jede Subsidiary bekommt mindestens einmal eine
+umsatzgerahmte strategische Ausrichtung (`set_strategic_direction`) -
+geprüft über `read_strategic_direction`, nicht implizit vorausgesetzt -
+die klarstellt, dass der eigentliche Punkt ein tragfähiges,
+umsatzgenerierendes Geschäft ist, keine endlos laufende Experimentserie;
+das ist eine einmalige Baseline pro Subsidiary, keine taktische
+Mikrosteuerung. Darüber hinaus setzt es eine NEUE Ausrichtung nur, wenn es
+einen echten Grund dafür gibt - ein Marktwandel, ein Muster über mehrere
+Berichte hinweg, eine gerade getroffene Entscheidung - das bleibt die
+Ausnahme, keine Pflichtübung; es übersteuert nie das eigene taktische
+Ermessen des Sub-CEO, es ist der Rahmen, den der Sub-CEO liest und
+innerhalb dessen er arbeitet. Prüft außerdem jeden Zyklus
+`assess_subsidiary_trajectory`, unabhängig davon, ob etwas eskaliert
+wurde - eine Subsidiary kann unbegrenzt weiterlaufen, ohne dass je eine
+formale Eskalation feuert, während sie sichtbar nicht Richtung Umsatz
+bewegt (evaluierte Hypothesen häufen sich, aber keine erreicht je
+`build`); sagt das explizit im eigenen Bericht, wenn die Zahlen das nahelegen,
+ohne selbst einen neuen Eskalationsrecord anzulegen -
+`check_escalation` (die Rolling-Score-Prüfung des Sub-CEO pro
+Hypothesen-Linie) bleibt das Einzige, was tatsächlich einen formalen
+Pivot-Vorschlag auslöst. Das Instanziieren einer neuen Subsidiary,
 neuer Agenten oder neuer externer Tools läuft immer über
 `request_approval` an das Aufsichtsrat, ohne Ausnahme - `register_subsidiary`
 selbst erzwingt das, aber die gleiche Disziplin gilt für jede Entscheidung
@@ -302,7 +331,8 @@ freigegebenen `request_approval` - jede Subsidiary startet konservativ
 | `read_pivot_proposals` / `decide_pivot_proposal` | Pivot-Vorschläge der Sub-CEOs entscheiden |
 | `read_cross_subsidiary_requests` / `resolve_cross_subsidiary_request` | Cross-Subsidiary-Anfragen routen/entscheiden |
 | `read_status_reports` / `acknowledge_status_report` | Sub-CEO-Berichte prüfen/quittieren |
-| `set_strategic_direction` | Ausrichtung für einen Sub-CEO setzen |
+| `set_strategic_direction` / `read_strategic_direction` | Ausrichtung für einen Sub-CEO setzen/prüfen ob je eine gesetzt wurde |
+| `assess_subsidiary_trajectory` | Subsidiary-weite Outcome-Zählung - Trajektorie Richtung Umsatz, jeden Zyklus (siehe Kapitel 7) |
 | `search_research_archive` | Holdingsweites Wissen durchsuchen |
 | `request_approval` | Freigabe ans Aufsichtsrat beantragen |
 | `read_subsidiary_policies` / `update_subsidiary_policies` | Generelle Vorgaben einer Subsidiary lesen/ändern (approval-gated) |
@@ -654,6 +684,37 @@ Metadaten-Eintrag - keine echte Infrastruktur (neuer Railway-Service, eigene
 Crew/Agenten). Das bleibt separate, menschlich gesteuerte Ingenieursarbeit,
 nachdem eine `request_approval` freigegeben wurde.
 
+### 7.1 Umsatz-Fokus statt endloser Experimente
+
+Zwei Mechanismen sollen verhindern, dass eine Subsidiary unbegrenzt
+Hypothesen testet, ohne dass ihr eigentlicher Zweck (ein profitables
+Geschäft) je explizit gemacht oder ihr tatsächlicher Fortschritt dorthin
+je unabhängig betrachtet wird - beide laufen in `task_main_ceo_review`,
+jeden Zyklus, unabhängig davon, ob der Sub-CEO etwas eskaliert hat:
+
+- **Verpflichtende Erstausrichtung:** Für jede aktive Subsidiary prüft der
+  Main-CEO `read_strategic_direction(subsidiary_id=...)`. Kommt
+  `direction=null` zurück - diese Subsidiary hatte noch **nie** eine
+  strategische Ausrichtung -, setzt der Main-CEO proaktiv eine, umsatz-
+  gerahmt (z.B. "ein tragfähiges, umsatzgenerierendes Geschäftsmodell
+  erreichen, kein endloses Hypothesen-Testen"). Das ist eine einmalige
+  Baseline pro Subsidiary, keine taktische Vorgabe für Kanal-/
+  Hypothesen-Entscheidungen - die bleiben beim Sub-CEO. Jede spätere,
+  zusätzliche Ausrichtung bleibt die bestehende Ausnahme-Regel (Kapitel
+  3.4): nur bei einem echten Grund, nicht jeden Zyklus.
+- **Trajektorie-Check jeden Zyklus:** `assess_subsidiary_trajectory`
+  (Kapitel 5.8 ergänzend, aber holdingweit statt pro Hypothesen-Linie)
+  zählt deterministisch alle je aufgelösten Outcomes
+  (`build`/`pivot`/`bury`) einer Subsidiary. `possible_stall=true`, wenn
+  mindestens `STALL_RESOLVED_THRESHOLD` (5) Hypothesen aufgelöst wurden
+  und keine davon `build` war. Das ist bewusst **kein** zweiter
+  Eskalationsmechanismus neben `check_escalation` (das bleibt pro
+  Hypothesen-Linie das Einzige, was tatsächlich einen formalen
+  Pivot-Vorschlag auslöst, von der Sub-CEO-Seite aus) - dieses Tool
+  persistiert nichts und feuert nichts selbst aus; es liefert nur die
+  Zahlen, und der Main-CEO benennt einen möglichen Stillstand explizit im
+  eigenen Zyklus-Report, falls die Zahlen das nahelegen.
+
 ---
 
 ## 8. Mensch im Loop: Freigabe-Queue und Telegram-Fernsteuerung
@@ -793,13 +854,18 @@ und trägt einen Treffer in `_limit_hits` ein.
 
 ### 9.6 Token-Reporting
 
-`_usage_line()` liest `crew.usage_metrics` nach `kickoff()` und meldet:
-Gesamt-Tokens, Prompt-/Completion-Aufteilung, Prompt-Cache-Lese-/
-Schreib-Tokens, Anzahl erfolgreicher Requests, Prozent des
-Zyklus-Budgets, sowie `max_tokens` pro Agent. Wird zusätzlich per
-`log_cycle_usage` an `usage_history.jsonl` angehängt, damit Kostenanomalien
-(z.B. ungewöhnlich viele Requests durch wiederholte Retries) über die Zeit
-sichtbar werden, nicht nur einmalig gemeldet und vergessen.
+`_compute_cycle_usage()` liest `crew.usage_metrics` nach `kickoff()` einmal
+pro Zyklus und hängt es per `log_cycle_usage` an `usage_history.jsonl` an,
+damit Kostenanomalien (z.B. ungewöhnlich viele Requests durch wiederholte
+Retries) über die Zeit sichtbar werden, nicht nur einmalig gemeldet und
+vergessen. Der Telegram-Report ist in zwei Teile gesplittet:
+`_usage_headline()` steht als eigene, unmissverständliche Zeile
+(`Gesamt-Tokens diesen Zyklus: X`) direkt am Anfang des gesamten Reports,
+noch vor Warnungen und Telegram-Kommando-Logs - die eine Zahl, die auf
+einen Blick zählt. `_usage_detail_line()` folgt weiter unten mit dem Rest:
+Agent-Profil/Modell, Prompt-/Completion-Aufteilung, Prompt-Cache-Lese-/
+Schreib-Tokens, Anzahl erfolgreicher Requests, Prozent des Zyklus-Budgets,
+sowie `max_tokens` pro Agent.
 
 ---
 
@@ -850,8 +916,8 @@ CrewAI markiert automatisch Cache-Breakpoints
 `crew_agent_executor._setup_messages`) für Rolle/Goal/Backstory und
 Tool-Definitionen pro Agent, sobald der gemeinsame Präfix (Tools + System)
 das modellabhängige Minimum erreicht. Das funktioniert für dieses Setup
-bereits ohne jede Code-Änderung - im `_usage_line()`-Report sichtbar als
-`cached_prompt_tokens` (günstig, gelesen) vs. `cache_creation_tokens`
+bereits ohne jede Code-Änderung - in `_usage_detail_line()`s Report sichtbar
+als `cached_prompt_tokens` (günstig, gelesen) vs. `cache_creation_tokens`
 (teurer, einmalig pro Cache-Fenster geschrieben).
 
 ### 10.5 Model-Routing über die native Anthropic-Anbindung
@@ -961,15 +1027,18 @@ CMD ["python", "crew.py"]
 ```json
 {
   "build": { "builder": "DOCKERFILE", "dockerfilePath": "Dockerfile" },
-  "deploy": { "cronSchedule": "0 */6 * * *" }
+  "deploy": { "cronSchedule": "0 */3 * * *" }
 }
 ```
 
 Railway baut das Docker-Image bei jedem Push auf `main` neu und startet den
-Container gemäß Cron-Schedule (alle 6 Stunden, volle Stunde) - kein
+Container gemäß Cron-Schedule (alle 3 Stunden, volle Stunde) - kein
 Dauerbetrieb, kein Webserver, kein offener Port. Zwischen den Läufen
 existiert kein laufender Prozess; der gesamte Zustand liegt im persistenten
-`/data`-Volume (`STATE_DIR`).
+`/data`-Volume (`STATE_DIR`). Seit der Umstellung von 6 auf 3 Stunden läuft
+doppelt so oft ein Zyklus pro Tag - `CYCLE_TOKEN_BUDGET` (Kapitel 9.4) gilt
+pro Zyklus, nicht pro Tag, das Tagesbudget verdoppelt sich also implizit
+mit; kein zusätzliches Guardrail dafür eingebaut, nur zur Kenntnis.
 
 ### 12.2 Umgebungsvariablen in Railway setzen
 
@@ -1082,4 +1151,4 @@ eine Zusammenfassung; Exit-Code `0` nur wenn wirklich alles bestanden hat.
   defensiv geschrieben und würde bei geändertem crewai-Internal einfach
   übersprungen, aber nicht mehr nötig sein).
 - **Kein manuelles "jetzt sofort einen Zyklus auslösen"** über Railway
-  selbst (Kapitel 12.4) - nur der planmäßige 6h-Cron oder ein lokaler Testlauf.
+  selbst (Kapitel 12.4) - nur der planmäßige 3h-Cron oder ein lokaler Testlauf.

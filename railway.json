@@ -5,6 +5,6 @@
     "dockerfilePath": "Dockerfile"
   },
   "deploy": {
-    "cronSchedule": "0 */6 * * *"
+    "cronSchedule": "0 */3 * * *"
   }
 }
