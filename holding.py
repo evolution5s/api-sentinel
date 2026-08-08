@@ -448,15 +448,19 @@ def search_research_archive(query: str, subsidiary_id: str = "") -> str:
 
 # --------------------------------------------------------------------------
 # Subsidiary trajectory (revenue-focus addendum, point 1b) - a lightweight,
-# recurring view of a subsidiary's actual progress toward revenue,
-# independent of whatever is or isn't in the status-report/pivot-proposal
-# queues this cycle. Deliberately NOT a second escalation mechanism next to
-# check_escalation (which watches one hypothesis lineage's rolling score
-# right after an evaluation, from the Sub-CEO's side): this is a
-# subsidiary-wide count across every resolved hypothesis, read by the
-# Main-CEO every cycle regardless of what was escalated, and it files
-# nothing and persists no record of its own - the counts just inform the
-# Main-CEO's own cycle report.
+# recurring HEALTH CHECK on whether a subsidiary is actually making progress
+# (toward a validated 'build' or a clear kill) rather than spinning in
+# place, independent of whatever is or isn't in the status-report/pivot-
+# proposal queues this cycle. This is not a revenue tracker: a resolved
+# outcome landing on 'build' only means a hypothesis cleared its own
+# break-even bar, not that revenue is itself the thing being optimized for
+# - see ceo_agent's Goal/backstory (crew.py) for that framing. Deliberately
+# NOT a second escalation mechanism next to check_escalation (which watches
+# one hypothesis lineage's rolling score right after an evaluation, from
+# the Sub-CEO's side): this is a subsidiary-wide count across every
+# resolved hypothesis, read by the Main-CEO every cycle regardless of what
+# was escalated, and it files nothing and persists no record of its own -
+# the counts just inform the Main-CEO's own cycle report.
 # --------------------------------------------------------------------------
 
 STALL_RESOLVED_THRESHOLD = 5
@@ -464,21 +468,28 @@ STALL_RESOLVED_THRESHOLD = 5
 
 @tool("assess_subsidiary_trajectory")
 def assess_subsidiary_trajectory(subsidiary_id: str) -> str:
-    """Deterministic view of whether a subsidiary's hypothesis history is
-    actually trending toward a revenue-generating outcome - counts of each
-    outcome (build/test_further/pivot/bury) across every hypothesis this
-    subsidiary has ever written, not just the ones flagged in a status
-    report or pivot proposal this cycle. Call this every cycle regardless
-    of whether anything else needs attention; it's cheap (reads one JSONL
-    file) and doesn't depend on the Sub-CEO having escalated anything.
+    """Deterministic health check on whether a subsidiary is actually
+    making progress - counts of each outcome (build/test_further/pivot/
+    bury) across every hypothesis this subsidiary has ever written, not
+    just the ones flagged in a status report or pivot proposal this cycle.
+    Call this every cycle regardless of whether anything else needs
+    attention; it's cheap (reads one JSONL file) and doesn't depend on the
+    Sub-CEO having escalated anything.
 
     possible_stall=true means at least STALL_RESOLVED_THRESHOLD hypotheses
     have reached a resolved outcome (build/pivot/bury - test_further is a
     continuation, not counted as resolved) and NONE of them was 'build' -
     a real signal worth saying explicitly in your own report, even without
-    a formal Sub-CEO escalation. It is not itself an escalation trigger and
-    files nothing - weigh it in your own judgment alongside everything else
-    this cycle, same as any other read-only tool's output.
+    a formal Sub-CEO escalation. This only catches the "zero builds"
+    pattern mechanically; also look at the raw outcome_counts yourself for
+    the related pattern this can't compute alone - repeated inconclusive
+    pivot/test_further cycles covering the same ground without ever
+    reaching a real resolution is just as much a sign of spinning in place.
+    Not itself an escalation trigger and files nothing - weigh it in your
+    own judgment alongside everything else this cycle, same as any other
+    read-only tool's output, and never treat a 'build' outcome here as
+    proof of real progress on its own if the underlying hypothesis never
+    actually validated a genuine user problem.
     """
     subs = _all_subsidiaries()
     sub = next((s for s in subs if s.get("id") == subsidiary_id), None)

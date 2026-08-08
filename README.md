@@ -197,11 +197,12 @@ funktioniert.
 einmal als `task_ceo` (Build-Measure-Learn, nach Growth).
 
 **Goal:** Fällige Hypothesen bewerten, Folge-Hypothesen formulieren und API
-Sentinel zu einem profitablen, **umsatzgenerierenden** bootstrapped Geschäft
-entwickeln - Bewegung hin zu echten zahlenden Kunden ist das eigentliche
-Fortschrittsmaß, nicht die Anzahl durchgeführter Experimente - ohne jemals
-eine Zahl zu erfinden, die menschliche Freigabe-Queue zu umgehen oder allein
-eine fundamentale Strategieänderung zu entscheiden.
+Sentinel wachsen lassen, indem echte, lösenswerte Probleme für die
+Zielgruppe validiert werden - Monetarisierung (Break-even-Ökonomie,
+Defensibility, Pricing) ist ein verpflichtender Filter, den jede Hypothese
+erfüllen muss, nicht das, worauf hin optimiert wird - ohne jemals eine Zahl
+zu erfinden, die menschliche Freigabe-Queue zu umgehen oder allein eine
+fundamentale Strategieänderung zu entscheiden.
 
 **Backstory (Kernpunkte):** Datengetriebener SaaS-Sub-CEO mit striktem
 Build-Measure-Learn-Loop für eine Subsidiary der Holding. Hat keinen Zugriff
@@ -240,11 +241,16 @@ bleibt, nicht nur die Erfolge. Rangiert konkurrierende Hypothesen-Ideen nach
 `impact_score`/`confidence_score` genauso wie Kanäle rangiert werden, da nur
 `MAX_ACTIVE_HYPOTHESES` gleichzeitig laufen können - sich über zu viele
 Hypothesen gleichzeitig zu verzetteln gilt als der häufigere Fehler als die
-falsche zu wählen. Dieses Ranking steht selbst im Dienst des Umsatzes, nicht
-der Neuartigkeit: `impact_score` soll widerspiegeln, wie sehr eine Hypothese
-bei Erfolg tatsächlich Richtung zahlendes, profitables Geschäft bewegt -
-nicht, welches Experiment die interessantesten Daten liefern würde. Derselbe
-Maßstab gilt für Kanal-Wahl und Pivot-Richtung, wann immer echtes Ermessen
+falsche zu wählen. Dieses Ranking steht im Dienst der Validierung eines
+echten Problems, nicht der direkten Umsatzjagd: `impact_score` soll
+widerspiegeln, wie überzeugend eine Hypothese ein echtes Nutzerproblem
+validieren - oder eindeutig widerlegen - würde, nicht wie leicht sie sich
+monetarisieren ließe oder welches Experiment die interessantesten Daten
+liefern würde. Die ökonomischen Felder (`break_even_users`,
+`defensibility_notes`, `pricing_tier_reasoning`) bleiben der verpflichtende
+Filter, den jede Hypothese erfüllen muss, egal wie vielversprechend das
+Value-Signal aussieht - sie sind das Tor, nicht das Ranking-Kriterium
+selbst. Derselbe Maßstab gilt für Kanal-Wahl und Pivot-Richtung, wann immer echtes Ermessen
 im Spiel ist.
 
 **Tools:**
@@ -275,14 +281,16 @@ im Spiel ist.
 **Rolle im Loop:** Führt `task_main_ceo_review` aus - Governance-Review nach
 Sub-CEO und Growth, vor Dev.
 
-**Goal:** Die Subsidiaries der Holding strategisch **Richtung profitables,
-umsatzgenerierendes Geschäft** steuern, nicht nur Richtung "mehr
-Experimente": Pivot-Vorschläge, Cross-Subsidiary-Anfragen und
+**Goal:** Die Subsidiaries der Holding strategisch **Richtung Validierung
+echter, lösenswerter Probleme** für ihre Zielgruppen steuern - nicht
+Richtung endloser Experimente, aber auch nicht Richtung Umsatzjagd als
+Selbstzweck: Pivot-Vorschläge, Cross-Subsidiary-Anfragen und
 Status-Reports der Sub-CEOs prüfen, sicherstellen, dass jeder Subsidiary
-mindestens einmal gesagt wurde, dass Umsatz der Punkt der Übung ist, die
-Trajektorie jeder Subsidiary im Blick behalten, strategische Ausrichtung
-setzen, wo tatsächlich gerechtfertigt, das Subsidiary-Register (inkl.
-Dormant-Lifecycle) pflegen, und bei allem mit echter Tragweite das
+mindestens einmal gesagt wurde, dass der Punkt ein wirklich nützliches,
+monetarisierbares Produkt ist, im Blick behalten, ob jede Subsidiary
+tatsächlich Fortschritt macht - statt sich im Kreis zu drehen -, strategische
+Ausrichtung setzen, wo tatsächlich gerechtfertigt, das Subsidiary-Register
+(inkl. Dormant-Lifecycle) pflegen, und bei allem mit echter Tragweite das
 Aufsichtsrat einbeziehen - nie allein Entscheidungen mit großer Wirkung
 treffen.
 
@@ -295,26 +303,33 @@ eine vollständige, gültige Antwort. Liest Sub-CEO-Status-Reports
 verlangen, z.B. jedes `build`-Outcome landet hier immer, bevor irgendjemand
 zu bauen beginnt - und quittiert sie nach Prüfung
 (`acknowledge_status_report`), damit sie nicht jeden Zyklus erneut
-auftauchen. Jede Subsidiary bekommt mindestens einmal eine
-umsatzgerahmte strategische Ausrichtung (`set_strategic_direction`) -
-geprüft über `read_strategic_direction`, nicht implizit vorausgesetzt -
-die klarstellt, dass der eigentliche Punkt ein tragfähiges,
-umsatzgenerierendes Geschäft ist, keine endlos laufende Experimentserie;
-das ist eine einmalige Baseline pro Subsidiary, keine taktische
-Mikrosteuerung. Darüber hinaus setzt es eine NEUE Ausrichtung nur, wenn es
-einen echten Grund dafür gibt - ein Marktwandel, ein Muster über mehrere
-Berichte hinweg, eine gerade getroffene Entscheidung - das bleibt die
-Ausnahme, keine Pflichtübung; es übersteuert nie das eigene taktische
+auftauchen. Jede Subsidiary bekommt mindestens einmal eine strategische
+Ausrichtung (`set_strategic_direction`) - geprüft über
+`read_strategic_direction`, nicht implizit vorausgesetzt - die klarstellt,
+dass der eigentliche Punkt das Lösen eines echten Problems für echte
+Nutzer ist, mit Monetarisierung als verpflichtendem, nicht verhandelbarem
+Filter, den jede Hypothese erfüllen muss (die bestehende Break-even-/
+Defensibility-/Pricing-Ökonomie) - nicht als das, was um seiner selbst
+willen verfolgt wird; das ist eine einmalige Baseline pro Subsidiary, keine
+taktische Mikrosteuerung. Darüber hinaus setzt es eine NEUE Ausrichtung nur,
+wenn es einen echten Grund dafür gibt - ein Marktwandel, ein Muster über
+mehrere Berichte hinweg, eine gerade getroffene Entscheidung - das bleibt
+die Ausnahme, keine Pflichtübung; es übersteuert nie das eigene taktische
 Ermessen des Sub-CEO, es ist der Rahmen, den der Sub-CEO liest und
 innerhalb dessen er arbeitet. Prüft außerdem jeden Zyklus
-`assess_subsidiary_trajectory`, unabhängig davon, ob etwas eskaliert
-wurde - eine Subsidiary kann unbegrenzt weiterlaufen, ohne dass je eine
-formale Eskalation feuert, während sie sichtbar nicht Richtung Umsatz
-bewegt (evaluierte Hypothesen häufen sich, aber keine erreicht je
-`build`); sagt das explizit im eigenen Bericht, wenn die Zahlen das nahelegen,
-ohne selbst einen neuen Eskalationsrecord anzulegen -
-`check_escalation` (die Rolling-Score-Prüfung des Sub-CEO pro
-Hypothesen-Linie) bleibt das Einzige, was tatsächlich einen formalen
+`assess_subsidiary_trajectory` als Gesundheits-Check auf echten Fortschritt
+- keinen zweiten Umsatz-Tracker -, unabhängig davon, ob etwas eskaliert
+wurde: eine Subsidiary kann unbegrenzt weiterlaufen, ohne dass je eine
+formale Eskalation feuert, während sie sich tatsächlich nur im Kreis dreht
+(evaluierte Hypothesen häufen sich, ohne je eine Auflösung Richtung
+validiertem `build` oder klarem Kill zu erreichen, oder dieselbe Frage wird
+über wiederholte ergebnislose Pivots/Test-further-Verlängerungen immer
+wieder neu gestellt); sagt das explizit im eigenen Bericht, wenn das Muster
+das nahelegt, ohne selbst einen neuen Eskalationsrecord anzulegen und ohne
+eine auf dem Papier umsatzpositiv wirkende Hypothese als Beleg für echten
+Fortschritt zu werten, wenn das zugrunde liegende Problem nie wirklich
+validiert wurde - `check_escalation` (die Rolling-Score-Prüfung des Sub-CEO
+pro Hypothesen-Linie) bleibt das Einzige, was tatsächlich einen formalen
 Pivot-Vorschlag auslöst. Das Instanziieren einer neuen Subsidiary,
 neuer Agenten oder neuer externer Tools läuft immer über
 `request_approval` an das Aufsichtsrat, ohne Ausnahme - `register_subsidiary`
@@ -332,7 +347,7 @@ freigegebenen `request_approval` - jede Subsidiary startet konservativ
 | `read_cross_subsidiary_requests` / `resolve_cross_subsidiary_request` | Cross-Subsidiary-Anfragen routen/entscheiden |
 | `read_status_reports` / `acknowledge_status_report` | Sub-CEO-Berichte prüfen/quittieren |
 | `set_strategic_direction` / `read_strategic_direction` | Ausrichtung für einen Sub-CEO setzen/prüfen ob je eine gesetzt wurde |
-| `assess_subsidiary_trajectory` | Subsidiary-weite Outcome-Zählung - Trajektorie Richtung Umsatz, jeden Zyklus (siehe Kapitel 7) |
+| `assess_subsidiary_trajectory` | Subsidiary-weite Outcome-Zählung - Gesundheits-Check auf echten Fortschritt, jeden Zyklus (siehe Kapitel 7) |
 | `search_research_archive` | Holdingsweites Wissen durchsuchen |
 | `request_approval` | Freigabe ans Aufsichtsrat beantragen |
 | `read_subsidiary_policies` / `update_subsidiary_policies` | Generelle Vorgaben einer Subsidiary lesen/ändern (approval-gated) |
@@ -684,36 +699,54 @@ Metadaten-Eintrag - keine echte Infrastruktur (neuer Railway-Service, eigene
 Crew/Agenten). Das bleibt separate, menschlich gesteuerte Ingenieursarbeit,
 nachdem eine `request_approval` freigegeben wurde.
 
-### 7.1 Umsatz-Fokus statt endloser Experimente
+### 7.1 Fortschritt statt endloser Experimente - Umsatz als Filter, nicht als Ziel
 
 Zwei Mechanismen sollen verhindern, dass eine Subsidiary unbegrenzt
-Hypothesen testet, ohne dass ihr eigentlicher Zweck (ein profitables
-Geschäft) je explizit gemacht oder ihr tatsächlicher Fortschritt dorthin
-je unabhängig betrachtet wird - beide laufen in `task_main_ceo_review`,
-jeden Zyklus, unabhängig davon, ob der Sub-CEO etwas eskaliert hat:
+Hypothesen testet, ohne dass ihr eigentlicher Zweck (ein echtes Problem für
+echte Nutzer lösen) je explizit gemacht oder ihr tatsächlicher Fortschritt
+dorthin je unabhängig betrachtet wird - beide laufen in
+`task_main_ceo_review`, jeden Zyklus, unabhängig davon, ob der Sub-CEO
+etwas eskaliert hat. Wichtig dabei: Umsatz ist bewusst **kein**
+Optimierungsziel, sondern ein verpflichtender Filter, den jede Hypothese
+ohnehin schon erfüllen muss (Break-even-Ökonomie, Defensibility, Pricing -
+mechanisch enforced, siehe Kapitel 5.1) - direkt auf Umsatz zu optimieren
+würde Hypothesen belohnen, die sich leicht monetarisieren lassen (aggressive
+Preise, aufdringliche Texte), statt solcher, die ein echtes Problem lösen -
+genau das Fehlermuster, das das restliche Systemdesign (organisch-only,
+menschlich klingender Content, 90/10-Regel, `hypothesis_type=value`)
+vermeiden soll:
 
 - **Verpflichtende Erstausrichtung:** Für jede aktive Subsidiary prüft der
   Main-CEO `read_strategic_direction(subsidiary_id=...)`. Kommt
   `direction=null` zurück - diese Subsidiary hatte noch **nie** eine
-  strategische Ausrichtung -, setzt der Main-CEO proaktiv eine, umsatz-
-  gerahmt (z.B. "ein tragfähiges, umsatzgenerierendes Geschäftsmodell
-  erreichen, kein endloses Hypothesen-Testen"). Das ist eine einmalige
-  Baseline pro Subsidiary, keine taktische Vorgabe für Kanal-/
-  Hypothesen-Entscheidungen - die bleiben beim Sub-CEO. Jede spätere,
-  zusätzliche Ausrichtung bleibt die bestehende Ausnahme-Regel (Kapitel
-  3.4): nur bei einem echten Grund, nicht jeden Zyklus.
-- **Trajektorie-Check jeden Zyklus:** `assess_subsidiary_trajectory`
-  (Kapitel 5.8 ergänzend, aber holdingweit statt pro Hypothesen-Linie)
-  zählt deterministisch alle je aufgelösten Outcomes
-  (`build`/`pivot`/`bury`) einer Subsidiary. `possible_stall=true`, wenn
-  mindestens `STALL_RESOLVED_THRESHOLD` (5) Hypothesen aufgelöst wurden
-  und keine davon `build` war. Das ist bewusst **kein** zweiter
-  Eskalationsmechanismus neben `check_escalation` (das bleibt pro
+  strategische Ausrichtung -, setzt der Main-CEO proaktiv eine. Voran steht
+  das Lösen eines echten Problems für die Zielgruppe; Monetarisierung wird
+  als verpflichtender, nicht verhandelbarer Filter benannt (die bestehende
+  Break-even-/Defensibility-/Pricing-Ökonomie), den jede Hypothese erfüllen
+  muss - nicht als das eigentliche Ziel. Das ist eine einmalige Baseline
+  pro Subsidiary, keine taktische Vorgabe für Kanal-/Hypothesen-
+  Entscheidungen - die bleiben beim Sub-CEO. Jede spätere, zusätzliche
+  Ausrichtung bleibt die bestehende Ausnahme-Regel (Kapitel 3.4): nur bei
+  einem echten Grund, nicht jeden Zyklus.
+- **Trajektorie-Check jeden Zyklus (Gesundheits-Check, kein
+  Umsatz-Tracker):** `assess_subsidiary_trajectory` (Kapitel 5.8
+  ergänzend, aber holdingweit statt pro Hypothesen-Linie) zählt
+  deterministisch alle je aufgelösten Outcomes (`build`/`pivot`/`bury`)
+  einer Subsidiary. `possible_stall=true`, wenn mindestens
+  `STALL_RESOLVED_THRESHOLD` (5) Hypothesen aufgelöst wurden und keine
+  davon `build` war - das ist die mechanisch erfassbare Teilmenge; ebenso
+  ein Stillstands-Signal, nur nicht mechanisch erfasst, sind wiederholte
+  ergebnislose Pivot-/Test-further-Zyklen, die dieselbe Frage immer wieder
+  neu stellen, ohne je zu einer echten Auflösung zu kommen - der Main-CEO
+  liest dafür selbst die Hypothesen-Historie mit. Das ist bewusst **kein**
+  zweiter Eskalationsmechanismus neben `check_escalation` (das bleibt pro
   Hypothesen-Linie das Einzige, was tatsächlich einen formalen
   Pivot-Vorschlag auslöst, von der Sub-CEO-Seite aus) - dieses Tool
   persistiert nichts und feuert nichts selbst aus; es liefert nur die
   Zahlen, und der Main-CEO benennt einen möglichen Stillstand explizit im
-  eigenen Zyklus-Report, falls die Zahlen das nahelegen.
+  eigenen Zyklus-Report, falls das Muster das nahelegt - ohne eine auf dem
+  Papier umsatzpositive Hypothese automatisch als echten Fortschritt zu
+  werten, wenn das zugrunde liegende Problem nie wirklich validiert wurde.
 
 ---
 
