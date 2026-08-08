@@ -7,8 +7,14 @@ research archive), which reuses STATE_DIR's approval_queue.jsonl as the one
 human approval queue rather than adding a second one.
 
 Everything under STATE_DIR is plain JSONL so it stays human-readable and
-diffable. STATE_DIR defaults to /data (the Railway volume mount point) but
-can be overridden for local runs and tests.
+diffable. STATE_DIR defaults to /data - on Railway this is only durable
+across cron ticks if an actual Railway Volume is attached and mounted
+there (confirmed live via `railway volume list`: a "data" volume, status
+"Ready", mounted at /data - not something to assume from this default
+alone, since a plain, volume-less path at the same location would look
+identical from inside the container until the next redeploy wipes it).
+Locally/in tests, STATE_DIR is just an ordinary directory, no volume
+involved - override via the STATE_DIR env var.
 """
 import base64
 import json
@@ -868,6 +874,10 @@ def write_channel(channel: str, reason: str = "") -> str:
       (e.g. "reddit averaging -0.4 over 3 evaluated hypotheses, swapping in
       content_marketing") so swaps stay auditable, same as any other
       decision that changes direction.
+    - creating a channel whose name (case/whitespace-insensitive) already
+      matches an existing roster entry is rejected, even under a different
+      id - update the existing id instead of writing a near-duplicate.
+      read_channels() first if unsure whether something's already there.
     """
     try:
         patch = json.loads(channel)
@@ -897,6 +907,18 @@ def write_channel(channel: str, reason: str = "") -> str:
         missing = REQUIRED_CHANNEL_FIELDS - patch.keys()
         if missing:
             return json.dumps({"error": f"new channel missing required fields: {sorted(missing)}"})
+        name_norm = patch["name"].strip().casefold()
+        name_match = next(
+            (c for c in channels if (c.get("name") or "").strip().casefold() == name_norm), None,
+        )
+        if name_match is not None:
+            return json.dumps({
+                "error": f"a channel named '{patch['name']}' already exists as id "
+                         f"'{name_match.get('id')}' (status={name_match.get('status')}) - call "
+                         f"read_channels() and update that id instead of creating a near-duplicate "
+                         "under a new one; if you already wrote this channel earlier in this same "
+                         "run, this is that same call landing twice, not a new channel"
+            })
         old_status = None
         record = {
             "created_at": now,
@@ -1422,13 +1444,20 @@ def get_account_stats(platform: str) -> str:
 TELEGRAM_MAX_MESSAGE_LENGTH = 4096
 
 
-def send_telegram_message(text: str) -> None:
-    """Send a plain-text message via a Telegram bot to a fixed chat, split
-    across multiple messages if it exceeds Telegram's 4096-char limit.
-    Needs TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID in the environment; prints
-    a clear warning and returns quietly if either is missing or the send
+def send_telegram_message(text: str, parse_mode: str = None) -> None:
+    """Send a message via a Telegram bot to a fixed chat, split across
+    multiple messages if it exceeds Telegram's 4096-char limit. Needs
+    TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID in the environment; prints a
+    clear warning and returns quietly if either is missing or the send
     fails - a missing/failed notification must never crash the crew run
     that already completed successfully.
+
+    parse_mode (e.g. "Markdown") enables formatting (used for the fixed-
+    width token/cost table, see crew.py's _format_usage_table). If a
+    formatted send is ever rejected by Telegram (e.g. a parse error),
+    automatically retries that same chunk once as plain text instead of
+    losing the message - formatting must degrade gracefully, never cost
+    the report itself.
     """
     token = os.getenv("TELEGRAM_BOT_TOKEN")
     chat_id = os.getenv("TELEGRAM_CHAT_ID")
@@ -1438,16 +1467,88 @@ def send_telegram_message(text: str) -> None:
 
     for i in range(0, len(text), TELEGRAM_MAX_MESSAGE_LENGTH):
         chunk = text[i:i + TELEGRAM_MAX_MESSAGE_LENGTH]
+        payload = {"chat_id": chat_id, "text": chunk}
+        if parse_mode:
+            payload["parse_mode"] = parse_mode
         try:
             resp = requests.post(
                 f"https://api.telegram.org/bot{token}/sendMessage",
-                json={"chat_id": chat_id, "text": chunk},
+                json=payload,
                 timeout=15,
             )
             resp.raise_for_status()
         except requests.RequestException as exc:
+            if parse_mode:
+                print(f"[telegram] formatted send failed ({exc}), retrying this chunk as plain text")
+                try:
+                    resp = requests.post(
+                        f"https://api.telegram.org/bot{token}/sendMessage",
+                        json={"chat_id": chat_id, "text": chunk},
+                        timeout=15,
+                    )
+                    resp.raise_for_status()
+                    continue
+                except requests.RequestException as retry_exc:
+                    print(f"[telegram] plain-text retry also failed: {retry_exc}")
+                    return
             print(f"[telegram] failed to send cycle summary: {exc}")
             return
+
+
+# --------------------------------------------------------------------------
+# State-persistence check (orchestration-level, not an agent tool - called
+# once at the very start of every cycle, before anything else, so a warning
+# can reach Telegram even if the rest of the cycle then fails). Root cause
+# this exists for: STATE_DIR defaulting to /data looks identical whether or
+# not a real Railway Volume is actually mounted there - the only way this
+# repo found out no volume existed for a long stretch of its history was by
+# manually diffing Railway logs across deploys. This makes that check
+# automatic instead of something a human has to remember to do by hand.
+# --------------------------------------------------------------------------
+
+def check_state_persistence() -> dict:
+    """Deterministic check for whether STATE_DIR is genuinely backed by a
+    mounted Railway Volume, using RAILWAY_VOLUME_MOUNT_PATH - a real,
+    Railway-documented runtime env var populated "if any" volume is
+    attached (https://docs.railway.com/variables/reference), not a guess.
+    Never raises.
+
+    Outside Railway (no RAILWAY_ENVIRONMENT_ID set - local runs, tests)
+    this check isn't applicable at all: returns applicable=False,
+    persistent=True, warning=None, since there's no volume concept to
+    check outside Railway and a false warning there would just be noise.
+
+    Inside Railway: persistent=True only if RAILWAY_VOLUME_MOUNT_PATH is
+    set AND resolves to the same path as STATE_DIR. Otherwise
+    persistent=False with a concrete warning string - state will not
+    survive the next redeploy (a new deployment is a fresh container image
+    with no continuity from the previous one's writable layer; only an
+    actually-mounted volume survives that, per this repo's own confirmed
+    incident - see README chapter 15).
+    """
+    if not os.getenv("RAILWAY_ENVIRONMENT_ID"):
+        return {"applicable": False, "persistent": True, "warning": None}
+
+    volume_mount_path = os.getenv("RAILWAY_VOLUME_MOUNT_PATH")
+    volume_name = os.getenv("RAILWAY_VOLUME_NAME")
+
+    if volume_mount_path and Path(volume_mount_path) == STATE_DIR:
+        return {
+            "applicable": True, "persistent": True, "warning": None,
+            "volume_name": volume_name, "volume_mount_path": volume_mount_path,
+        }
+
+    return {
+        "applicable": True, "persistent": False,
+        "warning": (
+            f"STATE_DIR ({STATE_DIR}) does not match a mounted Railway Volume "
+            f"(RAILWAY_VOLUME_MOUNT_PATH={volume_mount_path!r}) - all state "
+            "will be lost on the next redeploy. Attach a Railway Volume "
+            f"mounted at {STATE_DIR}, or fix STATE_DIR to match the one "
+            "that's actually mounted."
+        ),
+        "volume_name": volume_name, "volume_mount_path": volume_mount_path,
+    }
 
 
 # --------------------------------------------------------------------------

@@ -30,7 +30,7 @@
 ## 1. Überblick
 
 API Sentinel ist eine autonome, mehrstufige Simulation eines kleinen
-Software-Unternehmens (Holding mit einer Subsidiary), die alle 3 Stunden als
+Software-Unternehmens (Holding mit einer Subsidiary), die alle 2 Stunden als
 Cron-Job auf Railway läuft und dabei einen strikten
 **Build-Measure-Learn-Loop** (Lean Startup) auf Basis von vier
 [CrewAI](https://github.com/crewAIInc/crewAI)-Agenten durchläuft, die auf
@@ -74,17 +74,21 @@ Zentrale Design-Prinzipien, die sich durch den gesamten Code ziehen:
 ## 2. Ablauf eines Zyklus
 
 Ein Zyklus ist ein einzelner Aufruf von `python crew.py`, den Railway per
-Cron alle 3 Stunden auslöst (`railway.json`, `cronSchedule: "0 */3 * * *"`).
+Cron alle 2 Stunden auslöst (`railway.json`, `cronSchedule: "0 */2 * * *"`).
 Ablauf im Detail (siehe `crew.py`, Block `if __name__ == "__main__":`):
 
-1. **Telegram-Kommandos verarbeiten** (`process_telegram_commands()`) - läuft
-   *immer zuerst*, auch wenn das System pausiert ist, damit ein "start"
+1. **Persistenz-Check** (`check_state_persistence()`) - läuft als
+   allererstes, noch vor allem anderen, damit eine Warnung auch dann noch
+   nach Telegram gelangt, wenn der Rest des Zyklus danach fehlschlägt.
+   Siehe Kapitel 9.7.
+2. **Telegram-Kommandos verarbeiten** (`process_telegram_commands()`) - läuft
+   als nächstes, auch wenn das System pausiert ist, damit ein "start"
    überhaupt gesehen werden kann. Siehe Kapitel 8.
-2. **Pause-Check** (`is_system_paused()`) - ist das System per Telegram
+3. **Pause-Check** (`is_system_paused()`) - ist das System per Telegram
    `stop` pausiert, wird der komplette restliche Zyklus übersprungen und
    eine entsprechende Telegram-Nachricht verschickt. Kein `crew.kickoff()`,
    keine Kosten.
-3. **`crew.kickoff()`** - führt die fünf Tasks sequenziell aus (siehe
+4. **`crew.kickoff()`** - führt die fünf Tasks sequenziell aus (siehe
    Kapitel 10, Prozess-Modell):
    1. `task_channel_strategy` (Sub-CEO) - immer, nicht überspringbar.
    2. `task_growth` (Growth) - übersprungen, falls das Zyklus-Token-Budget
@@ -92,12 +96,14 @@ Ablauf im Detail (siehe `crew.py`, Block `if __name__ == "__main__":`):
    3. `task_ceo` (Sub-CEO, Build-Measure-Learn) - ebenso conditional.
    4. `task_main_ceo_review` (Main-CEO) - ebenso conditional.
    5. `task_dev` (Dev) - ebenso conditional.
-4. **`send_cycle_summary()`** - läuft in jedem Fall, auch wenn
+5. **`send_cycle_summary()`** - läuft in jedem Fall, auch wenn
    `crew.kickoff()` eine Exception geworfen hat (dann wird der Fehler explizit
    in der Telegram-Nachricht gemeldet statt verschluckt). Postet eine
-   Zusammenfassung nach Telegram (Task-Outputs, Token-Nutzung,
-   Sicherheitslimits, offene Freigaben) und speichert eine gekürzte Version
-   als Kontinuitätsnotiz für den nächsten Zyklus (`last_cycle_note.txt`).
+   Zusammenfassung nach Telegram (Token-/Kosten-Kopfzeile, Task-Outputs,
+   Sicherheitslimits, Persistenz-/Malformed-Tool-Call-Hinweise, offene
+   Freigaben) plus eine separate formatierte Token-/Kosten-Tabelle (Kapitel
+   9.6), und speichert eine gekürzte Version als Kontinuitätsnotiz für den
+   nächsten Zyklus (`last_cycle_note.txt`).
 
 Wichtig: `crew.kickoff()` selbst wird in `checkup.py` **nie** aufgerufen -
 der Testsuite würde damit echte Anthropic-API-Kosten verursachen. Tests
@@ -111,7 +117,13 @@ rufen jedes Tool einzeln über sein `.run(...)`-Interface auf.
 > laufen sequenziell (`Process.sequential`) in genau der Reihenfolge, in der
 > ihre Tasks unten aufgeführt sind. Jeder Agent bekommt sein LLM, seine
 > Limits (`max_iter`, `max_execution_time`) aus `agent_profile.json` (siehe
-> Kapitel 9) sowie fest codiert `max_rpm=20` und `max_retry_limit=1`.
+> Kapitel 9) sowie fest codiert `max_rpm=20` und `max_retry_limit=1`. Alle
+> vier tragen außerdem denselben Effizienz-Grundsatz wörtlich in ihrer
+> Backstory: Tokens/Iterationen sind ein echter, gemessener Kostenfaktor,
+> kein freies Gut - korrekt in so wenigen Tool-Aufrufen wie tatsächlich
+> nötig fertig zu werden ist das eigentliche Ziel, die Caps (`max_iter`
+> etc.) sind eine harte Obergrenze gegen außer Kontrolle geratene Kosten,
+> kein Zielwert, den es auszuschöpfen gilt.
 
 ### 3.1 Growth Engine / Dev Relations (`growth_agent`)
 
@@ -606,6 +618,15 @@ Ein bezahlter Kanal (`is_paid=true`) braucht **beides**: die Policy
 `spend`-Anfrage - `write_channel` erzwingt beide Gates in dieser
 Reihenfolge.
 
+**Namens-Duplikat-Schutz:** Ein neuer Kanal, dessen Name (Groß-/
+Kleinschreibung und Leerzeichen egal) bereits in der Roster existiert, wird
+abgelehnt - auch unter einer anderen id. Reaktion auf einen diagnostizierten
+101k-Token-Zyklus, in dem derselbe Kanal mehrfach unter verschiedenen
+Bedingungen erneut geschrieben wurde, statt via `read_channels()` zu
+erkennen, dass er schon da war (Kapitel 15) - `write_channel` verweist bei
+einem Namenstreffer explizit auf die existierende id, statt eine
+Beinahe-Dopplung anzulegen.
+
 ### 6.2 Reichweitenmessung (`read_channel_metrics`)
 
 Growth misst reale Reichweite, nie geraten:
@@ -885,20 +906,92 @@ wiederholt an sein Limit stoßender Agent also nie auffallen.
 Task-Abschluss) prüft `agent.agent_executor.iterations >= agent.max_iter`
 und trägt einen Treffer in `_limit_hits` ein.
 
-### 9.6 Token-Reporting
+### 9.6 Token-Reporting, Kosten und Formatierung
 
 `_compute_cycle_usage()` liest `crew.usage_metrics` nach `kickoff()` einmal
-pro Zyklus und hängt es per `log_cycle_usage` an `usage_history.jsonl` an,
-damit Kostenanomalien (z.B. ungewöhnlich viele Requests durch wiederholte
-Retries) über die Zeit sichtbar werden, nicht nur einmalig gemeldet und
-vergessen. Der Telegram-Report ist in zwei Teile gesplittet:
+pro Zyklus, berechnet die Kosten (siehe unten) und hängt beides per
+`log_cycle_usage` an `usage_history.jsonl` an, damit Kosten-/Token-Trends
+über die Zeit sichtbar werden, nicht nur einmalig gemeldet und vergessen.
+
+**Kostenberechnung (`pricing.py`):** reine, testbare Funktionen im Stil von
+`scoring.py`, ohne CrewAI-/STATE_DIR-Abhängigkeit. `get_pricing(model,
+as_of)` schlägt die USD-pro-Million-Tokens-Sätze für `claude-haiku-4-5`
+bzw. `claude-sonnet-5` nach - datumsbewusst, da Sonnet 5 am 2026-09-01 einen
+bestätigten Preissprung hat; `as_of` ist immer das Datum des jeweiligen
+Zyklus, nicht das Datum, an dem der Code geschrieben wurde, damit der
+Report auf beiden Seiten des Stichtags automatisch korrekt bleibt.
+`compute_cycle_cost(...)` multipliziert die vier bereits getrennt
+vorliegenden Token-Kategorien (Base-Input, Cache-Write, Cache-Hit/Read,
+Completion - laut Anthropics API nie überlappend) mit den passenden Sätzen
+und summiert. Der Cache-Write-Tarif ist bewusst der 5-Minuten-Satz, nicht
+der 1-Stunden-Satz - verifiziert direkt im installierten crewai-Paket
+(`crewai.llms.providers.anthropic.completion._stamp_cache_control_on_
+message` stampt `cache_control` ohne explizites `ttl`, was Anthropics
+Default von 5 Minuten ist), nicht angenommen.
+
+**Report-Aufbau:** in zwei Telegram-Nachrichten gesplittet.
 `_usage_headline()` steht als eigene, unmissverständliche Zeile
-(`Gesamt-Tokens diesen Zyklus: X`) direkt am Anfang des gesamten Reports,
-noch vor Warnungen und Telegram-Kommando-Logs - die eine Zahl, die auf
-einen Blick zählt. `_usage_detail_line()` folgt weiter unten mit dem Rest:
-Agent-Profil/Modell, Prompt-/Completion-Aufteilung, Prompt-Cache-Lese-/
-Schreib-Tokens, Anzahl erfolgreicher Requests, Prozent des Zyklus-Budgets,
-sowie `max_tokens` pro Agent.
+(`Gesamt-Tokens diesen Zyklus: X (Y% Zyklus-Budget) - Kosten: $Z`) direkt am
+Anfang der ersten (Haupt-)Nachricht, noch vor Warnungen und
+Telegram-Kommando-Logs. `_usage_detail_line()` folgt weiter unten mit dem
+Rest in Prosa: Agent-Profil/Modell, Prompt-/Completion-Aufteilung,
+Cache-Erklärung, `max_tokens` pro Agent. Direkt im Anschluss an die
+Hauptnachricht verschickt `_format_usage_table()` eine **zweite, separate**
+Nachricht mit denselben Zahlen als fest formatierte Monospace-Tabelle
+(Markdown-Codeblock, `parse_mode="Markdown"`) - zwei Tabellen: Token-/
+Kosten-Übersicht und `max_tokens` pro Agent. Getrennt von der Hauptnachricht,
+damit ein Formatierungsfehler dort nie den eigentlichen Report gefährdet
+(`send_telegram_message` faengt das selbst ab und würde bei einem
+abgelehnten `parse_mode`-Send automatisch als Klartext erneut versuchen) -
+die Zahlen stehen ohnehin schon in Prosa in der Hauptnachricht, die Tabelle
+ist rein kosmetisch on top.
+
+Telegram Bot API 10.1 (11.06.2026) hat mit `sendRichMessage`/
+`RichBlockTable` echte native Tabellen eingeführt - live gegen Telegrams
+eigene Dokumentation bestätigt real (nicht die hier verwendete Methode:
+drei separate Abruf-Versuche gegen `core.telegram.org/bots/api` und dessen
+Changelog lieferten zwar die Existenz, aber nie die vollständige
+Feld-für-Feld-Parametertabelle). Ein JSON-Schema gegen eine echte externe
+API zu raten, nur weil die Methode nachweislich existiert, widerspricht der
+Verifikationsdisziplin dieses Repos - deshalb der dokumentierte, bewährte
+`sendMessage` + `parse_mode="Markdown"`-Codeblock-Weg statt eines
+ungetesteten `sendRichMessage`-Aufrufs. Aufzugreifen, sobald das exakte
+Schema verifizierbar ist.
+
+**Instrumentierung (ohne Limit-Änderung):** `_task_usage_log` erfasst pro
+Task den tatsächlichen Token-Verbrauch (Differenz von
+`crew.calculate_usage_metrics().total_tokens` vor/nach der jeweiligen Task,
+im selben Callback wie der `max_iter`-Watchdog, siehe 9.5) - ein Ausreisser
+in einer einzelnen Task war vorher erst sichtbar, nachdem er bereits das
+ganze Zyklus-Budget gesprengt hatte. `_malformed_tool_calls` zählt
+`ToolValidateInputErrorEvent`-Vorkommen (crewai-eigenes Event, gefeuert wenn
+ein Tool-Aufruf schon an Pydantic-Argumentvalidierung scheitert, bevor die
+eigentliche Tool-Funktion je läuft) - ein aus einem diagnostizierten
+101k-Token-Zyklus vermuteter, aber unbestätigter Zusammenhang mit dem
+strict-tools-Patch (Kapitel 10.6) wird damit zu einer echten Zahl statt
+einer Vermutung. Beides landet in `usage_history.jsonl` und, falls
+Vorkommen vorliegen, als kurzer Hinweis im Telegram-Report - explizit *ohne*
+`cycle_token_budget`/`max_iter`/`max_tokens` selbst anzufassen, bis nach
+mehreren Zyklen echte Daten vorliegen (siehe Kapitel 15).
+
+### 9.7 Persistenz-Check (`check_state_persistence`)
+
+Läuft als aller erster Schritt jedes Zyklus (noch vor
+`process_telegram_commands`), damit eine Warnung Telegram auch dann noch
+erreicht, wenn danach alles andere fehlschlägt. Prüft `RAILWAY_VOLUME_
+MOUNT_PATH` - eine echte, von Railway dokumentierte Laufzeit-Env-Var, die
+"if any" Volume angehängt ist, gesetzt wird
+(https://docs.railway.com/variables/reference) - gegen `STATE_DIR`:
+
+- Außerhalb Railways (kein `RAILWAY_ENVIRONMENT_ID` gesetzt - lokale Läufe,
+  Tests): `applicable=False`, keine Warnung - es gibt dort kein
+  Volume-Konzept zu prüfen.
+- Innerhalb Railways, `RAILWAY_VOLUME_MOUNT_PATH` stimmt mit `STATE_DIR`
+  überein: `persistent=True`, keine Warnung.
+- Innerhalb Railways, aber kein passender Mount-Pfad: `persistent=False`
+  mit konkreter Warnung, gleiche Sichtbarkeitsstufe wie die bestehenden
+  Budget-/`max_iter`-Warnungen im Telegram-Report (Kapitel 15 zur
+  Entstehungsgeschichte dieses Checks).
 
 ---
 
@@ -1000,8 +1093,12 @@ Versionen (siehe Kapitel 13).
 Kein Datenbank-Server - alles ist Klartext-JSONL (eine JSON-Zeile pro
 Record) unter `STATE_DIR` (`jsonl_store.py`: `read_jsonl`/`write_jsonl`/
 `append_jsonl`, geteilt zwischen `tools.py` und `holding.py`). `STATE_DIR`
-ist `/data` auf Railway (persistentes Volume), lokal/für Tests per
-`STATE_DIR`-Umgebungsvariable überschreibbar.
+ist `/data` auf Railway - durabel über Cron-Ticks hinweg nur, wenn dort
+tatsächlich ein Railway Volume angehängt ist (aktuell live bestätigt: ein
+Volume namens `data`, Status "Ready", gemountet auf `/data` - siehe Kapitel
+15 zur Historie, warum das nicht einfach angenommen werden sollte). Lokal/
+für Tests ist `STATE_DIR` ein gewöhnliches Verzeichnis ohne Volume-Bezug,
+per `STATE_DIR`-Umgebungsvariable überschreibbar.
 
 ### 11.1 Subsidiary-Ebene (`tools.py`, direkt unter `STATE_DIR`)
 
@@ -1060,18 +1157,20 @@ CMD ["python", "crew.py"]
 ```json
 {
   "build": { "builder": "DOCKERFILE", "dockerfilePath": "Dockerfile" },
-  "deploy": { "cronSchedule": "0 */3 * * *" }
+  "deploy": { "cronSchedule": "0 */2 * * *" }
 }
 ```
 
 Railway baut das Docker-Image bei jedem Push auf `main` neu und startet den
-Container gemäß Cron-Schedule (alle 3 Stunden, volle Stunde) - kein
+Container gemäß Cron-Schedule (alle 2 Stunden, volle Stunde) - kein
 Dauerbetrieb, kein Webserver, kein offener Port. Zwischen den Läufen
-existiert kein laufender Prozess; der gesamte Zustand liegt im persistenten
-`/data`-Volume (`STATE_DIR`). Seit der Umstellung von 6 auf 3 Stunden läuft
-doppelt so oft ein Zyklus pro Tag - `CYCLE_TOKEN_BUDGET` (Kapitel 9.4) gilt
-pro Zyklus, nicht pro Tag, das Tagesbudget verdoppelt sich also implizit
-mit; kein zusätzliches Guardrail dafür eingebaut, nur zur Kenntnis.
+existiert kein laufender Prozess; der Zustand überlebt trotzdem, weil er im
+angehängten Railway Volume liegt (`/data`, `STATE_DIR`) - siehe Kapitel 11
+für die Nuance, was das genau heißt, und Kapitel 15 für die Historie dazu.
+Mit jetzt 2 statt ursprünglich 6 Stunden läuft ein Zyklus dreimal so oft pro
+Tag - `CYCLE_TOKEN_BUDGET` (Kapitel 9.4) gilt pro Zyklus, nicht pro Tag, das
+Tagesbudget steigt also implizit mit; kein zusätzliches Guardrail dafür
+eingebaut, nur zur Kenntnis.
 
 ### 12.2 Umgebungsvariablen in Railway setzen
 
@@ -1154,6 +1253,8 @@ eine Zusammenfassung; Exit-Code `0` nur wenn wirklich alles bestanden hat.
 | `TELEGRAM_BOT_TOKEN` | Nein | Zyklus-Benachrichtigungen und Fernsteuerung (Kapitel 8.2) - ohne Token: Warnung im Log, kein Crash |
 | `TELEGRAM_CHAT_ID` | Nein | Ziel-Chat für Telegram-Nachrichten, gleiches Verhalten wie oben |
 | `GITHUB_TOKEN` | Nein | Erhöht das GitHub-API-Rate-Limit für Signup-Sync; **erforderlich** für `open_pull_request` (Dev-Agent) - ohne Token liefert das Tool einen klaren Fehler statt eine Aktion vorzutäuschen |
+| `RAILWAY_ENVIRONMENT_ID` | Nein, von Railway gesetzt | Nur gelesen, nie gesetzt - Signal für `check_state_persistence` (Kapitel 9.7), dass der Prozess überhaupt in Railway läuft |
+| `RAILWAY_VOLUME_MOUNT_PATH` / `RAILWAY_VOLUME_NAME` | Nein, von Railway gesetzt, "falls ein Volume angehängt ist" | Nur gelesen, nie gesetzt - `check_state_persistence` vergleicht `RAILWAY_VOLUME_MOUNT_PATH` gegen `STATE_DIR` |
 
 ---
 
@@ -1184,4 +1285,27 @@ eine Zusammenfassung; Exit-Code `0` nur wenn wirklich alles bestanden hat.
   defensiv geschrieben und würde bei geändertem crewai-Internal einfach
   übersprungen, aber nicht mehr nötig sein).
 - **Kein manuelles "jetzt sofort einen Zyklus auslösen"** über Railway
-  selbst (Kapitel 12.4) - nur der planmäßige 3h-Cron oder ein lokaler Testlauf.
+  selbst (Kapitel 12.4) - nur der planmäßige 2h-Cron oder ein lokaler Testlauf.
+- **Historie: `/data` war lange Zeit kein echtes Volume.** Frühere Versionen
+  dieses Dokuments behaupteten unverifiziert, `/data` sei "das persistente
+  Railway-Volume" - `railway volume list` zeigte tatsächlich lange Zeit
+  keinerlei Volume für diesen Service. Jeder Redeploy (jeder Push nach
+  `main`) hat dadurch den kompletten Zustand gelöscht; nur zwischen
+  Cron-Ticks *desselben* Deployments (kein neuer Push dazwischen) blieb er
+  erhalten, was das Problem lange verschleiert hat. Direkt per Log-Vergleich
+  über mehrere Cron-Ticks desselben Deployments nachgewiesen (identische
+  `created_at`-Zeitstempel über mehrere Stunden hinweg vs. ein leerer
+  Roster unmittelbar nach jedem neuen Deploy). Inzwischen ist ein echtes
+  Volume angehängt (`railway volume list` zeigt `data`, Status "Ready",
+  Mount-Pfad `/data`) - der `check_state_persistence`-Tool-Aufruf (Kapitel
+  9.7) prüft das jetzt bei jedem Zykluststart automatisch mit, damit ein
+  erneutes stillschweigendes Fehlen nicht wieder unbemerkt bliebe.
+- **`railway status --json` zeigte einen widersprüchlichen `cronSchedule`-
+  Wert:** Auf Service-Instance-Ebene stand `"0 */6 * * *"`, während die
+  Deployment-Metadaten (`fileServiceManifest`/`serviceManifest`, aus
+  `railway.json`) bereits korrekt `"0 */3 * * *"` zeigten - über mehrere
+  Deploys hinweg unverändert, also keine bloße Propagations-Verzögerung.
+  Nicht per CLI direkt korrigierbar (keine `railway service`-Unterkommando
+  dafür gefunden); nach der Umstellung auf 2h sollte anhand der tatsächlich
+  eintreffenden Cron-Läufe (nicht nur der Config-Datei) verifiziert werden,
+  welcher Wert wirklich das Verhalten bestimmt.

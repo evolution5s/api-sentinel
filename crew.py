@@ -4,9 +4,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from crewai import Agent, Crew, Process, Task, LLM
+from crewai.events import crewai_event_bus
+from crewai.events.types.tool_usage_events import ToolValidateInputErrorEvent
 from crewai.tasks.conditional_task import ConditionalTask
 
 import crewai_patches
+import pricing
 
 # Muss vor jeder Agent/Task-Konstruktion passieren, insbesondere vor dem
 # ersten crew.kickoff() - siehe crewai_patches.py: crewai wirft einen
@@ -20,6 +23,7 @@ from tools import (
     check_approval_status,
     check_community_risk,
     check_escalation,
+    check_state_persistence,
     compare_channel_performance,
     complete_task_order,
     compute_break_even,
@@ -173,7 +177,12 @@ growth_agent = Agent(
         "it is live. Concrete work comes from the Sub-CEO as task orders "
         "(read_task_orders(to_role='growth', status='open')) - that's the "
         "authoritative ask, not a paraphrase of it; call complete_task_order "
-        "with the real result when done, don't just narrate it in prose."
+        "with the real result when done, don't just narrate it in prose. "
+        "Tokens and iterations are a real, metered cost, not a free "
+        "resource - finishing correctly in as few tool calls as the task "
+        "genuinely needs is the actual goal; max_iter/max_rpm/the cycle "
+        "budget are a hard ceiling against runaway cost, not a target to "
+        "use up."
     ),
     llm=growth_llm,
     tools=[
@@ -201,7 +210,12 @@ dev_agent = Agent(
         "'build' hypothesis outcome, verifies via check_approval_status that "
         "its approval is actually approved before opening a PR - never takes "
         "another agent's word that something was approved. Calls "
-        "complete_task_order with the real result (e.g. the PR URL) when done."
+        "complete_task_order with the real result (e.g. the PR URL) when done. "
+        "Tokens and iterations are a real, metered cost, not a free "
+        "resource - finishing correctly in as few tool calls as the task "
+        "genuinely needs is the actual goal; max_iter/max_rpm/the cycle "
+        "budget are a hard ceiling against runaway cost, not a target to "
+        "use up."
     ),
     llm=dev_llm,
     tools=[open_pull_request, read_task_orders, complete_task_order, check_approval_status],
@@ -280,7 +294,15 @@ ceo_agent = Agent(
         "still has to clear regardless of how promising the value signal "
         "looks - they are the gate, not the ranking criterion itself. Same "
         "standard applies to channel picks and pivot-variable choices "
-        "whenever there's real discretion involved."
+        "whenever there's real discretion involved. Tokens and iterations "
+        "are a real, metered cost, not a free resource - finishing "
+        "correctly in as few tool calls as the task genuinely needs is the "
+        "actual goal; max_iter/max_rpm/the cycle budget are a hard ceiling "
+        "against runaway cost, not a target to use up. Before writing a "
+        "channel, checking whether it already exists (read_channels) "
+        "avoids wasted, near-duplicate write_channel calls - the same "
+        "channel written twice under two different ids is exactly the kind "
+        "of avoidable waste this applies to."
     ),
     llm=ceo_llm,
     tools=[
@@ -365,7 +387,11 @@ main_ceo_agent = Agent(
         "register_subsidiary; every subsidiary starts conservative "
         "(everything off/low) by default and only loosens with a real, "
         "board-approved reason, never because a Sub-CEO would find it "
-        "convenient."
+        "convenient. Tokens and iterations are a real, metered cost, not a "
+        "free resource - finishing correctly in as few tool calls as the "
+        "task genuinely needs is the actual goal; max_iter/max_rpm/the "
+        "cycle budget are a hard ceiling against runaway cost, not a "
+        "target to use up."
     ),
     llm=main_ceo_llm,
     tools=[
@@ -394,16 +420,55 @@ main_ceo_agent = Agent(
 # dem Zeitpunkt spiegelt agent.agent_executor.iterations noch exakt die
 # Iterationszahl dieser einen Task wider (wird erst bei der naechsten
 # Task-Ausfuehrung des Agenten auf 0 zurueckgesetzt).
+#
+# Dieselbe Callback-Stelle erfasst zusaetzlich den Token-Verbrauch PRO TASK
+# (nicht nur die Zyklus-Summe) - ein Ausreisser in einer einzelnen Task war
+# vorher erst sichtbar, nachdem er bereits das ganze Zyklus-Budget gesprengt
+# hatte. crew.calculate_usage_metrics().total_tokens ist live-kumulativ
+# (verifiziert im Quellcode, siehe Kapitel 9.4 im README) - die Differenz
+# zum zuletzt gemessenen Stand ist genau der Verbrauch dieser einen Task.
 # --------------------------------------------------------------------------
 _limit_hits: list[str] = []
+_task_usage_log: list[dict] = []
+_last_cumulative_tokens = 0
 
 
 def _make_iteration_watchdog(agent: Agent, label: str):
     def _watchdog(_output):
+        global _last_cumulative_tokens
         executor = agent.agent_executor
         if executor is not None and executor.iterations >= agent.max_iter:
             _limit_hits.append(f"{label}: max_iter-Kappe ({agent.max_iter}) erreicht, finale Antwort erzwungen")
+        total_now = crew.calculate_usage_metrics().total_tokens
+        _task_usage_log.append({"task": label, "tokens": total_now - _last_cumulative_tokens})
+        _last_cumulative_tokens = total_now
     return _watchdog
+
+
+# --------------------------------------------------------------------------
+# Fehlerhafte Tool-Aufrufe zaehlen (Token-Effizienz-Addendum) - ein
+# Verdacht aus einem diagnostizierten 101k-Token-Zyklus: write_channel
+# scheiterte dort mehrfach schon VOR der eigenen Validierung mit einem
+# komplett leeren Argument-Dict ("Field required [...], input_value={}"),
+# vermutlich zusammenhaengend mit dem strict-tools-Patch (crewai_patches.py),
+# der Anthropics Schema-Erzwingung deaktiviert. Bisher nur eine Vermutung,
+# keine bestaetigte Ursache - dieser Handler macht daraus eine echte Zahl
+# statt einer Vermutung: crewai feuert ToolValidateInputErrorEvent genau in
+# diesem Fall (Pydantic-Validierung der Tool-Argumente scheitert, bevor die
+# eigentliche Tool-Funktion je aufgerufen wird - unterscheidet sich von den
+# JSON-Fehlern, die unsere eigenen Tools als normales {"error": ...}-Ergebnis
+# zurueckgeben).
+# --------------------------------------------------------------------------
+_malformed_tool_calls: list[dict] = []
+
+
+@crewai_event_bus.on(ToolValidateInputErrorEvent)
+def _on_tool_validate_input_error(source, event) -> None:
+    _malformed_tool_calls.append({
+        "tool_name": event.tool_name,
+        "tool_args": event.tool_args,
+        "error": str(event.error),
+    })
 
 
 # --------------------------------------------------------------------------
@@ -1026,6 +1091,13 @@ def _compute_cycle_usage() -> dict:
     happens exactly once per cycle regardless of which is called first.
     Returns None if no kickoff() has run yet (e.g. mid-test, or a crash
     before the crew ever started).
+
+    Also computes cost_usd via pricing.compute_cycle_cost() - date-aware
+    (Sonnet 5 steps price on 2026-09-01, compared against this cycle's own
+    date) and persisted into usage_history.jsonl alongside the token
+    figures, so cost trends are visible over time, not just token trends.
+    None if the active profile's model has no known pricing (never guess a
+    rate) - the rest of the report still works, cost is just omitted.
     """
     metrics = getattr(crew, "usage_metrics", None)
     if metrics is None:
@@ -1038,18 +1110,38 @@ def _compute_cycle_usage() -> dict:
         "completion_tokens": getattr(metrics, "completion_tokens", None),
         "successful_requests": getattr(metrics, "successful_requests", None),
     }
+    try:
+        usage["cost_usd"] = pricing.compute_cycle_cost(
+            model=AGENT_PROFILE["model"],
+            as_of=datetime.now(timezone.utc).date(),
+            base_input_tokens=usage["prompt_tokens"] or 0,
+            cache_write_tokens=usage["cache_creation_tokens"] or 0,
+            cache_hit_tokens=usage["cached_prompt_tokens"] or 0,
+            completion_tokens=usage["completion_tokens"] or 0,
+        )
+    except ValueError:
+        usage["cost_usd"] = None
+    usage["per_task_tokens"] = list(_task_usage_log)
+    usage["malformed_tool_calls"] = len(_malformed_tool_calls)
+    if _malformed_tool_calls:
+        usage["malformed_tool_calls_detail"] = list(_malformed_tool_calls)
     log_cycle_usage(usage)
     return usage
 
 
 def _usage_headline(usage: dict) -> str:
-    """The single most-glanced-at number in the whole report - kept as its
-    own standalone line at the very top (see send_cycle_summary), not
-    folded mid-sentence into the fuller breakdown below it.
+    """The most-glanced-at numbers in the whole report - kept as their own
+    standalone line at the very top (see send_cycle_summary), not folded
+    mid-sentence into the fuller breakdown below it.
     """
     if usage is None:
         return "Gesamt-Tokens diesen Zyklus: nicht verfuegbar"
-    return f"Gesamt-Tokens diesen Zyklus: {usage['total_tokens']}"
+    budget_pct = round(100 * (usage["total_tokens"] or 0) / CYCLE_TOKEN_BUDGET)
+    cost_part = f"${usage['cost_usd']:.4f}" if usage.get("cost_usd") is not None else "n/a"
+    return (
+        f"Gesamt-Tokens diesen Zyklus: {usage['total_tokens']} "
+        f"({budget_pct}% Zyklus-Budget) - Kosten: {cost_part}"
+    )
 
 
 def _usage_detail_line(usage: dict) -> str:
@@ -1060,19 +1152,72 @@ def _usage_detail_line(usage: dict) -> str:
         f"Aufteilung: {usage['prompt_tokens']} prompt, {usage['completion_tokens']} completion. "
         f"Prompt-Cache: {usage['cached_prompt_tokens']} tokens gelesen "
         f"(guenstig), {usage['cache_creation_tokens']} tokens neu geschrieben "
-        f"(teurer, einmalig pro Cache-Fenster) - CrewAI cached role/goal/"
-        f"backstory + Tool-Definitionen pro Agent automatisch, sobald der "
-        f"gemeinsame Praefix (Tools+System) das Modell-Minimum erreicht; "
-        f"{usage['successful_requests']} Requests, "
-        f"{usage['total_tokens']}/{CYCLE_TOKEN_BUDGET:,} Zyklus-Budget "
-        f"({round(100 * (usage['total_tokens'] or 0) / CYCLE_TOKEN_BUDGET)}%); "
+        f"(teurer, einmalig pro 5-Minuten-Cache-Fenster) - CrewAI cached "
+        f"role/goal/backstory + Tool-Definitionen pro Agent automatisch, "
+        f"sobald der gemeinsame Praefix (Tools+System) das Modell-Minimum "
+        f"erreicht; {usage['successful_requests']} Requests, "
+        f"{usage['total_tokens']}/{CYCLE_TOKEN_BUDGET:,} Zyklus-Budget; "
         f"max_tokens/Call: "
         f"Growth={growth_llm.max_tokens} Dev={dev_llm.max_tokens} "
         f"Sub-CEO={ceo_llm.max_tokens} Main-CEO={main_ceo_llm.max_tokens}"
     )
 
 
-def send_cycle_summary(kickoff_error: Exception = None, telegram_action_log: list = None) -> None:
+def _format_usage_table(usage: dict) -> str:
+    """Fixed-width, monospace token/cost/per-agent breakdown as a
+    Markdown-fenced code block, sent as its own short follow-up Telegram
+    message (see send_cycle_summary) so a formatting failure there can
+    never cost the main plain-text report, which already carries the same
+    numbers in prose form via _usage_headline()/_usage_detail_line().
+
+    This is the monospace-codeblock fallback, not Telegram Bot API 10.1's
+    native sendRichMessage/RichBlockTable. That method and type are real
+    (confirmed live against Telegram's own docs - added 2026-06-11), but
+    their exact field-level request schema could not be confirmed from
+    available documentation (three separate fetch attempts against
+    core.telegram.org/bots/api and its changelog all truncated before the
+    parameter tables) - shipping a guessed JSON shape against a live
+    external API isn't something this repo does, so this uses the
+    documented, verified sendMessage + parse_mode="Markdown" path instead.
+    Revisit if the exact RichBlockTable schema becomes verifiable.
+    """
+    if usage is None:
+        return ""
+
+    def _table(rows: list, value_header: str) -> str:
+        label_width = max(len(label) for label, _ in rows)
+        value_width = max(len(value_header), max(len(value) for _, value in rows))
+        header = f"{'Metrik'.ljust(label_width)}  {value_header.rjust(value_width)}"
+        separator = "-" * len(header)
+        body = "\n".join(f"{label.ljust(label_width)}  {value.rjust(value_width)}" for label, value in rows)
+        return f"{header}\n{separator}\n{body}"
+
+    cost_str = f"${usage['cost_usd']:.4f}" if usage.get("cost_usd") is not None else "n/a"
+    budget_pct = round(100 * (usage["total_tokens"] or 0) / CYCLE_TOKEN_BUDGET)
+    summary_rows = [
+        ("Tokens gesamt", str(usage["total_tokens"])),
+        ("Kosten (USD)", cost_str),
+        ("Zyklus-Budget", f"{usage['total_tokens']}/{CYCLE_TOKEN_BUDGET:,} ({budget_pct}%)"),
+        ("Prompt", str(usage["prompt_tokens"])),
+        ("Completion", str(usage["completion_tokens"])),
+        ("Cache gelesen", str(usage["cached_prompt_tokens"])),
+        ("Cache geschrieben", str(usage["cache_creation_tokens"])),
+        ("Requests", str(usage["successful_requests"])),
+    ]
+    agent_rows = [
+        ("Growth", str(growth_llm.max_tokens)),
+        ("Dev", str(dev_llm.max_tokens)),
+        ("Sub-CEO", str(ceo_llm.max_tokens)),
+        ("Main-CEO", str(main_ceo_llm.max_tokens)),
+    ]
+    block = _table(summary_rows, "Wert") + "\n\n" + _table(agent_rows, "Max Tok./Call")
+    return "```\n" + block + "\n```"
+
+
+def send_cycle_summary(
+    kickoff_error: Exception = None, telegram_action_log: list = None,
+    persistence_warning: str = None,
+) -> None:
     """Post a what-happened/what's-next digest of this cycle to Telegram,
     and save a condensed version as next cycle's continuity note. Called
     once after kickoff() finishes (or fails) - never raises itself, so a
@@ -1080,7 +1225,11 @@ def send_cycle_summary(kickoff_error: Exception = None, telegram_action_log: lis
     didn't do. If kickoff_error is set, that's reported up front instead of
     being silently swallowed - a hard crew failure must still reach Telegram,
     not just Railway's logs, since that's the only place a human reliably
-    sees it.
+    sees it. persistence_warning (from check_state_persistence(), computed
+    once at the very start of the cycle in __main__) gets the same
+    visibility tier as the existing budget/max_iter warnings below - state
+    silently not surviving the next redeploy is exactly the kind of thing
+    that must never go unnoticed again (see README chapter 15).
     """
     try:
         notify_new_pending_approvals()
@@ -1104,9 +1253,20 @@ def send_cycle_summary(kickoff_error: Exception = None, telegram_action_log: lis
             _usage_detail_line(usage),
             f"Offene Freigaben (approve.py / Telegram-Reply): {pending}",
         ]
+        if persistence_warning:
+            lines.append(f"WARNUNG: Zustand vermutlich nicht persistent: {persistence_warning}")
         if _limit_hits:
             lines.append("WARNUNG: Sicherheitslimits diesen Zyklus ausgeloest:")
             lines.extend(f"- {hit}" for hit in _limit_hits)
+        if _malformed_tool_calls:
+            lines.append(
+                f"Hinweis: {len(_malformed_tool_calls)}x fehlerhafter Tool-Aufruf diesen Zyklus "
+                "(leeres/unvollstaendiges Argument-Dict vor der eigenen Validierung, vermuteter "
+                "Zusammenhang mit dem strict-tools-Patch - siehe usage_history.jsonl fuer Details)."
+            )
+        if _task_usage_log:
+            per_task = ", ".join(f"{e['task']}={e['tokens']}" for e in _task_usage_log)
+            lines.append(f"Tokens pro Task: {per_task}")
         lines += [
             "",
             "--- Channel-Strategie ---",
@@ -1126,6 +1286,15 @@ def send_cycle_summary(kickoff_error: Exception = None, telegram_action_log: lis
         ]
         full_summary = "\n".join(lines)
         send_telegram_message(full_summary)
+        try:
+            table = _format_usage_table(usage)
+            if table:
+                send_telegram_message(table, parse_mode="Markdown")
+        except Exception as exc:
+            # Best-effort only - the numbers above already reached Telegram
+            # in plain-text form via the main report, so a failure here
+            # never costs the report itself, just the prettier formatting.
+            print(f"[api-sentinel] usage table send failed (main report was unaffected): {exc}")
         save_cycle_note(full_summary[:3000])
     except Exception as exc:
         print(f"[api-sentinel] cycle summary failed (crew run itself was unaffected): {exc}")
@@ -1133,19 +1302,30 @@ def send_cycle_summary(kickoff_error: Exception = None, telegram_action_log: lis
 
 if __name__ == "__main__":
     print("[api-sentinel] Autonomous Loop Started (Anthropic Claude)...")
+    # Checked first, before anything else - a warning needs to reach
+    # Telegram even if everything after this fails or gets skipped.
+    persistence = check_state_persistence()
+    if persistence["warning"]:
+        print(f"[api-sentinel] WARNUNG: {persistence['warning']}")
     telegram_action_log = process_telegram_commands()
     paused, pause_note = is_system_paused()
     if paused:
         print(f"[api-sentinel] system paused ({pause_note}) - skipping this cycle.")
-        send_telegram_message(
+        skip_message = (
             f"API Sentinel Zyklus uebersprungen - System ist pausiert ({pause_note}). "
             "Sende 'start', um fortzufahren."
         )
+        if persistence["warning"]:
+            skip_message += f"\nWARNUNG: Zustand vermutlich nicht persistent: {persistence['warning']}"
+        send_telegram_message(skip_message)
     else:
         try:
             crew.kickoff()
             print("[api-sentinel] Execution finished.")
-            send_cycle_summary(telegram_action_log=telegram_action_log)
+            send_cycle_summary(telegram_action_log=telegram_action_log, persistence_warning=persistence["warning"])
         except Exception as exc:
             print(f"[api-sentinel] crew.kickoff() failed: {exc}")
-            send_cycle_summary(kickoff_error=exc, telegram_action_log=telegram_action_log)
+            send_cycle_summary(
+                kickoff_error=exc, telegram_action_log=telegram_action_log,
+                persistence_warning=persistence["warning"],
+            )

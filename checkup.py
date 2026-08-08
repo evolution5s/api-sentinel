@@ -13,7 +13,7 @@ import os
 import shutil
 import sys
 import tempfile
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 import requests
@@ -26,6 +26,7 @@ import tools  # noqa: E402
 import holding  # noqa: E402
 import approve  # noqa: E402
 import crew  # noqa: E402
+import pricing  # noqa: E402
 
 results = []
 
@@ -279,6 +280,94 @@ def test_classify_outcome_pivot_then_bury_once_cap_reached():
 
 def test_classify_outcome_clearly_bad_score_is_always_bury():
     assert scoring.classify_outcome(-0.9, 0, 10, False, 0) == "bury"
+
+
+# --- pricing.py: date-aware Anthropic cost lookup ---------------------------
+
+def test_get_pricing_haiku():
+    rates = pricing.get_pricing("claude-haiku-4-5", date(2026, 1, 1))
+    assert rates == {
+        "base_input": 1.0, "cache_write_5m": 1.25, "cache_write_1h": 2.0,
+        "cache_hit": 0.10, "output": 5.0,
+    }
+
+
+def test_get_pricing_sonnet5_before_price_step():
+    rates = pricing.get_pricing("claude-sonnet-5", date(2026, 8, 31))
+    assert rates == {
+        "base_input": 2.0, "cache_write_5m": 2.50, "cache_write_1h": 4.0,
+        "cache_hit": 0.20, "output": 10.0,
+    }
+
+
+def test_get_pricing_sonnet5_from_price_step():
+    rates = pricing.get_pricing("claude-sonnet-5", date(2026, 9, 1))
+    assert rates == {
+        "base_input": 3.0, "cache_write_5m": 3.75, "cache_write_1h": 6.0,
+        "cache_hit": 0.30, "output": 15.0,
+    }
+    # a later date is still "from_step" - the step is one-directional
+    assert pricing.get_pricing("claude-sonnet-5", date(2026, 12, 25)) == pricing.get_pricing(
+        "claude-sonnet-5", date(2026, 9, 1)
+    )
+
+
+def test_get_pricing_unknown_model_raises():
+    try:
+        pricing.get_pricing("claude-opus-5", date(2026, 1, 1))
+        assert False, "expected ValueError for an unpriced model"
+    except ValueError:
+        pass
+
+
+def test_compute_cycle_cost_haiku_known_value():
+    # 1M base input + 1M cache write + 1M cache hit + 1M output at
+    # haiku-4-5's 5m rates = 1.00 + 1.25 + 0.10 + 5.00 = 7.35 USD exactly.
+    cost = pricing.compute_cycle_cost(
+        model="claude-haiku-4-5", as_of=date(2026, 1, 1),
+        base_input_tokens=1_000_000, cache_write_tokens=1_000_000,
+        cache_hit_tokens=1_000_000, completion_tokens=1_000_000,
+    )
+    assert cost == 7.35
+
+
+def test_compute_cycle_cost_is_date_aware_for_sonnet5():
+    kwargs = dict(
+        model="claude-sonnet-5", base_input_tokens=1_000_000, cache_write_tokens=0,
+        cache_hit_tokens=0, completion_tokens=0,
+    )
+    before = pricing.compute_cycle_cost(as_of=date(2026, 8, 31), **kwargs)
+    after = pricing.compute_cycle_cost(as_of=date(2026, 9, 1), **kwargs)
+    assert before == 2.0
+    assert after == 3.0
+    assert after > before
+
+
+def test_compute_cycle_cost_1h_cache_write_tier():
+    cost_5m = pricing.compute_cycle_cost(
+        model="claude-haiku-4-5", as_of=date(2026, 1, 1),
+        base_input_tokens=0, cache_write_tokens=1_000_000, cache_hit_tokens=0,
+        completion_tokens=0, cache_write_ttl="5m",
+    )
+    cost_1h = pricing.compute_cycle_cost(
+        model="claude-haiku-4-5", as_of=date(2026, 1, 1),
+        base_input_tokens=0, cache_write_tokens=1_000_000, cache_hit_tokens=0,
+        completion_tokens=0, cache_write_ttl="1h",
+    )
+    assert cost_5m == 1.25
+    assert cost_1h == 2.0
+
+
+def test_compute_cycle_cost_rejects_invalid_ttl():
+    try:
+        pricing.compute_cycle_cost(
+            model="claude-haiku-4-5", as_of=date(2026, 1, 1),
+            base_input_tokens=0, cache_write_tokens=0, cache_hit_tokens=0,
+            completion_tokens=0, cache_write_ttl="30m",
+        )
+        assert False, "expected ValueError for an invalid cache_write_ttl"
+    except ValueError:
+        pass
 
 
 # --- tools.py: JSONL primitives -------------------------------------------
@@ -816,6 +905,32 @@ def test_write_channel_create_defaults_not_tested():
     assert entry["status_history"][0]["to"] == "not_tested"
 
 
+def test_write_channel_rejects_duplicate_name_under_different_id():
+    reset_state()
+    first = json.loads(tools.write_channel.run(channel=json.dumps({
+        "id": "ch_reddit_quantfinance", "name": "r/quantfinance", "category": "community_marketing",
+        "is_paid": False, "impact_score": 8, "confidence_score": 8,
+    })))
+    assert first["ok"] is True
+
+    # same name, different id, even different casing/whitespace - rejected
+    dup = json.loads(tools.write_channel.run(channel=json.dumps({
+        "id": "ch_reddit_quantfinance_2", "name": "  r/QuantFinance  ", "category": "community_marketing",
+        "is_paid": False, "impact_score": 7, "confidence_score": 7,
+    })))
+    assert "error" in dup and "ch_reddit_quantfinance" in dup["error"]
+    stored = json.loads(tools.read_channels.run())
+    # reset_state() already seeds one "reddit" channel - no near-duplicate
+    # roster entry beyond that plus the one we successfully created
+    assert len(stored) == 2
+
+    # updating the SAME id (not creating a new one) still works fine
+    update = json.loads(tools.write_channel.run(channel=json.dumps({
+        "id": "ch_reddit_quantfinance", "impact_score": 9,
+    })))
+    assert update["ok"] is True
+
+
 def test_write_channel_total_roster_cap_enforced():
     reset_state()
     for i in range(tools.MAX_TOTAL_CHANNELS - 1):  # reset_state already seeded 1 ("reddit")
@@ -1273,6 +1388,80 @@ def test_send_telegram_message_degrades_gracefully_on_bad_token():
     finally:
         os.environ.pop("TELEGRAM_BOT_TOKEN", None)
         os.environ.pop("TELEGRAM_CHAT_ID", None)
+
+
+# --- tools.py: state-persistence check --------------------------------------
+
+def _clear_railway_env():
+    for key in ("RAILWAY_ENVIRONMENT_ID", "RAILWAY_VOLUME_NAME", "RAILWAY_VOLUME_MOUNT_PATH"):
+        os.environ.pop(key, None)
+
+
+def test_check_state_persistence_not_applicable_outside_railway():
+    reset_state()
+    had = {k: os.environ.pop(k, None) for k in
+           ("RAILWAY_ENVIRONMENT_ID", "RAILWAY_VOLUME_NAME", "RAILWAY_VOLUME_MOUNT_PATH")}
+    try:
+        result = tools.check_state_persistence()
+        assert result == {"applicable": False, "persistent": True, "warning": None}
+    finally:
+        for k, v in had.items():
+            if v is not None:
+                os.environ[k] = v
+
+
+def test_check_state_persistence_detects_matching_volume():
+    reset_state()
+    had = {k: os.environ.pop(k, None) for k in
+           ("RAILWAY_ENVIRONMENT_ID", "RAILWAY_VOLUME_NAME", "RAILWAY_VOLUME_MOUNT_PATH")}
+    try:
+        os.environ["RAILWAY_ENVIRONMENT_ID"] = "env_test"
+        os.environ["RAILWAY_VOLUME_NAME"] = "data"
+        os.environ["RAILWAY_VOLUME_MOUNT_PATH"] = str(tools.STATE_DIR)
+        result = tools.check_state_persistence()
+        assert result["applicable"] is True
+        assert result["persistent"] is True
+        assert result["warning"] is None
+    finally:
+        _clear_railway_env()
+        for k, v in had.items():
+            if v is not None:
+                os.environ[k] = v
+
+
+def test_check_state_persistence_flags_missing_volume():
+    reset_state()
+    had = {k: os.environ.pop(k, None) for k in
+           ("RAILWAY_ENVIRONMENT_ID", "RAILWAY_VOLUME_NAME", "RAILWAY_VOLUME_MOUNT_PATH")}
+    try:
+        os.environ["RAILWAY_ENVIRONMENT_ID"] = "env_test"
+        # no RAILWAY_VOLUME_MOUNT_PATH at all - no volume attached
+        result = tools.check_state_persistence()
+        assert result["applicable"] is True
+        assert result["persistent"] is False
+        assert result["warning"] and str(tools.STATE_DIR) in result["warning"]
+    finally:
+        _clear_railway_env()
+        for k, v in had.items():
+            if v is not None:
+                os.environ[k] = v
+
+
+def test_check_state_persistence_flags_mismatched_mount_path():
+    reset_state()
+    had = {k: os.environ.pop(k, None) for k in
+           ("RAILWAY_ENVIRONMENT_ID", "RAILWAY_VOLUME_NAME", "RAILWAY_VOLUME_MOUNT_PATH")}
+    try:
+        os.environ["RAILWAY_ENVIRONMENT_ID"] = "env_test"
+        os.environ["RAILWAY_VOLUME_MOUNT_PATH"] = "/some/other/path"
+        result = tools.check_state_persistence()
+        assert result["persistent"] is False
+        assert result["warning"]
+    finally:
+        _clear_railway_env()
+        for k, v in had.items():
+            if v is not None:
+                os.environ[k] = v
 
 
 # --- tools.py: Telegram remote control ---------------------------------------
@@ -2084,21 +2273,19 @@ def test_usage_headline_and_detail_split():
     # _usage_line() used to fold "X tokens gesamt" mid-sentence into the
     # agent-profile line - split into a standalone headline (checked here)
     # plus the fuller detail line, per the token-total-upfront addendum.
-    fake_metrics = type("U", (), {
+    # The headline addendum (cost breakdown) later added cost_usd/budget%
+    # to this same headline.
+    usage = {
         "total_tokens": 12345, "prompt_tokens": 10000, "completion_tokens": 2345,
         "cached_prompt_tokens": 500, "cache_creation_tokens": 200, "successful_requests": 7,
-    })()
-    usage = {
-        "total_tokens": fake_metrics.total_tokens, "prompt_tokens": fake_metrics.prompt_tokens,
-        "cached_prompt_tokens": fake_metrics.cached_prompt_tokens,
-        "cache_creation_tokens": fake_metrics.cache_creation_tokens,
-        "completion_tokens": fake_metrics.completion_tokens,
-        "successful_requests": fake_metrics.successful_requests,
+        "cost_usd": 0.0456,
     }
-    assert crew._usage_headline(usage) == "Gesamt-Tokens diesen Zyklus: 12345"
+    headline = crew._usage_headline(usage)
+    assert headline.startswith("Gesamt-Tokens diesen Zyklus: 12345")
+    assert "$0.0456" in headline
+    assert "%" in headline
     assert crew._usage_headline(None) == "Gesamt-Tokens diesen Zyklus: nicht verfuegbar"
     detail = crew._usage_detail_line(usage)
-    assert "12345" not in detail.split(":")[0]  # not repeated as the line's own headline number
     assert "10000 prompt" in detail and "2345 completion" in detail
     assert crew._usage_detail_line(None) == "LLM-Nutzung: nicht verfuegbar"
 
@@ -2110,21 +2297,74 @@ def test_usage_headline_is_first_line_in_cycle_summary():
     original_send = crew.send_telegram_message
     original_metrics = crew.crew.usage_metrics
     try:
-        crew.send_telegram_message = lambda text: captured.append(text)
+        crew.send_telegram_message = lambda text, parse_mode=None: captured.append((text, parse_mode))
         crew.crew.usage_metrics = type("U", (), {
             "total_tokens": 999, "prompt_tokens": 900, "completion_tokens": 99,
             "cached_prompt_tokens": 0, "cache_creation_tokens": 0, "successful_requests": 3,
         })()
         crew.send_cycle_summary()
         assert captured, "expected send_telegram_message to be called"
-        lines = captured[0].split("\n")
+        main_report = captured[0][0]
+        lines = main_report.split("\n")
         assert lines[0].startswith("API Sentinel Zyklus - ")
-        assert lines[1] == "Gesamt-Tokens diesen Zyklus: 999"
+        assert lines[1].startswith("Gesamt-Tokens diesen Zyklus: 999")
+        assert "$" in lines[1]  # cost figure present (model is priced in the active testing profile)
+        # the usage table is sent as its own follow-up, formatted message
+        assert len(captured) == 2
+        assert captured[1][1] == "Markdown"
+        assert "```" in captured[1][0]
     finally:
         crew.send_telegram_message = original_send
         crew.crew.usage_metrics = original_metrics
         if had_token is not None:
             os.environ["TELEGRAM_BOT_TOKEN"] = had_token
+
+
+def test_format_usage_table_contains_key_figures():
+    usage = {
+        "total_tokens": 12345, "prompt_tokens": 10000, "completion_tokens": 2345,
+        "cached_prompt_tokens": 500, "cache_creation_tokens": 200, "successful_requests": 7,
+        "cost_usd": 0.0456,
+    }
+    table = crew._format_usage_table(usage)
+    assert table.startswith("```\n") and table.endswith("\n```")
+    assert "12345" in table
+    assert "$0.0456" in table
+    assert "Growth" in table and "Sub-CEO" in table and "Main-CEO" in table
+    assert crew._format_usage_table(None) == ""
+
+
+def test_malformed_tool_call_handler_records_events():
+    crew._malformed_tool_calls.clear()
+    fake_event = type("E", (), {
+        "tool_name": "write_channel", "tool_args": {}, "error": "Field required",
+    })()
+    crew._on_tool_validate_input_error(source=None, event=fake_event)
+    assert len(crew._malformed_tool_calls) == 1
+    assert crew._malformed_tool_calls[0]["tool_name"] == "write_channel"
+    crew._malformed_tool_calls.clear()
+
+
+def test_task_usage_watchdog_records_per_task_tokens():
+    from crewai import Crew as _Crew
+    original_calc = _Crew.calculate_usage_metrics
+    crew._task_usage_log.clear()
+    original_cumulative = crew._last_cumulative_tokens
+    crew._last_cumulative_tokens = 0
+    try:
+        _Crew.calculate_usage_metrics = lambda self: type("U", (), {"total_tokens": 500})()
+        watchdog = crew._make_iteration_watchdog(crew.growth_agent, "Growth (Test)")
+        watchdog(None)
+        assert crew._task_usage_log[-1] == {"task": "Growth (Test)", "tokens": 500}
+
+        _Crew.calculate_usage_metrics = lambda self: type("U", (), {"total_tokens": 900})()
+        watchdog2 = crew._make_iteration_watchdog(crew.ceo_agent, "Sub-CEO (Test)")
+        watchdog2(None)
+        assert crew._task_usage_log[-1] == {"task": "Sub-CEO (Test)", "tokens": 400}
+    finally:
+        _Crew.calculate_usage_metrics = original_calc
+        crew._task_usage_log.clear()
+        crew._last_cumulative_tokens = original_cumulative
 
 
 def main():
