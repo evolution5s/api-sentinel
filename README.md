@@ -500,7 +500,28 @@ Kontinuierlich zwischen -1 und 1 in 0,1-Schritten. `failure_rate` und
 `read_channel_metrics` real gemessen hat - nie geraten (siehe Kapitel 6).
 `conversions` zählt `evaluate_hypothesis` selbst aus `signups.jsonl`,
 gematcht über `landing_page_variant_id` und einen `submitted_at`-Zeitstempel
-innerhalb von `[created_at, created_at + duration_days]`.
+innerhalb von `[created_at, created_at + duration_days]` (zur Herkunft der
+Signups selbst siehe Kapitel 6.4).
+
+`evaluate_hypothesis(hypothesis_id)` ist reine Leseoperation (persistiert
+selbst nichts, der Sub-CEO ruft danach `write_hypothesis` auf) und lehnt
+mit einem klaren Fehler ab statt zu bewerten, wenn `measured.reach_estimate`
+oder `break_even_users` noch fehlen. Rückgabe: `hypothesis_id`,
+`conversions`, `estimated_reach`, `score`, `verdict`, `outcome`,
+`break_even_users`, `pivot_attempts_so_far`. `verdict`
+(`scoring.verdict_for_score`) ist ein rein menschenlesbares Zusatzlabel
+neben dem eigentlichen `outcome` - dieselben Bandgrenzen wie die
+Score-Klassifikation, aber als Prosa-Text, nicht als das, worauf die
+Vier-Wege-Logik selbst verzweigt (das bleibt `classify_outcome`, Kapitel
+5.3):
+
+| Score-Band | `verdict` |
+|---|---|
+| `>= 0.7` | `strongly validated` |
+| `>= 0.3` | `weakly positive` |
+| `>= -0.3` | `inconclusive` |
+| `>= -0.7` | `weakly negative` |
+| `< -0.7` | `strongly devalidated` |
 
 ### 5.3 Vier-Wege-Outcome (`scoring.classify_outcome`)
 
@@ -768,6 +789,31 @@ drafted --(Mensch postet, Telegram "posted: <id> <url>")--> posted --(optional, 
   gemergter PR eine rein menschliche Tatsache ist, die das System sonst
   nicht beobachten kann.
 
+### 6.4 Signup-Erfassung ohne eigenes Backend (GitHub Issues)
+
+Die Landing Page (`index.html`) hat **keinen** Server, keine Datenbank,
+keinen eigenen API-Endpunkt für Signups - das Formular (`submitForm()`)
+baut aus E-Mail, gewähltem Preis-Tier, Consent-Häkchen, Zeitstempel und der
+fest im HTML stehenden `LANDING_PAGE_VARIANT_ID`-Konstante (pro Variante
+unterschiedlich, z.B. `"lp_v1_default"`) direkt eine vorausgefüllte GitHub-
+"New Issue"-URL
+(`https://github.com/evolution5s/api-sentinel/issues/new?title=...&body=...`,
+Issue-Titel mit dem Präfix `[Signup]`) und leitet den Browser dorthin um.
+Der Mensch klickt auf GitHub selbst noch "Submit new issue" - keine
+serverseitige Logik, kein API-Key im Client nötig, GitHub Issues fungiert
+als kostenloser, öffentlicher Signup-Speicher.
+
+`sync_signups_from_github()` (`tools.py`) holt periodisch alle offenen wie
+geschlossenen Issues mit diesem Titel-Präfix über die **unauthentifizierte**
+GitHub Search API (`in:title "[Signup]" is:issue`, 60 Requests/Stunde ohne
+Token - `GITHUB_TOKEN` erhöht nur das Rate-Limit, ist hierfür nicht
+zwingend), parst den Issue-Body per Regex nach den Feldern `Email:`/`Tier:`/
+`Consent:`/`Timestamp:`/`Variant:` und hängt neue Datensätze (dedupliziert
+über `issue_number`) an `signups.jsonl` an. Wird **automatisch bei jedem
+`read_state()`-Aufruf** ausgeführt (nicht als eigenes Tool exponiert) - ein
+Sync-Fehler landet als Text im `signup_source`-Feld von `read_state()`s
+Antwort statt den Aufruf abzubrechen.
+
 ---
 
 ## 7. Governance-Ebene: Main-CEO / Holding
@@ -800,8 +846,10 @@ Crew/Agenten). Das bleibt separate, menschlich gesteuerte Ingenieursarbeit,
 nachdem eine `request_approval` freigegeben wurde. Seit dem Audit-Addendum
 (Kapitel 15) steht das jetzt auch **auf dem Record selbst**
 (`operative_capability`), nicht nur in der Dokumentation hier: `tools.py`
-hat aktuell genau ein `STATE_DIR` (kein `subsidiary_id`-Feld auf
-`hypotheses.jsonl`/`channels.jsonl`) und `crew.py` verdrahtet genau eine
+hat aktuell genau ein `STATE_DIR`, sogar einen hartcodierten Konstante
+`OWN_SUBSIDIARY_ID = "api-sentinel"` (für `read_subsidiary_policies`-Lookups
+ohne zirkulären Import von `holding.py`) - kein `subsidiary_id`-Feld auf
+`hypotheses.jsonl`/`channels.jsonl` - und `crew.py` verdrahtet genau eine
 `Crew` fest auf `api-sentinel` - eine zweite registrierte Subsidiary hat
 also weder einen eigenen Zustand noch eine eigene Crew, bis das jemand
 separat baut.
@@ -1056,6 +1104,14 @@ der 1-Stunden-Satz - verifiziert direkt im installierten crewai-Paket
 message` stampt `cache_control` ohne explizites `ttl`, was Anthropics
 Default von 5 Minuten ist), nicht angenommen.
 
+USD pro Million Tokens (`pricing.py::PRICING_TABLE`):
+
+| Modell | Base-Input | Cache-Write (5m) | Cache-Write (1h) | Cache-Hit/Read | Output |
+|---|---|---|---|---|---|
+| `claude-haiku-4-5` | 1,00 | 1,25 | 2,00 | 0,10 | 5,00 |
+| `claude-sonnet-5` (vor 2026-09-01) | 2,00 | 2,50 | 4,00 | 0,20 | 10,00 |
+| `claude-sonnet-5` (ab 2026-09-01) | 3,00 | 3,75 | 6,00 | 0,30 | 15,00 |
+
 **Report-Aufbau:** in zwei Telegram-Nachrichten gesplittet.
 `_usage_headline()` steht als eigene, unmissverständliche Zeile
 (`Gesamt-Tokens diesen Zyklus: X (Y% Zyklus-Budget) - Kosten: $Z`) direkt am
@@ -1185,9 +1241,13 @@ die (noch) nicht in crewais hartcodierter `ANTHROPIC_MODELS`-Liste stehen,
 ### 10.6 Patches für bestätigte crewai-Bugs (`crewai_patches.py`)
 
 `apply_patches()` wird in `crew.py` **vor** jeder Agent-/Task-Konstruktion
-aufgerufen. Aktuell ein Patch:
+aufgerufen (`crewai_patches.apply_patches()`, ganz oben in `crew.py`, noch
+vor dem `from tools import ...`). Aktuell **zwei** Patches, beide defensiv
+implementiert: ändert sich crewais interne Struktur, überspringt
+`apply_patches()` den betroffenen Patch mit einer Log-Warnung statt beim
+Import zu crashen.
 
-**`_patch_max_iterations_final_answer_role`** - wenn ein Agent `max_iter`
+**1) `_patch_max_iterations_final_answer_role`** - wenn ein Agent `max_iter`
 erreicht, versucht crewai eine finale Antwort zu erzwingen, indem es die
 entsprechende Anweisung als **assistant**-Rolle-Nachricht anhängt und als
 letzte Nachricht der Conversation verschickt. Jedes aktuelle Claude-Modell
@@ -1201,9 +1261,28 @@ die sie über ein eigenes `from ... import` referenzieren
 `crewai.experimental.agent_executor`) - nur die Ursprungsdefinition in
 `crewai.utilities.agent_utils` zu patchen hätte sich **nicht** propagiert.
 Verifiziert gegen eine Fake-LLM sowohl vor (Rolle war `"assistant"`) als
-auch nach dem Patch (Rolle ist `"user"`). Defensiv implementiert: Ändert
-sich crewais interne Struktur, überspringt `apply_patches()` diesen Patch
-mit einer Log-Warnung statt beim Import zu crashen.
+auch nach dem Patch (Rolle ist `"user"`).
+
+**2) `_patch_disable_strict_tool_schemas`** - `convert_tools_to_openai_
+schema()` bäckt unbedingt `"strict": True` in jedes Tool-Schema, ohne
+Opt-out pro Tool/Agent. Anthropics natives Tool-Use erzwingt einen harten
+Deckel von 20 "strict"-Tools pro Request und lehnt den gesamten Aufruf mit
+einem 400 ab, sobald ein einzelner Agent 21+ Tools hat ("Too many strict
+tools (21). The maximum number of strict tools supported is 20.") - kein
+Randfall, sondern eine Schwelle, die dieses Repos eigene Agenten mit der
+Zeit zwangsläufig überschreiten (in Produktion reproduziert: `ceo_agent`
+überschritt 20 Tools, jeder ihm zugewiesene Task scheiterte komplett an
+`crew.kickoff()`). Der Patch entfernt das `"strict"`-Flag, nachdem crewai
+jedes Tool-Schema gebaut hat, an beiden Referenzstellen
+(`crewai.utilities.agent_utils` und `crewai.agents.crew_agent_executor`).
+Unproblematisch, weil jedes Tool in diesem Repo seine eigenen Argumente
+bereits selbst validiert und einen JSON-Fehler statt eines Absturzes bei
+schlechtem Input zurückgibt (siehe `tools.py`/`holding.py`) - Anthropics
+providerseitige Strict-Schema-Durchsetzung abzuschalten nimmt hier also kein
+echtes Sicherheitsnetz weg, nur eine künstliche Obergrenze für die
+Tool-Anzahl pro Agent. `ceo_agent` hat inzwischen 25 Tools (Kapitel 3.3) -
+ohne diesen Patch wäre der Zyklus bereits an der 21-Tool-Schwelle
+zerbrochen.
 
 ### 10.7 Versionsverifikation
 
