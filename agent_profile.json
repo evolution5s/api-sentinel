@@ -6,8 +6,8 @@
       "model": "claude-haiku-4-5",
       "cycle_token_budget": 50000,
       "agents": {
-        "growth": {"max_tokens": 500, "max_iter": 6, "max_execution_time": 120},
-        "dev": {"max_tokens": 500, "max_iter": 4, "max_execution_time": 90},
+        "growth": {"max_tokens": 900, "max_iter": 9, "max_execution_time": 120},
+        "dev": {"max_tokens": 2000, "max_iter": 6, "max_execution_time": 90},
         "sub_ceo": {"max_tokens": 800, "max_iter": 15, "max_execution_time": 240},
         "main_ceo": {"max_tokens": 500, "max_iter": 6, "max_execution_time": 120}
       }

@@ -433,7 +433,7 @@ def test_check_approval_status_reflects_real_state():
     reset_state()
     appr = json.loads(tools.request_approval.run(category="deploy", proposal="p", reasoning="r"))
     result = json.loads(tools.check_approval_status.run(approval_id=appr["queued"]))
-    assert result == {"id": appr["queued"], "status": "pending", "category": "deploy"}
+    assert result == {"id": appr["queued"], "status": "pending", "category": "deploy", "payment_link_url": None}
 
     approvals = tools._read_jsonl("approval_queue.jsonl")
     approvals[0]["status"] = "approved"
@@ -456,7 +456,7 @@ def test_file_and_read_task_order():
     reset_state()
     filed = json.loads(tools.file_task_order.run(
         to_role="dev", task_description="build variant for hyp_x", context="build outcome",
-        hypothesis_id="hyp_x",
+        hypothesis_id="hyp_x", stage_justification="evidence-stage gate test bypass",
     ))
     assert "filed" in filed
     open_orders = json.loads(tools.read_task_orders.run(to_role="dev", status="open"))
@@ -1423,6 +1423,117 @@ def test_write_hypothesis_defaults_new_optional_fields():
     assert stored["pricing_tier_reasoning"] is None
     assert stored["expansion_notes"] is None
     assert stored["channel_fit_reasoning"] is None
+    assert stored["evidence_stage"] is None
+    assert stored["payment_intent_approval_id"] is None
+
+
+# --- tools.py: evidence-stage ladder (Dev/Growth-limits addendum) -----------
+
+def test_write_hypothesis_evidence_stage_rejects_invalid_value():
+    reset_state()
+    result = json.loads(tools.write_hypothesis.run(
+        hypothesis=json.dumps({**SAMPLE_HYP, "evidence_stage": "not_a_real_stage"})
+    ))
+    assert "error" in result
+
+
+def test_write_hypothesis_evidence_stage_accepts_each_valid_value():
+    reset_state()
+    for stage in tools.EVIDENCE_STAGES:
+        hyp_id = f"hyp_stage_{stage}"
+        # status='evaluated' sidesteps MAX_ACTIVE_HYPOTHESES/parallelism (both
+        # only apply to status='active') - irrelevant to what's under test here.
+        result = json.loads(tools.write_hypothesis.run(
+            hypothesis=json.dumps({**SAMPLE_HYP, "id": hyp_id, "status": "evaluated", "evidence_stage": stage})
+        ))
+        assert "error" not in result, result
+        stored = next(h for h in json.loads(tools.read_hypotheses.run()) if h["id"] == hyp_id)
+        assert stored["evidence_stage"] == stage
+
+
+def test_write_hypothesis_evidence_stage_update_accepts_null():
+    reset_state()
+    tools.write_hypothesis.run(hypothesis=json.dumps({**SAMPLE_HYP, "evidence_stage": "research"}))
+    result = json.loads(tools.write_hypothesis.run(
+        hypothesis=json.dumps({"id": SAMPLE_HYP["id"], "evidence_stage": "landing_page"})
+    ))
+    assert "error" not in result
+    stored = json.loads(tools.read_hypotheses.run())[0]
+    assert stored["evidence_stage"] == "landing_page"
+
+
+# --- tools.py: file_task_order dev-stage gate --------------------------------
+
+def test_file_task_order_dev_gate_rejects_without_stage_or_justification():
+    reset_state()
+    tools.write_hypothesis.run(hypothesis=json.dumps(SAMPLE_HYP))  # evidence_stage still None
+    result = json.loads(tools.file_task_order.run(
+        to_role="dev", task_description="build landing page", context="first test",
+        hypothesis_id=SAMPLE_HYP["id"],
+    ))
+    assert "error" in result
+    assert json.loads(tools.read_task_orders.run(to_role="dev", status="open")) == []
+
+
+def test_file_task_order_dev_gate_accepts_with_landing_page_stage():
+    reset_state()
+    tools.write_hypothesis.run(hypothesis=json.dumps({**SAMPLE_HYP, "evidence_stage": "landing_page"}))
+    result = json.loads(tools.file_task_order.run(
+        to_role="dev", task_description="build landing page", context="first test",
+        hypothesis_id=SAMPLE_HYP["id"],
+    ))
+    assert "filed" in result, result
+
+
+def test_file_task_order_dev_gate_accepts_with_build_stage():
+    reset_state()
+    tools.write_hypothesis.run(hypothesis=json.dumps({**SAMPLE_HYP, "evidence_stage": "build"}))
+    result = json.loads(tools.file_task_order.run(
+        to_role="dev", task_description="build the real product", context="build outcome",
+        hypothesis_id=SAMPLE_HYP["id"],
+    ))
+    assert "filed" in result, result
+
+
+def test_file_task_order_dev_gate_accepts_with_explicit_justification():
+    reset_state()
+    tools.write_hypothesis.run(hypothesis=json.dumps(SAMPLE_HYP))  # evidence_stage still None
+    result = json.loads(tools.file_task_order.run(
+        to_role="dev", task_description="build landing page", context="first test",
+        hypothesis_id=SAMPLE_HYP["id"],
+        stage_justification="cheapest sufficient test is a landing page here, no cheaper step applies",
+    ))
+    assert "filed" in result, result
+    stored = json.loads(tools.read_task_orders.run(to_role="dev"))[0]
+    assert stored["stage_justification"] == "cheapest sufficient test is a landing page here, no cheaper step applies"
+
+
+def test_file_task_order_dev_gate_ignores_unknown_hypothesis_without_justification():
+    reset_state()
+    # hypothesis_id doesn't exist at all - stage resolves to None, same as an
+    # early-stage hypothesis, so it's rejected the same way, not a crash.
+    result = json.loads(tools.file_task_order.run(
+        to_role="dev", task_description="build variant", context="ctx", hypothesis_id="hyp_does_not_exist",
+    ))
+    assert "error" in result
+
+
+def test_file_task_order_dev_gate_does_not_apply_without_hypothesis_id():
+    reset_state()
+    # a Dev task with no hypothesis_id at all (rare, but not this gate's concern)
+    result = json.loads(tools.file_task_order.run(
+        to_role="dev", task_description="general maintenance", context="ctx",
+    ))
+    assert "filed" in result, result
+
+
+def test_file_task_order_dev_gate_does_not_apply_to_growth():
+    reset_state()
+    tools.write_hypothesis.run(hypothesis=json.dumps(SAMPLE_HYP))  # evidence_stage still None
+    result = json.loads(tools.file_task_order.run(
+        to_role="growth", task_description="draft a post", context="ctx", hypothesis_id=SAMPLE_HYP["id"],
+    ))
+    assert "filed" in result, result
 
 
 # --- tools.py: cross-cycle continuity + usage log ---------------------------
@@ -1628,6 +1739,14 @@ def test_classify_command_removed():
     )
 
 
+def test_classify_command_payment_link():
+    assert tools._classify_command("payment_link: appr_ab12cd34 https://buy.stripe.com/xyz", "") == (
+        "payment_link", ("appr_ab12cd34", "https://buy.stripe.com/xyz")
+    )
+    assert tools._classify_command("payment_link: no approval id here", "") is None
+    assert tools._classify_command("payment_link: appr_ab12cd34", "") is None  # no url
+
+
 def test_apply_telegram_commands_pause_and_resume():
     reset_state()
     had_token = os.environ.pop("TELEGRAM_BOT_TOKEN", None)
@@ -1713,6 +1832,51 @@ def test_apply_telegram_commands_posted_and_removed_mark_draft():
         assert any("entfernt" in entry for entry in log)
         stored = next(d for d in tools._read_jsonl("content_drafts.jsonl") if d["id"] == draft_id)
         assert stored["status"] == "removed" and stored["removed"] is True and stored["removed_reason"] == "mod took it down"
+    finally:
+        if had_token is not None:
+            os.environ["TELEGRAM_BOT_TOKEN"] = had_token
+        if had_chat is not None:
+            os.environ["TELEGRAM_CHAT_ID"] = had_chat
+
+
+def test_apply_telegram_commands_payment_link_requires_approved_status():
+    reset_state()
+    had_token = os.environ.pop("TELEGRAM_BOT_TOKEN", None)
+    had_chat = os.environ.pop("TELEGRAM_CHAT_ID", None)
+    try:
+        appr = json.loads(tools.request_approval.run(category="spend", proposal="payment link", reasoning="r"))
+        approval_id = appr["queued"]  # still 'pending', not yet approved
+
+        log = tools._apply_telegram_commands([{
+            "text": f"payment_link: {approval_id} https://buy.stripe.com/xyz", "reply_to_text": "",
+        }])
+        assert log == []
+        stored = next(r for r in tools._read_jsonl("approval_queue.jsonl") if r["id"] == approval_id)
+        assert stored.get("payment_link_url") is None
+    finally:
+        if had_token is not None:
+            os.environ["TELEGRAM_BOT_TOKEN"] = had_token
+        if had_chat is not None:
+            os.environ["TELEGRAM_CHAT_ID"] = had_chat
+
+
+def test_apply_telegram_commands_payment_link_sets_url_once_approved():
+    reset_state()
+    had_token = os.environ.pop("TELEGRAM_BOT_TOKEN", None)
+    had_chat = os.environ.pop("TELEGRAM_CHAT_ID", None)
+    try:
+        appr = json.loads(tools.request_approval.run(category="spend", proposal="payment link", reasoning="r"))
+        approval_id = appr["queued"]
+        approvals = tools._read_jsonl("approval_queue.jsonl")
+        approvals[0]["status"] = "approved"
+        tools._write_jsonl("approval_queue.jsonl", approvals)
+
+        log = tools._apply_telegram_commands([{
+            "text": f"payment_link: {approval_id} https://buy.stripe.com/xyz", "reply_to_text": "",
+        }])
+        assert any("payment_link_url gesetzt" in entry for entry in log)
+        result = json.loads(tools.check_approval_status.run(approval_id=approval_id))
+        assert result["payment_link_url"] == "https://buy.stripe.com/xyz"
     finally:
         if had_token is not None:
             os.environ["TELEGRAM_BOT_TOKEN"] = had_token
@@ -1811,6 +1975,12 @@ def test_register_subsidiary_succeeds_once_approved():
     assert result["policies"] == holding.SUBSIDIARY_POLICY_DEFAULTS
     subs = json.loads(holding.read_subsidiaries.run())
     assert {s["id"] for s in subs} == {"api-sentinel", "second-co"}
+    new_sub = next(s for s in subs if s["id"] == "second-co")
+    # Audit addendum, section 4: register_subsidiary only ever creates a
+    # registry row - it must say so plainly on the record itself, not just
+    # in its own docstring, so nothing downstream can miss it.
+    assert new_sub["operative_capability"] == holding.NEW_SUBSIDIARY_CAPABILITY_NOTE
+    assert new_sub["state_dir"] is None
 
 
 def test_register_subsidiary_rejects_duplicate_id():
@@ -1988,6 +2158,91 @@ def test_resolve_cross_subsidiary_request_does_not_reresolve():
     ))
     holding.resolve_cross_subsidiary_request.run(request_id=filed["filed"], decision="rejected")
     result = json.loads(holding.resolve_cross_subsidiary_request.run(request_id=filed["filed"], decision="approved"))
+    assert "error" in result
+
+
+# --- holding.py: idea intake and Main-CEO routing ---------------------------
+
+def test_propose_idea_requires_nonempty_summary():
+    reset_state()
+    result = json.loads(holding.propose_idea.run(summary="", source="api-sentinel", reasoning="r"))
+    assert "error" in result
+
+
+def test_propose_and_read_ideas_roundtrip():
+    reset_state()
+    filed = json.loads(holding.propose_idea.run(
+        summary="Freqtrade users also want backtest-result sharing",
+        source="api-sentinel", reasoning="came up repeatedly in community engagement",
+    ))
+    assert "filed" in filed
+    pending = json.loads(holding.read_ideas.run(status="pending"))
+    assert len(pending) == 1
+    assert pending[0]["id"] == filed["filed"]
+    assert pending[0]["status"] == "pending"
+    assert pending[0]["source"] == "api-sentinel"
+
+    routed = json.loads(holding.read_ideas.run(status="routed"))
+    assert routed == []
+    assert json.loads(holding.read_ideas.run()) == pending  # "" returns all, same as pending here
+
+
+def test_route_idea_rejects_invalid_decision():
+    reset_state()
+    filed = json.loads(holding.propose_idea.run(summary="s", source="main_ceo", reasoning="r"))
+    result = json.loads(holding.route_idea.run(idea_id=filed["filed"], decision="maybe_later", reasoning="r"))
+    assert "error" in result
+
+
+def test_route_idea_existing_subsidiary_requires_target():
+    reset_state()
+    filed = json.loads(holding.propose_idea.run(summary="s", source="main_ceo", reasoning="r"))
+    result = json.loads(holding.route_idea.run(idea_id=filed["filed"], decision="existing_subsidiary", reasoning="r"))
+    assert "error" in result
+
+
+def test_route_idea_existing_subsidiary_rejects_unknown_target():
+    reset_state()
+    filed = json.loads(holding.propose_idea.run(summary="s", source="main_ceo", reasoning="r"))
+    result = json.loads(holding.route_idea.run(
+        idea_id=filed["filed"], decision="existing_subsidiary", reasoning="r",
+        target_subsidiary_id="does-not-exist",
+    ))
+    assert "error" in result
+
+
+def test_route_idea_existing_subsidiary_succeeds():
+    reset_state()
+    holding.read_subsidiaries.run()  # bootstraps api-sentinel
+    filed = json.loads(holding.propose_idea.run(summary="s", source="main_ceo", reasoning="r"))
+    result = json.loads(holding.route_idea.run(
+        idea_id=filed["filed"], decision="existing_subsidiary", reasoning="fits api-sentinel's focus",
+        target_subsidiary_id="api-sentinel",
+    ))
+    assert result["ok"] is True and result["decision"] == "existing_subsidiary"
+    stored = json.loads(holding.read_ideas.run(status="routed"))[0]
+    assert stored["target_subsidiary_id"] == "api-sentinel"
+    assert stored["routing_reasoning"] == "fits api-sentinel's focus"
+
+
+def test_route_idea_new_subsidiary_and_rejected_do_not_require_target():
+    reset_state()
+    idea_a = json.loads(holding.propose_idea.run(summary="a", source="main_ceo", reasoning="r"))
+    idea_b = json.loads(holding.propose_idea.run(summary="b", source="main_ceo", reasoning="r"))
+    result_a = json.loads(holding.route_idea.run(
+        idea_id=idea_a["filed"], decision="new_subsidiary", reasoning="doesn't fit any existing focus",
+    ))
+    result_b = json.loads(holding.route_idea.run(
+        idea_id=idea_b["filed"], decision="rejected", reasoning="not worth pursuing",
+    ))
+    assert result_a["ok"] is True and result_b["ok"] is True
+
+
+def test_route_idea_does_not_reroute():
+    reset_state()
+    filed = json.loads(holding.propose_idea.run(summary="s", source="main_ceo", reasoning="r"))
+    holding.route_idea.run(idea_id=filed["filed"], decision="rejected", reasoning="r")
+    result = json.loads(holding.route_idea.run(idea_id=filed["filed"], decision="rejected", reasoning="again"))
     assert "error" in result
 
 
@@ -2225,6 +2480,26 @@ def test_load_agent_profile_returns_the_active_one():
     assert profile["model"] == config["profiles"][config["active_profile"]]["model"]
 
 
+def test_testing_profile_dev_limits_raised_past_confirmed_stall_floor():
+    # Confirmed via real Railway cycle logs (audit addendum): Dev hit
+    # "Maximum iterations reached" every cycle it ran under max_iter=4/
+    # max_tokens=500, always mid-way through open_pull_request missing
+    # file_content - structurally impossible to complete a landing-page
+    # build in that budget. These floors keep it from silently regressing
+    # back to a value too small for a real build to ever finish.
+    with open(crew._AGENT_PROFILE_FILE, encoding="utf-8") as f:
+        config = json.load(f)
+    dev_cfg = config["profiles"]["testing"]["agents"]["dev"]
+    assert dev_cfg["max_tokens"] >= 1500, dev_cfg
+    assert dev_cfg["max_iter"] >= 6, dev_cfg
+    growth_cfg = config["profiles"]["testing"]["agents"]["growth"]
+    # Growth's own realistic minimum tool-call count for one full task
+    # (read_task_orders, read_hypotheses, check_community_risk,
+    # get_account_stats, draft_content, request_approval, complete_task_order
+    # = 7) already exceeds the old cap of 6.
+    assert growth_cfg["max_iter"] >= 7, growth_cfg
+
+
 def test_agents_are_configured_from_the_active_profile():
     profile = crew.AGENT_PROFILE
     assert crew.growth_llm.max_tokens == profile["agents"]["growth"]["max_tokens"]
@@ -2257,7 +2532,7 @@ def test_ceo_agent_tools_match_spec():
         "file_status_report", "read_strategic_direction",
         "file_pivot_proposal", "file_cross_subsidiary_request", "search_research_archive",
         "read_subsidiary_policies", "read_content_drafts", "log_research_finding", "read_research_findings",
-        "read_knowledge_base", "write_knowledge_entry",
+        "read_knowledge_base", "write_knowledge_entry", "propose_idea",
     }, tool_names
 
 
@@ -2271,6 +2546,7 @@ def test_main_ceo_agent_tools_match_spec():
         "read_strategic_direction", "assess_subsidiary_trajectory",
         "search_research_archive", "request_approval",
         "read_subsidiary_policies", "update_subsidiary_policies",
+        "propose_idea", "read_ideas", "route_idea",
     }, tool_names
 
 
@@ -2279,7 +2555,7 @@ def test_growth_dev_tools():
         "request_approval", "read_channel_metrics", "read_channels", "read_state", "read_hypotheses",
         "read_task_orders", "complete_task_order", "draft_content", "read_content_drafts",
         "check_community_risk", "get_account_stats", "log_research_finding", "read_research_findings",
-        "read_subsidiary_policies", "read_knowledge_base",
+        "read_subsidiary_policies", "read_knowledge_base", "propose_idea",
     }
     assert {t.name for t in crew.dev_agent.tools} == {
         "open_pull_request", "read_task_orders", "complete_task_order", "check_approval_status",

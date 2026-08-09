@@ -61,6 +61,17 @@ HYPOTHESIS_STATUSES = {"active", "evaluated", "buried"}
 # too many hypotheses at once is the more common failure than picking the
 # wrong one first (four-fixes addendum, point 4).
 MAX_ACTIVE_HYPOTHESES = 3
+# Evidence-stage ladder (audit addendum): ordered from cheapest/weakest to
+# most expensive/strongest signal. Tracked per-hypothesis via the optional
+# evidence_stage field (write_hypothesis) - not required on every hypothesis
+# (the bootstrap hypothesis and any other legitimate straight-to-landing-page
+# test stay valid without one), but file_task_order's dev-stage gate below
+# checks it: ordering real Dev work (a landing page or, later, the actual
+# build) without having recorded progression through research/community_
+# engagement first requires an explicit stage_justification instead - an
+# auditable choice, not a silent default, same self-declared-and-trusted
+# pattern as pivot_reasoning/primary_variable_tested elsewhere in this file.
+EVIDENCE_STAGES = ["research", "community_engagement", "landing_page", "build"]
 # AI-native economics addendum: this system's builds happen via Dev-agent
 # LLM calls, not a human dev team or agency - a landing page/signup form/
 # small webhook should cost token spend (very low single digits), not
@@ -259,6 +270,19 @@ def request_approval(category: str, proposal: str, reasoning: str) -> str:
     publicly visible. The request is written with status "pending" and sits
     there until a human reviews it via approve.py; this tool never executes
     anything itself.
+
+    Payment-intent test requests use category='spend': when a hypothesis
+    would benefit from testing real willingness-to-pay (a pre-order/deposit
+    on the landing page) rather than only an interest/email signal, file one
+    here describing the price point and what kind of pre-order/deposit is
+    wanted - never set up a payment processor/link directly, that stays a
+    human-only step (same tier as DNS/contracts/new logins), same as this
+    tool for every other category. Once approved, a human replies via
+    Telegram ("payment_link: <appr_id> <url>") with the actual link; poll
+    check_approval_status(approval_id) for payment_link_url rather than
+    assuming it exists just because status='approved'. Put the confirmed URL
+    literally in the follow-up file_task_order to Dev, same as any other
+    concrete artifact (never a paraphrase).
     """
     if category not in APPROVAL_CATEGORIES:
         return json.dumps({
@@ -284,6 +308,12 @@ def check_approval_status(approval_id: str) -> str:
     by Dev to verify a Build-outcome approval actually exists and is
     status='approved' before opening a PR for it - never take the CEO's
     report's word for that alone.
+
+    payment_link_url is only present once a human has actually provisioned
+    one and confirmed it via the Telegram "payment_link: <id> <url>" reply
+    (see request_approval's payment-intent-test guidance) - null until then,
+    even if status is already 'approved'. This system never creates payment
+    infrastructure itself; it only asks a human to hand one back.
     """
     approvals = _read_jsonl("approval_queue.jsonl")
     approval = next((a for a in approvals if a.get("id") == approval_id), None)
@@ -293,6 +323,7 @@ def check_approval_status(approval_id: str) -> str:
         "id": approval["id"],
         "status": approval.get("status"),
         "category": approval.get("category"),
+        "payment_link_url": approval.get("payment_link_url"),
     })
 
 
@@ -422,6 +453,15 @@ def write_hypothesis(hypothesis: str) -> str:
     Setting status="buried" requires a non-empty bury_reasoning - buried
     hypotheses are never deleted, only marked, so the reasoning has to be
     on the record for whoever revisits it later.
+
+    Optional evidence_stage (one of EVIDENCE_STAGES: research,
+    community_engagement, landing_page, build) records how far this
+    hypothesis has actually progressed through the evidence ladder - not
+    required here, but file_task_order's dev-stage gate reads it before
+    letting a Dev task order through. Optional payment_intent_approval_id
+    links this hypothesis to a request_approval(category='spend') entry
+    once a real payment-intent (pre-order/deposit) test has been requested
+    for it - see draft/task_ceo guidance for when that's warranted.
     """
     try:
         patch = json.loads(hypothesis)
@@ -442,6 +482,10 @@ def write_hypothesis(hypothesis: str) -> str:
     if "outcome" in patch and patch["outcome"] is not None and patch["outcome"] not in scoring.HYPOTHESIS_OUTCOMES:
         return json.dumps({
             "error": f"invalid outcome '{patch['outcome']}', must be one of {sorted(scoring.HYPOTHESIS_OUTCOMES)} or null"
+        })
+    if "evidence_stage" in patch and patch["evidence_stage"] is not None and patch["evidence_stage"] not in EVIDENCE_STAGES:
+        return json.dumps({
+            "error": f"invalid evidence_stage '{patch['evidence_stage']}', must be one of {EVIDENCE_STAGES} or null"
         })
     if patch.get("status") == "buried" and not (patch.get("bury_reasoning") or "").strip():
         return json.dumps({"error": "status='buried' requires a non-empty bury_reasoning"})
@@ -564,6 +608,8 @@ def write_hypothesis(hypothesis: str) -> str:
             "sample_size_trigger": None,
             "primary_variable_tested": None,
             "holding_constant_notes": None,
+            "evidence_stage": None,
+            "payment_intent_approval_id": None,
             **patch,
         }
         hyps.append(record)
@@ -837,16 +883,43 @@ TASK_ORDER_ROLES = {"growth", "dev"}
 
 
 @tool("file_task_order")
-def file_task_order(to_role: str, task_description: str, context: str, hypothesis_id: str = "") -> str:
+def file_task_order(
+    to_role: str, task_description: str, context: str, hypothesis_id: str = "",
+    stage_justification: str = "",
+) -> str:
     """Sub-CEO hands a concrete task to Growth or Dev as a fixed record,
     instead of leaving it to be inferred from free-text task output.
     to_role must be "growth" or "dev". task_description is the concrete ask
     (e.g. "build landing page variant for hyp_x123, testing a $15/mo price
     point"); context is the why. Pass hypothesis_id whenever this task
     ties back to one - most do.
+
+    Evidence-stage gate (to_role="dev" with a hypothesis_id only): Dev work
+    is real cost committed on a hypothesis, so this is rejected unless
+    either (a) that hypothesis's evidence_stage (read_hypotheses) already
+    shows real prior progression - "landing_page" or "build" - meaning a
+    cheaper research/community_engagement step already ran or was
+    deliberately not needed, or (b) a non-empty stage_justification explains
+    why going straight to Dev work is the right call here anyway (e.g. "this
+    is the very first test for a brand-new subsidiary, a landing page is
+    already the cheapest sufficient test for this question"). This is an
+    auditable choice, not a hard block - a genuinely cheap landing-page-first
+    test (this system's default pattern) is always valid with a one-line
+    reason, it just can't be silent.
     """
     if to_role not in TASK_ORDER_ROLES:
         return json.dumps({"error": f"invalid to_role '{to_role}', must be one of {sorted(TASK_ORDER_ROLES)}"})
+    if to_role == "dev" and hypothesis_id and not stage_justification.strip():
+        hyp = next((h for h in _read_jsonl("hypotheses.jsonl") if h.get("id") == hypothesis_id), None)
+        stage = hyp.get("evidence_stage") if hyp else None
+        if stage not in ("landing_page", "build"):
+            return json.dumps({
+                "error": f"hypothesis '{hypothesis_id}' has evidence_stage={stage!r}, not yet "
+                         "'landing_page'/'build' - either record real progression through "
+                         "research/community_engagement first (write_hypothesis evidence_stage), "
+                         "or pass a non-empty stage_justification explaining why committing Dev "
+                         "work now is the right call for this specific hypothesis"
+            })
     record = {
         "id": f"order_{uuid.uuid4().hex[:8]}",
         "created_at": datetime.now(timezone.utc).isoformat(),
@@ -855,6 +928,7 @@ def file_task_order(to_role: str, task_description: str, context: str, hypothesi
         "hypothesis_id": hypothesis_id or None,
         "task_description": task_description,
         "context": context,
+        "stage_justification": stage_justification or None,
         "status": "open",
         "result": None,
     }
@@ -1740,14 +1814,18 @@ def _classify_command(text: str, reply_to_text: str):
       actually posted a draft from content_drafts.jsonl.
     - "removed": payload is (draft_id, reason) - a human confirming a
       previously-posted draft got taken down, feeding check_community_risk.
+    - "payment_link": payload is (approval_id, url) - a human confirming
+      they've provisioned the actual payment processor/link for a
+      category='spend' payment-intent-test request and handing the URL back.
 
     Two ways to approve/reject: reply directly to the notification message
     that announced the pending approval (matched via the appr_... id in
     reply_to_text), or type "<id> approve"/"<id> reject" directly if that
     original message has scrolled out of view. "live:"/"posted:"/
-    "removed:" are always typed directly (there's no single notification
-    message to reply to for those), as "live: <hypothesis_id>",
-    "posted: <draft_id> <url>", "removed: <draft_id> <reason>".
+    "removed:"/"payment_link:" are always typed directly (there's no single
+    notification message to reply to for those), as "live: <hypothesis_id>",
+    "posted: <draft_id> <url>", "removed: <draft_id> <reason>",
+    "payment_link: <appr_id> <url>".
     """
     normalized = text.strip().lower()
 
@@ -1788,6 +1866,14 @@ def _classify_command(text: str, reply_to_text: str):
             return None
         reason = rest[draft_match.end():].strip() or "removed (no reason given)"
         return "removed", (draft_match.group(0), reason)
+
+    if normalized.startswith("payment_link:"):
+        rest = text.split(":", 1)[1].strip()
+        approval_match = _APPROVAL_ID_RE.search(rest)
+        if not approval_match:
+            return None
+        url = rest[approval_match.end():].strip()
+        return ("payment_link", (approval_match.group(0), url)) if url else None
 
     return None
 
@@ -1863,6 +1949,26 @@ def _apply_telegram_commands(messages: list) -> list:
             _write_jsonl("content_drafts.jsonl", drafts)
             log.append(f"{draft_id} als entfernt markiert (Telegram)")
             send_telegram_message(f"{draft_id}: als entfernt markiert ({reason}).")
+            continue
+
+        if action == "payment_link":
+            approval_id, url = target_id
+            approvals = _read_jsonl("approval_queue.jsonl")
+            idx = next((i for i, a in enumerate(approvals) if a.get("id") == approval_id), None)
+            if idx is None:
+                send_telegram_message(f"Keine Freigabe-Anfrage mit id '{approval_id}' gefunden.")
+                continue
+            if approvals[idx].get("status") != "approved":
+                send_telegram_message(
+                    f"{approval_id} hat status='{approvals[idx].get('status')}', nicht 'approved' - "
+                    "erst freigeben, bevor ein Payment-Link hinterlegt wird."
+                )
+                continue
+            approvals[idx]["payment_link_url"] = url
+            approvals[idx]["payment_link_set_at"] = datetime.now(timezone.utc).isoformat()
+            _write_jsonl("approval_queue.jsonl", approvals)
+            log.append(f"{approval_id} payment_link_url gesetzt (Telegram)")
+            send_telegram_message(f"{approval_id}: Payment-Link hinterlegt ({url}).")
             continue
 
         if records is None:

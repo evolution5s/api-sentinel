@@ -61,7 +61,9 @@ from holding import (
     file_cross_subsidiary_request,
     file_pivot_proposal,
     file_status_report,
+    propose_idea,
     read_cross_subsidiary_requests,
+    read_ideas,
     read_pivot_proposals,
     read_status_reports,
     read_strategic_direction,
@@ -69,6 +71,7 @@ from holding import (
     read_subsidiary_policies,
     register_subsidiary,
     resolve_cross_subsidiary_request,
+    route_idea,
     search_research_archive,
     set_strategic_direction,
     set_subsidiary_status,
@@ -182,14 +185,17 @@ growth_agent = Agent(
         "resource - finishing correctly in as few tool calls as the task "
         "genuinely needs is the actual goal; max_iter/max_rpm/the cycle "
         "budget are a hard ceiling against runaway cost, not a target to "
-        "use up."
+        "use up. If community engagement surfaces a genuine market gap "
+        "outside this hypothesis's own scope - not just a variation on it - "
+        "call propose_idea to hand it to the Main-CEO rather than folding it "
+        "into work here unasked."
     ),
     llm=growth_llm,
     tools=[
         request_approval, read_channel_metrics, read_channels, read_state, read_hypotheses,
         read_task_orders, complete_task_order, draft_content, read_content_drafts,
         check_community_risk, get_account_stats, log_research_finding, read_research_findings,
-        read_subsidiary_policies, read_knowledge_base,
+        read_subsidiary_policies, read_knowledge_base, propose_idea,
     ],
     max_iter=AGENT_PROFILE["agents"]["growth"]["max_iter"],
     max_execution_time=AGENT_PROFILE["agents"]["growth"]["max_execution_time"],
@@ -308,7 +314,35 @@ ceo_agent = Agent(
         "channel, checking whether it already exists (read_channels) "
         "avoids wasted, near-duplicate write_channel calls - the same "
         "channel written twice under two different ids is exactly the kind "
-        "of avoidable waste this applies to."
+        "of avoidable waste this applies to. At every evidence-stage "
+        "decision (evidence_stage on write_hypothesis: research -> "
+        "community_engagement -> landing_page -> build), the real question "
+        "is never just 'what stage comes next' but 'what's the cheapest "
+        "test that would actually resolve this uncertainty' - a desk-"
+        "research check (log_research_finding/read_research_findings) or a "
+        "genuine community question can sometimes settle something a full "
+        "landing page would otherwise be asked to answer, and skipping "
+        "straight to Dev work costs real tokens/iterations for a signal a "
+        "cheaper step might have already given. file_task_order's dev-stage "
+        "gate enforces the audit trail for this (evidence_stage progression "
+        "or a stage_justification), not the judgment itself - that judgment "
+        "call is this role's own to make each time, not something to satisfy "
+        "mechanically. Most hypotheses will still legitimately go straight "
+        "to a landing page - that's this system's own proven default, not "
+        "something to second-guess reflexively - but it should be a "
+        "considered choice, not a skipped one. For a hypothesis where real "
+        "willingness-to-pay (not just interest) would meaningfully "
+        "strengthen the landing-page-stage signal, a genuine payment-intent "
+        "test (pre-order/deposit instead of or alongside email capture) is "
+        "available - never provisions a payment processor/link directly "
+        "(that's always request_approval(category='spend'), a human-only "
+        "step this role has no access to, same as any other spend), only "
+        "requests one and waits for check_approval_status to show a real "
+        "payment_link_url before referencing it in a file_task_order to "
+        "Dev. If something surfaces that's a genuine market gap outside "
+        "this subsidiary's own focus - not a variation on the current "
+        "hypothesis - propose_idea hands it to the Main-CEO instead of "
+        "chasing it here unasked."
     ),
     llm=ceo_llm,
     tools=[
@@ -319,7 +353,7 @@ ceo_agent = Agent(
         file_status_report, read_strategic_direction,
         file_pivot_proposal, file_cross_subsidiary_request, search_research_archive,
         read_subsidiary_policies, read_content_drafts, log_research_finding, read_research_findings,
-        read_knowledge_base, write_knowledge_entry,
+        read_knowledge_base, write_knowledge_entry, propose_idea,
     ],
     max_iter=AGENT_PROFILE["agents"]["sub_ceo"]["max_iter"],
     max_execution_time=AGENT_PROFILE["agents"]["sub_ceo"]["max_execution_time"],
@@ -393,11 +427,23 @@ main_ceo_agent = Agent(
         "register_subsidiary; every subsidiary starts conservative "
         "(everything off/low) by default and only loosens with a real, "
         "board-approved reason, never because a Sub-CEO would find it "
-        "convenient. Tokens and iterations are a real, metered cost, not a "
-        "free resource - finishing correctly in as few tool calls as the "
-        "task genuinely needs is the actual goal; max_iter/max_rpm/the "
-        "cycle budget are a hard ceiling against runaway cost, not a "
-        "target to use up."
+        "convenient. Reviews pending ideas (read_ideas) - proposed by any "
+        "agent, not just Sub-CEOs - every cycle and routes each one "
+        "(route_idea): into an existing active subsidiary's strategic "
+        "direction, toward a new one (still gated by the same request_"
+        "approval + register_subsidiary discipline as any other spin-off - "
+        "route_idea itself only records the decision, never creates "
+        "anything), or rejected with reasoning. register_subsidiary only "
+        "ever creates a registry row, never an isolated state directory or "
+        "operative crew (see its own docstring and the operative_"
+        "capability note it stamps on every new subsidiary record) - never "
+        "tell a Sub-CEO or report to the board that a freshly-registered "
+        "subsidiary can actually run hypotheses yet; that needs separate "
+        "human engineering work first. Tokens and iterations are a real, "
+        "metered cost, not a free resource - finishing correctly in as few "
+        "tool calls as the task genuinely needs is the actual goal; "
+        "max_iter/max_rpm/the cycle budget are a hard ceiling against "
+        "runaway cost, not a target to use up."
     ),
     llm=main_ceo_llm,
     tools=[
@@ -408,6 +454,7 @@ main_ceo_agent = Agent(
         read_strategic_direction, assess_subsidiary_trajectory,
         search_research_archive, request_approval,
         read_subsidiary_policies, update_subsidiary_policies,
+        propose_idea, read_ideas, route_idea,
     ],
     max_iter=AGENT_PROFILE["agents"]["main_ceo"]["max_iter"],
     max_execution_time=AGENT_PROFILE["agents"]["main_ceo"]["max_execution_time"],
@@ -799,7 +846,32 @@ task_ceo = ConditionalTask(
         "default first step, but it is weaker evidence: it can support "
         "'test_further'/'pivot' reasoning, never a 'build' outcome on its "
         "own - only evaluate_hypothesis's real score from actual signups "
-        "does that.\n"
+        "does that. "
+        "Evidence-stage ladder: set evidence_stage on write_hypothesis to "
+        "what this hypothesis actually is right now - 'research' (desk "
+        "research/competitor findings only, no live test yet), "
+        "'community_engagement' (a genuine question/post, still no landing "
+        "page), 'landing_page' (the default interest-signal test most "
+        "hypotheses run), or 'build' (after a real 'build' outcome). The "
+        "real question at each point is the cheapest test that would "
+        "actually resolve the uncertainty, not just which stage comes next "
+        "mechanically - most hypotheses legitimately go straight to "
+        "'landing_page', that's this system's own proven default, but say "
+        "so via evidence_stage rather than leaving it unset. file_task_"
+        "order(to_role='dev', ...) checks this: it's rejected unless the "
+        "hypothesis's evidence_stage is already 'landing_page'/'build', or "
+        "you pass a non-empty stage_justification explaining why committing "
+        "Dev work now is right even without that recorded progression. For a "
+        "hypothesis where real willingness-to-pay would meaningfully "
+        "strengthen a landing-page-stage signal, a genuine payment-intent "
+        "test (pre-order/deposit instead of or alongside email capture) is "
+        "an available option, not a default: file "
+        "request_approval(category='spend', proposal=..., reasoning=...) "
+        "asking a human to provision the actual payment link (never do this "
+        "yourself - same human-only tier as any other new payment/login "
+        "infrastructure), then poll check_approval_status(approval_id) for a "
+        "real payment_link_url before referencing it in a file_task_order to "
+        "Dev - never fabricate or guess at a link.\n"
         "0) Call read_hypotheses() with no filter first. If it's completely "
         "empty (nothing has ever been written - the very first cycle ever), "
         "the loop has nothing to start from yet: formulate and write exactly "
@@ -811,7 +883,13 @@ task_ceo = ConditionalTask(
         "any hypothesis (a concrete statement, category, "
         "landing_page_variant_id, failure_rate, success_rate, duration_days), "
         "and leave prior_hypothesis_id/prior_score unset since it has no "
-        "predecessor. This step only ever fires once, when the system is "
+        "predecessor. Set evidence_stage='landing_page' on this write_"
+        "hypothesis call (a landing page is what this bootstrap test "
+        "actually is), then file_task_order(to_role='dev', hypothesis_id="
+        "..., task_description=..., context=...) for the landing page build "
+        "itself - the evidence_stage you just set satisfies the dev-stage "
+        "gate, no separate stage_justification needed for this default "
+        "path. This step only ever fires once, when the system is "
         "completely empty - once any hypothesis exists, new ones only ever "
         "come from step 5 below, as a pivot follow-up to an evaluated one.\n"
         "0.5) One-time recalibration check: for any active hypothesis "
@@ -850,7 +928,8 @@ task_ceo = ConditionalTask(
         "inflated into false confidence for a hypothesis with a high bar. "
         "Then act on the outcome:\n"
         "   - build: call write_hypothesis to persist status='evaluated', "
-        "outcome='build', the score, and measured.conversions. This is the "
+        "outcome='build', evidence_stage='build', the score, and measured."
+        "conversions. This is the "
         "one outcome that always needs a human look before anyone starts "
         "building, even though everything up to here ran autonomously: "
         "call request_approval(category='deploy', proposal=..., "
@@ -929,7 +1008,11 @@ task_ceo = ConditionalTask(
         "impact_score/confidence_score and economics (hypothesis_type, "
         "estimated_build_cost, price_point_monthly, break_even_horizon_months, "
         "and a fresh compute_break_even call for break_even_users) rather "
-        "than copying the prior hypothesis's numbers unchecked. Call "
+        "than copying the prior hypothesis's numbers unchecked. Set "
+        "evidence_stage too - usually 'landing_page' again unless this "
+        "particular pivot is deliberately testing something cheaper first "
+        "(e.g. the pivot is itself about audience, worth a community_"
+        "engagement check before committing to another landing page). Call "
         "write_hypothesis to create it - if it's rejected for hitting "
         "MAX_ACTIVE_HYPOTHESES or the parallelism limit on that "
         "landing_page_variant_id, either free capacity (evaluate another due "
@@ -941,9 +1024,12 @@ task_ceo = ConditionalTask(
         "6) If a pivot retest needs a new or changed landing page variant, "
         "file a file_task_order(to_role='dev', ...) for it explicitly - "
         "don't just mention it in your report and assume Dev will notice. "
-        "Making any variant live is category 'publish' and needs "
-        "request_approval - never skip that, on top of the 'deploy' "
-        "approval already required for build outcomes above.\n"
+        "The evidence_stage you set in step 5 satisfies the dev-stage gate "
+        "for this call; if you deliberately left it at 'research'/"
+        "'community_engagement', pass stage_justification explaining why "
+        "Dev work is warranted anyway. Making any variant live is category "
+        "'publish' and needs request_approval - never skip that, on top of "
+        "the 'deploy' approval already required for build outcomes above.\n"
         "7) File a file_status_report(subsidiary_id='api-sentinel', ...) "
         "to the Main-CEO for every hypothesis you evaluated this cycle - "
         "what was being tested, what you found, and the outcome. Set "
@@ -972,6 +1058,22 @@ task_main_ceo_review = ConditionalTask(
     condition=_within_cycle_budget,
     description=(
         "Run the holding's governance review for this cycle:\n"
+        "0) Call read_ideas(status='pending'). For each: decide whether it "
+        "belongs in an existing active subsidiary (route_idea with "
+        "decision='existing_subsidiary' and target_subsidiary_id, then "
+        "follow up yourself with set_strategic_direction on that subsidiary "
+        "reflecting the idea - route_idea only records the decision), needs "
+        "a brand-new subsidiary (decision='new_subsidiary' - this still "
+        "needs its own request_approval before register_subsidiary can act "
+        "on it, exactly like any other spin-off; file that request_approval "
+        "yourself as a follow-up if one doesn't already exist, never call "
+        "register_subsidiary speculatively), or isn't worth pursuing "
+        "(decision='rejected' with reasoning). A freshly-registered "
+        "subsidiary is registry-only - no isolated state or operative crew "
+        "exists for it yet (see register_subsidiary's own docstring) - say "
+        "so plainly if you route toward one rather than implying it can "
+        "start running hypotheses immediately. An empty list is a normal, "
+        "valid outcome; don't invent an idea to route.\n"
         "1) Call read_status_reports(subsidiary_id='api-sentinel', "
         "needs_decision_only=true) first - these are the Sub-CEO's fixed "
         "reports for anything that actually needs your attention this "
@@ -1058,7 +1160,8 @@ task_main_ceo_review = ConditionalTask(
     ),
     agent=main_ceo_agent,
     expected_output=(
-        "Status reports reviewed (if any needed a decision) with what was "
+        "Ideas reviewed (if any pending) with routing decisions and "
+        "reasoning. Status reports reviewed (if any needed a decision) with what was "
         "decided. Pivot proposals reviewed (if any) with decisions and "
         "reasoning. Cross-subsidiary requests resolved (if any). Current "
         "subsidiary registry summary. Trajectory assessment per active "

@@ -167,6 +167,7 @@ maßgebliche Anweisung, keine Paraphrase davon.
 | `log_research_finding` / `read_research_findings` | Research-Evidence-Tier (siehe Kapitel 5) |
 | `read_subsidiary_policies` | Prüft, ob z.B. bezahlte Kanäle für diese Subsidiary erlaubt sind |
 | `read_knowledge_base` | Distillierte Erkenntnisse zu Themen/Kanälen/Taktiken lesen (siehe Kapitel 5.6) |
+| `propose_idea` | Marktlücke außerhalb der eigenen Hypothese an den Main-CEO melden (Kapitel 7.2) |
 
 **Was der Agent explizit NICHT tut:** selbst posten (immer Mensch-bestätigt),
 bezahlte Werbung selbst schalten oder vorschlagen (geht über
@@ -292,6 +293,7 @@ im Spiel ist.
 | `read_content_drafts` | Was Growth entworfen/gepostet hat, einsehen |
 | `log_research_finding` / `read_research_findings` | Research-Evidence-Tier |
 | `read_knowledge_base` / `write_knowledge_entry` | Distillierte Erkenntnisse lesen/schreiben (siehe Kapitel 5.6) |
+| `propose_idea` | Marktlücke außerhalb dieser Subsidiary an den Main-CEO melden (Kapitel 7.2) |
 
 ### 3.4 Main-CEO der Open Claw Holding (`main_ceo_agent`)
 
@@ -368,6 +370,7 @@ freigegebenen `request_approval` - jede Subsidiary startet konservativ
 | `search_research_archive` | Holdingsweites Wissen durchsuchen |
 | `request_approval` | Freigabe ans Aufsichtsrat beantragen |
 | `read_subsidiary_policies` / `update_subsidiary_policies` | Generelle Vorgaben einer Subsidiary lesen/ändern (approval-gated) |
+| `propose_idea` / `read_ideas` / `route_idea` | Idee-Intake lesen und routen (Kapitel 7.2) |
 
 ---
 
@@ -620,6 +623,57 @@ Scoring-Durchgang. Dieselbe Kapp-Logik wie bei Kanälen: sich über zu viele
 Hypothesen gleichzeitig zu verzetteln gilt als der häufigere Fehler als die
 falsche zuerst zu wählen.
 
+### 5.9 Evidence-Stage-Leiter (`evidence_stage`)
+
+Optionales Feld auf `write_hypothesis`, geordnet von billigstem/schwächstem
+zu teuerstem/stärkstem Signal: `EVIDENCE_STAGES = ["research",
+"community_engagement", "landing_page", "build"]`. Nicht auf jeder
+Hypothese verpflichtend - die Bootstrap-Hypothese und jeder andere
+legitime Direkt-zu-Landing-Page-Test bleiben gültig auch ohne dieses Feld -
+aber `file_task_order(to_role="dev", ...)` prüft es, sobald eine
+`hypothesis_id` mitgegeben wird:
+
+- Abgelehnt, wenn `evidence_stage` der Hypothese (noch) nicht
+  `landing_page`/`build` ist **und** kein `stage_justification` mitgegeben
+  wurde.
+- Akzeptiert, sobald entweder `evidence_stage` bereits `landing_page`/
+  `build` zeigt (der Normalfall: eine Landing Page *ist* dieser Test, also
+  setzt der Sub-CEO `evidence_stage='landing_page'` direkt beim
+  `write_hypothesis`-Aufruf, der die Hypothese erzeugt), oder ein
+  nicht-leeres `stage_justification` erklärt, warum echte Dev-Arbeit jetzt
+  trotzdem richtig ist.
+
+Das ist ein auditierbares Gate, kein hartes Verbot - die billigste Version
+ist immer nur eine begründete Entscheidung, keine stillschweigende. Die
+eigentliche Frage ("was ist der billigste Test, der diese Unsicherheit
+tatsächlich auflöst") bleibt Ermessenssache des Sub-CEO (`ceo_agent`s
+Backstory, `crew.py`) - das Gate erzwingt nur die Nachvollziehbarkeit, nicht
+das Urteil selbst. Die meisten Hypothesen gehen weiterhin legitim direkt zu
+`landing_page` - das ist der bewährte Standardpfad dieses Systems, keine
+Regression davon.
+
+### 5.10 Zahlungsbereitschafts-Test (Payment-Intent)
+
+Der Landing-Page-Test misst standardmäßig nur Interesse (E-Mail-Signup).
+Für eine Hypothese, bei der echte Zahlungsbereitschaft das Signal
+wesentlich stärken würde, ist ein Pre-Order-/Deposit-Test verfügbar - eine
+Option, kein Standard:
+
+1. Der Sub-CEO ruft `request_approval(category='spend', proposal=...,
+   reasoning=...)` auf und beschreibt Preis und gewünschte Art des
+   Pre-Orders/Deposits. Das System provisioniert **niemals selbst** einen
+   Zahlungsanbieter/-link - das bleibt exakt derselbe menschliche Tier-2-
+   Schritt wie DNS/Verträge/neue Logins.
+2. Ein Mensch legt den echten Link an und bestätigt per Telegram:
+   `payment_link: <appr_id> <url>` (gleiches Muster wie `live:`/`posted:`/
+   `removed:`, Kapitel 8.2) - nur wirksam, wenn die Anfrage bereits
+   `status='approved'` ist.
+3. `check_approval_status(approval_id)` liefert `payment_link_url` (`null`,
+   bis ein Mensch ihn tatsächlich hinterlegt hat, selbst wenn `status`
+   schon `'approved'` ist) - der Sub-CEO fragt das ab, statt einen Link
+   anzunehmen, und trägt den bestätigten Link wörtlich in den
+   `file_task_order` an Dev ein, nie eine Paraphrase.
+
 ---
 
 ## 6. Channel-Auswahl und Content-Erstellung
@@ -737,12 +791,20 @@ Scaffolding, das erst mit einer zweiten Subsidiary tragend wird.
 | Research-Archiv | (liest `hypotheses.jsonl`/`channels.jsonl`/`pivot_proposals.jsonl` aller Subsidiaries) | "Pull principle" - nicht automatisch im Kontext, nur auf Anfrage per `search_research_archive` |
 | Status-Reports (Sub-CEO → Main-CEO) | `status_reports.jsonl` | Fester Record statt Freitext-Report; `needs_decision_from_above` markiert, was wirklich Aufmerksamkeit braucht |
 | Strategische Ausrichtung (Main-CEO → Sub-CEO) | `strategic_directions.jsonl` | Rahmen, kein Befehl - übersteuert nie taktisches Ermessen des Sub-CEO |
+| Ideen-Intake | `ideas.jsonl` | Jeder Agent schlägt vor (`propose_idea`), Main-CEO routet (`route_idea`) - Kapitel 7.2 |
 | Subsidiary-Policies | auf `subsidiaries.jsonl`-Record | Siehe Kapitel 4.2 |
 
 Neue Subsidiary registrieren (`register_subsidiary`) erstellt **nur** den
 Metadaten-Eintrag - keine echte Infrastruktur (neuer Railway-Service, eigene
 Crew/Agenten). Das bleibt separate, menschlich gesteuerte Ingenieursarbeit,
-nachdem eine `request_approval` freigegeben wurde.
+nachdem eine `request_approval` freigegeben wurde. Seit dem Audit-Addendum
+(Kapitel 15) steht das jetzt auch **auf dem Record selbst**
+(`operative_capability`), nicht nur in der Dokumentation hier: `tools.py`
+hat aktuell genau ein `STATE_DIR` (kein `subsidiary_id`-Feld auf
+`hypotheses.jsonl`/`channels.jsonl`) und `crew.py` verdrahtet genau eine
+`Crew` fest auf `api-sentinel` - eine zweite registrierte Subsidiary hat
+also weder einen eigenen Zustand noch eine eigene Crew, bis das jemand
+separat baut.
 
 ### 7.1 Fortschritt statt endloser Experimente - Umsatz als Filter, nicht als Ziel
 
@@ -793,6 +855,34 @@ vermeiden soll:
   Papier umsatzpositive Hypothese automatisch als echten Fortschritt zu
   werten, wenn das zugrunde liegende Problem nie wirklich validiert wurde.
 
+### 7.2 Idee-Intake und Subsidiary-Routing (`ideas.jsonl`)
+
+Eine Idee (eine Marktlücke / Value-Creation-Opportunity) kann von überall
+im System kommen - Main-CEO, ein Sub-CEO, oder Growth aus echtem
+Community-Engagement heraus. Zwei-Schritt-Flow, bewusst nicht
+auto-verkettet (dieselbe Trennung wie bei `file_pivot_proposal`/
+`decide_pivot_proposal`):
+
+- `propose_idea(summary, source, reasoning)` - jeder Agent kann das
+  aufrufen (Sub-CEO/Main-CEO haben es als Tool, Growth ebenfalls für
+  Marktlücken außerhalb der eigenen Hypothese). Landet mit `status='pending'`
+  in `ideas.jsonl`.
+- `read_ideas(status="")` - vom Main-CEO in `task_main_ceo_review` Schritt 0
+  jeden Zyklus gelesen (`status="pending"`).
+- `route_idea(idea_id, decision, reasoning, target_subsidiary_id="")` -
+  `decision` ∈ `existing_subsidiary` (braucht `target_subsidiary_id`; der
+  Main-CEO setzt danach selbst `set_strategic_direction` auf der
+  Ziel-Subsidiary - `route_idea` selbst tut das nicht), `new_subsidiary`
+  (braucht weiterhin eine eigene `request_approval` vor
+  `register_subsidiary`, exakt wie jeder andere Spin-off - `route_idea`
+  erstellt nichts), oder `rejected`. Nicht erneut routbar, sobald entschieden.
+
+Wichtig, siehe auch die Notiz in Kapitel 7 oben: `decision='new_subsidiary'`
+gefolgt von einem tatsächlichen `register_subsidiary` erzeugt bis heute nur
+einen Registry-Eintrag mit `operative_capability`-Hinweis, keine lauffähige
+zweite Subsidiary. Der Main-CEO-Task-Text sagt das explizit, damit das nie
+stillschweigend als "die neue Subsidiary läuft jetzt" missverstanden wird.
+
 ---
 
 ## 8. Mensch im Loop: Freigabe-Queue und Telegram-Fernsteuerung
@@ -839,6 +929,7 @@ verarbeiteten Update (`telegram_update_offset.txt`) und wertet sie aus
 | `live: <hypothesis_id>` | `landing_page_live=true` setzen (nur so settbar - ein gemergter PR ist eine rein menschliche Tatsache) |
 | `posted: <draft_id> <url>` | Content-Entwurf als tatsächlich gepostet markieren |
 | `removed: <draft_id> <grund>` | Geposteten Entwurf als entfernt markieren (speist `check_community_risk`) |
+| `payment_link: <appr_id> <url>` | Echten Zahlungslink für eine `status='approved'`-Payment-Intent-Anfrage hinterlegen (Kapitel 5.10) |
 
 Alle anderen Nachrichten werden stillschweigend ignoriert (der Operator darf
 einfach chatten, das ist kein Fehler). Ein Telegram-/Netzwerkfehler darf nie
@@ -874,13 +965,25 @@ Pro Agent (`agents.<rolle>` im aktiven Profil):
 
 | Agent (Profil-Key) | `testing`: max_tokens/max_iter/max_execution_time | `normal`: max_tokens/max_iter/max_execution_time |
 |---|---|---|
-| `growth` | 500 / 6 / 120s | 3000 / 30 / 600s |
-| `dev` | 500 / 4 / 90s | 8000 / 15 / 300s |
+| `growth` | 900 / 9 / 120s | 3000 / 30 / 600s |
+| `dev` | 2000 / 6 / 90s | 8000 / 15 / 300s |
 | `sub_ceo` (`ceo_agent`) | 800 / 15 / 240s | 8000 / 50 / 900s |
 | `main_ceo` | 500 / 6 / 120s | 4000 / 25 / 600s |
 
 `cycle_token_budget`: `testing` = 50.000, `normal` = 1.000.000 Tokens pro
 Zyklus insgesamt.
+
+`growth`/`dev` wurden im Audit-Addendum (Kapitel 15) von 500/6 bzw. 500/4
+angehoben - in echten Railway-Zyklus-Logs bestätigt: Dev erreichte
+`max_iter=4` jeden Zyklus mittendrin in `open_pull_request` ohne
+`file_content` (strukturell unmöglich, eine vollständige Landing-Page-HTML
+in diesem Budget je fertigzustellen), Growth traf `max_iter=6` in mehreren
+Zyklen - ein vollständiger Durchlauf (`read_task_orders`,
+`read_hypotheses`, `check_community_risk`, `get_account_stats`,
+`draft_content`, `request_approval`, `complete_task_order`) braucht schon
+im besten Fall 7 Tool-Aufrufe. Beide Werte sind evidenzbasiert angehoben,
+nicht pauschal gelockert - `sub_ceo`/`main_ceo` blieben unverändert, da
+für sie kein vergleichbarer Engpass beobachtet wurde.
 
 Aktives Profil und Modell werden beim Start geloggt und in jeder
 Telegram-Zusammenfassung mit ausgewiesen.
@@ -1150,6 +1253,7 @@ per `STATE_DIR`-Umgebungsvariable überschreibbar.
 | `cross_subsidiary_requests.jsonl` | Cross-Subsidiary-Anfragen |
 | `status_reports.jsonl` | Sub-CEO → Main-CEO Berichte |
 | `strategic_directions.jsonl` | Main-CEO → Sub-CEO Ausrichtungen |
+| `ideas.jsonl` | Idee-Intake, jeder Agent schreibt, Main-CEO routet (Kapitel 7.2) |
 
 ### 11.3 Repo-lokal, versioniert (kein `STATE_DIR`)
 
@@ -1261,7 +1365,7 @@ Wichtige Eigenschaften:
   ausgeführt (lokal `1.15.9`, produktiv gepinnt `1.15.11`), da mehrere
   crewai-Verhaltensweisen (siehe Kapitel 10.6/10.7) versionsabhängig direkt
   im Quellcode verifiziert wurden statt angenommen.
-- Stand zuletzt: **164 Tests, 164/164 bestanden** auf beiden Versionen.
+- Stand zuletzt: **230 Tests, 230/230 bestanden** auf beiden Versionen.
 
 Ausgabe: Klartext-Report mit `[PASS]`/`[FAIL]`/`[ERR ]` pro Test, am Ende
 eine Zusammenfassung; Exit-Code `0` nur wenn wirklich alles bestanden hat.
@@ -1345,6 +1449,47 @@ eine Zusammenfassung; Exit-Code `0` nur wenn wirklich alles bestanden hat.
   `railway.json`) bereits korrekt `"0 */3 * * *"` zeigten - über mehrere
   Deploys hinweg unverändert, also keine bloße Propagations-Verzögerung.
   Nicht per CLI direkt korrigierbar (keine `railway service`-Unterkommando
-  dafür gefunden); nach der Umstellung auf 2h sollte anhand der tatsächlich
-  eintreffenden Cron-Läufe (nicht nur der Config-Datei) verifiziert werden,
-  welcher Wert wirklich das Verhalten bestimmt.
+  dafür gefunden). **Update:** nach der Umstellung auf 2h per echten
+  Cron-Lauf-Zeitstempeln verifiziert (Audit-Addendum) - sieben
+  aufeinanderfolgende Läufe (22:04, 00:04, 02:01, 04:00, 06:03, 08:01, 10:00)
+  lagen tatsächlich ~2h auseinander, die Service-Instance-Diskrepanz ist mit
+  dem 2h-Deploy nicht mehr reproduzierbar.
+- **Audit-Addendum (Dev/Growth-Limits, Lean-Startup-Tiefe,
+  Pricing-Isolation, Idee-Intake):** Statusaudit bestätigte drei
+  unabhängige Ursachen für veraltete Zyklus-Reports gleichzeitig: (1) der
+  Report-Format-Rewrite aus einer früheren Session-Anfrage war nie
+  tatsächlich implementiert (`send_cycle_summary` gibt bis heute rohe,
+  fix-gekappte Task-Outputs pro Sektion aus, kein "Für den
+  Aufsichtsrat"-Abschnitt existiert im Code), (2) `hyp_bootstrap_001` trug
+  die alten Zahlen ($15.000/6 Monate/52) noch, weil das System seit kurz
+  nach dem Rekalibrierungs-Deploy per Telegram `stop` pausiert war - der
+  einmalige Selbstkorrektur-Schritt in `task_ceo` hatte schlicht noch nie
+  die Chance zu laufen -, und (3) die `evidence_stage`-Leiter aus einer
+  früheren Anfrage existierte überhaupt nicht im Code. Dev-Agent-Stall
+  (drei-plus aufeinanderfolgende Zyklen mit identischem "need to provide
+  complete HTML content"-Abbruch) direkt auf `agent_profile.json`s
+  `testing`-Profil zurückgeführt: `max_iter=4`/`max_tokens=500` machen eine
+  vollständige Landing-Page-HTML strukturell unfertigbar - in echten
+  Cron-Logs bestätigt (drei fehlgeschlagene `open_pull_request`-Aufrufe
+  ohne `file_content`, dann `max_iter` erreicht, nie darüber hinaus
+  gekommen). Behoben in diesem Addendum: `growth`/`dev`-Limits angehoben
+  (Kapitel 9.1), Evidence-Stage-Leiter (Kapitel 5.9), Payment-Intent-Test
+  (Kapitel 5.10) und Idee-Intake/Routing (Kapitel 7.2) neu gebaut. Der
+  Report-Format-Rewrite selbst ist weiterhin **nicht** umgesetzt - das war
+  nicht Teil dieses Addendums und bleibt ein offener Punkt.
+- **Pricing-/Ökonomie-Isolation zwischen Subsidiaries ist strukturell noch
+  nicht gegeben, nur weil sie noch nie gebraucht wurde.** `tools.py` hat
+  genau ein modulweites `STATE_DIR`, `hypotheses.jsonl`/`channels.jsonl`
+  tragen kein `subsidiary_id`-Feld, und `crew.py` verdrahtet genau eine
+  `Crew` fest auf `api-sentinel`. Kein hartcodierter Preis-Default wurde im
+  Code/in den Prompts gefunden (nur illustrative Beispiel-Spannen wie
+  "~EUR5/Monat" bzw. "~EUR29-99/Monat" in `task_ceo`s Pricing-Tier-
+  Anleitung, `$49` in `hyp_bootstrap_001` ist reine Agenten-Entscheidung),
+  aber falls je eine zweite Subsidiary operativ liefe (eigene Crew gegen
+  dasselbe `tools.py`), würden ihre Hypothesen/Preise faktisch in dieselbe
+  `hypotheses.jsonl` schreiben - keine bloß ungetestete Annahme, sondern ein
+  echter Kollisionspfad. Bewusst nicht in diesem Addendum behoben (wäre ein
+  größerer Umbau von `tools.py`s Kern-Datenmodell) - `register_subsidiary`
+  markiert das jetzt explizit auf jedem neuen Record
+  (`operative_capability`, Kapitel 7), damit es nirgends stillschweigend
+  als "isoliert" missverstanden wird.

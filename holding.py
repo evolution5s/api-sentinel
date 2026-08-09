@@ -35,6 +35,26 @@ REQUIRED_PIVOT_FIELDS = {
     "new_resources_needed", "risk_assessment", "synergy_overlap",
 }
 REQUIRED_SUBSIDIARY_FIELDS = {"id", "name", "focus"}
+IDEA_STATUSES = {"pending", "routed"}
+IDEA_ROUTING_DECISIONS = {"existing_subsidiary", "new_subsidiary", "rejected"}
+# What "a new subsidiary" concretely means in this system today, stated
+# plainly on every subsidiary record rather than left implicit (audit
+# addendum, section 4): register_subsidiary only ever writes a registry row.
+# There is currently no per-subsidiary state partition anywhere in tools.py
+# (STATE_DIR is one single module-level path, hypotheses.jsonl/channels.jsonl
+# carry no subsidiary_id field) and no code path that would instantiate a
+# second Sub-CEO/Growth/Dev crew - crew.py wires up exactly one Crew, hardcoded
+# to api-sentinel throughout its task text. A registered subsidiary beyond the
+# first is bookkeeping only until a human does the separate engineering work
+# (its own STATE_DIR/service, its own crew wiring) - never assume or imply
+# otherwise when reporting on the registry.
+NEW_SUBSIDIARY_CAPABILITY_NOTE = (
+    "registry_only - no isolated state directory or operative Sub-CEO/Growth/"
+    "Dev crew exists for this subsidiary yet; register_subsidiary only creates "
+    "this metadata row. Running real hypotheses under this id requires "
+    "separate human engineering work first (its own STATE_DIR, its own crew "
+    "wiring in crew.py) - until then, do not route operative work here."
+)
 
 # General prerequisites every subsidiary operates under by default - the
 # Main-CEO can instruct any Sub-CEO to build essentially any company, but
@@ -155,6 +175,7 @@ def register_subsidiary(subsidiary: str, approved_request_id: str) -> str:
         "created_at": datetime.now(timezone.utc).isoformat(),
         "status": "active",
         "state_dir": None,
+        "operative_capability": NEW_SUBSIDIARY_CAPABILITY_NOTE,
         "status_history": [{
             "at": datetime.now(timezone.utc).isoformat(), "to": "active",
             "reason": f"spin-off approved via {approved_request_id}",
@@ -253,6 +274,101 @@ def set_subsidiary_status(subsidiary_id: str, status: str, reason: str) -> str:
     })
     _write("subsidiaries.jsonl", subs)
     return json.dumps({"ok": True, "id": subsidiary_id, "status": status})
+
+
+# --------------------------------------------------------------------------
+# Idea intake and Main-CEO routing (audit addendum, section 4). Any agent -
+# Main-CEO, a Sub-CEO, or in principle Growth surfacing a market gap from
+# real community engagement - can propose an idea here. It sits pending
+# until the Main-CEO reviews it (task_main_ceo_review step 0) and routes it:
+# into an existing active subsidiary's strategic direction, toward a new
+# subsidiary (still gated by the existing register_subsidiary approval
+# requirement - route_idea itself never creates one), or rejected outright.
+# Deliberately a flat two-step flow (propose -> route) rather than auto-
+# chaining into set_strategic_direction/register_subsidiary itself, same
+# separation as file_pivot_proposal/decide_pivot_proposal above: routing is
+# a decision on record, acting on it is still the Main-CEO's own next tool
+# call, with its own reasoning.
+# --------------------------------------------------------------------------
+
+@tool("propose_idea")
+def propose_idea(summary: str, source: str, reasoning: str) -> str:
+    """Propose an idea (a market gap / value-creation opportunity) into the
+    holding-level intake queue for the Main-CEO to evaluate and route. Any
+    agent can call this - a Sub-CEO noticing something adjacent to its own
+    focus, Growth surfacing a real pattern from community engagement, or the
+    Main-CEO itself. `source` should identify where this came from (e.g. a
+    subsidiary_id, or "main_ceo", or a short free-text origin if neither
+    applies). This only queues the idea - it does not evaluate or act on it;
+    see route_idea for that.
+    """
+    if not summary.strip():
+        return json.dumps({"error": "summary must not be empty"})
+    record = {
+        "id": f"idea_{uuid.uuid4().hex[:8]}",
+        "proposed_at": datetime.now(timezone.utc).isoformat(),
+        "summary": summary,
+        "source": source,
+        "reasoning": reasoning,
+        "status": "pending",
+        "routing_decision": None,
+        "routing_reasoning": None,
+        "target_subsidiary_id": None,
+    }
+    _append("ideas.jsonl", record)
+    return json.dumps({"filed": record["id"]})
+
+
+@tool("read_ideas")
+def read_ideas(status: str = "") -> str:
+    """Return proposed ideas as JSON. Pass status="pending" for what's
+    actually waiting on Main-CEO review, "routed" for already-decided ones,
+    or "" for all.
+    """
+    ideas = _read("ideas.jsonl")
+    if status:
+        ideas = [i for i in ideas if i.get("status") == status]
+    return json.dumps(ideas, ensure_ascii=False)
+
+
+@tool("route_idea")
+def route_idea(idea_id: str, decision: str, reasoning: str, target_subsidiary_id: str = "") -> str:
+    """Main-CEO routes a pending idea. decision must be one of:
+    existing_subsidiary (fits an already-active subsidiary's portfolio -
+    requires target_subsidiary_id; follow up yourself with
+    set_strategic_direction on that subsidiary to actually act on it, this
+    tool only records the routing decision), new_subsidiary (needs its own
+    subsidiary - still requires a separate request_approval +
+    register_subsidiary afterward, exactly like any other spin-off; read
+    register_subsidiary's own docstring before promising this idea an
+    operative capability it doesn't have yet), or rejected (say why in
+    reasoning). Never re-routes an already-routed idea.
+    """
+    if decision not in IDEA_ROUTING_DECISIONS:
+        return json.dumps({"error": f"invalid decision '{decision}', must be one of {sorted(IDEA_ROUTING_DECISIONS)}"})
+    if decision == "existing_subsidiary" and not target_subsidiary_id.strip():
+        return json.dumps({"error": "decision='existing_subsidiary' requires target_subsidiary_id"})
+    if decision == "existing_subsidiary":
+        subs = _all_subsidiaries()
+        if not any(s.get("id") == target_subsidiary_id for s in subs):
+            return json.dumps({"error": f"no subsidiary with id '{target_subsidiary_id}'"})
+
+    ideas = _read("ideas.jsonl")
+    idx = next((i for i, rec in enumerate(ideas) if rec.get("id") == idea_id), None)
+    if idx is None:
+        return json.dumps({"error": f"no idea with id '{idea_id}'"})
+    if ideas[idx].get("status") == "routed":
+        return json.dumps({
+            "error": f"'{idea_id}' was already routed ({ideas[idx].get('routing_decision')}), not re-routing"
+        })
+
+    ideas[idx]["status"] = "routed"
+    ideas[idx]["routing_decision"] = decision
+    ideas[idx]["routing_reasoning"] = reasoning
+    ideas[idx]["target_subsidiary_id"] = target_subsidiary_id or None
+    ideas[idx]["routed_at"] = datetime.now(timezone.utc).isoformat()
+    _write("ideas.jsonl", ideas)
+    return json.dumps({"ok": True, "id": idea_id, "decision": decision})
 
 
 # --------------------------------------------------------------------------
