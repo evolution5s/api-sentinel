@@ -222,7 +222,12 @@ auf Zahlungsmittel; jede Aktion mit Kosten, rechtlicher Verpflichtung oder
 Öffentlichkeitswirkung muss zuerst durch `request_approval`. Berechnet
 Scores nur über `evaluate_hypothesis` und Break-even-Nutzerzahlen nur über
 `compute_break_even` - nie im Kopf. Jede Hypothese bekommt eine eigene,
-zu ihr passende ökonomische Messlatte, kein fester globaler Zielwert. Liest
+zu ihr passende ökonomische Messlatte, kein fester globaler Zielwert.
+Dieses Geschäft wird von KI-Agenten gebaut und betrieben - Kostenschätzungen
+müssen das widerspiegeln (Dev-Agent-Token-Spend + minimale laufende Infra),
+nie klassische Agentur-/Freelancer-/Angestellten-Kostenannahmen; ein Build,
+der ein menschliches Team Tausende kosten würde, kostet dieses System
+typischerweise ein paar Dollar in Tokens (Kapitel 5.1, Kapitel 15). Liest
 die aktuelle strategische Ausrichtung des Main-CEO
 (`read_strategic_direction`) zu Zyklusbeginn und bezieht sie als Rahmen ein
 - nicht als Befehl, der taktische Kanal-/Größen-Entscheidungen übersteuert.
@@ -424,7 +429,26 @@ Schritt 5 von `task_ceo`) braucht **vor** dem Start des Tests fixierte
   mehr Ideen als Kapazität vorhanden sind (Kapitel 5.8).
 - `estimated_build_cost`, `price_point_monthly`, `break_even_horizon_months`
   - grob geschätzte Kosten/Preis/Zeitrahmen für das *echte* Produkt/Feature,
-    nicht für den Test selbst.
+    nicht für den Test selbst. `estimated_build_cost` muss auf echten
+    KI-Agenten-Ökonomie beruhen - Dev-Agent-LLM-Aufrufe plus etwaige echte
+    laufende Infra-Kosten (Hosting, Domain) - **nie** auf einem
+    Marktpreis/Agentur-/Freelancer-Satz; dieses System wird von KI-Agenten
+    gebaut und betrieben, eine Landing Page/ein Signup-Formular/ein
+    kleines Backend-Skript kostet hier realistisch einen niedrigen
+    einstelligen Dollarbetrag in Tokens, keine Hunderte oder Tausende.
+    `write_hypothesis` verlangt dafür ein Pflichtfeld `build_cost_reasoning`
+    (Aufschlüsselung der echten Kostenkomponenten) und lehnt Schätzungen
+    über `SIMPLE_BUILD_COST_CEILING` (10,0 USD) ohne substanzielle
+    Begründung (mind. `BUILD_COST_JUSTIFICATION_MIN_LENGTH` = 80 Zeichen,
+    echter zusätzlicher Token-/Iterationsaufwand, nicht "fühlt sich teurer
+    an") ab. `break_even_horizon_months` defaultet konzeptionell auf 1
+    Monat - bei so günstigen Builds soll sich eine wirklich validierte Idee
+    schnell amortisieren; länger als 1 Monat braucht ebenfalls
+    `build_cost_reasoning` (z.B. echte laufende Infra-Kosten), nicht
+    Gewohnheit. Siehe Kapitel 15 zur Entstehungsgeschichte dieser Regel
+    (eine $15.000-Fehlschätzung mit Agentur-Logik verzerrte
+    `break_even_users` auf 52 statt der realistischen niedrigen einstelligen
+    Zahl).
 - `break_even_users` - **nie** von Hand geschätzt, sondern via
   `compute_break_even()` (`scoring.compute_break_even_users`):
   `ceil(build_cost / (price_point_monthly * horizon_months))`.
@@ -1269,6 +1293,21 @@ eine Zusammenfassung; Exit-Code `0` nur wenn wirklich alles bestanden hat.
   (Cross-Subsidiary-Requests, Research-Archiv über mehrere Subsidiaries,
   `move_to_subsidiary`-Pivot-Entscheidung) ist funktionsfähig, aber mangels
   einer zweiten Subsidiary im Alltag noch nicht wirklich belastet.
+- **Historie: `estimated_build_cost` war anfangs mit Agentur-Logik statt
+  KI-Agenten-Ökonomie geschätzt worden.** `hyp_bootstrap_001` (die allererste
+  Hypothese) setzte `estimated_build_cost=15000` für eine einfache Landing
+  Page - ein plausibler Preis für ein menschliches Dev-Team/eine Agentur,
+  aber um Größenordnungen zu hoch für das, was der Dev-Agent hier
+  tatsächlich zahlt (LLM-Tokenkosten, real eher niedrige einstellige
+  Dollarbeträge). Das verzerrte `break_even_users` auf 52 statt einer
+  realistischen niedrigen einstelligen Zahl - genau der Fall, für den
+  dieses System eigentlich entworfen wurde (schon 2 echte Nutzer können
+  ein `build` rechtfertigen). Behoben durch das Pflichtfeld
+  `build_cost_reasoning`, `SIMPLE_BUILD_COST_CEILING` (10 USD) mit
+  Substanz-Anforderung darüber, und einen auf 1 Monat gesenkten
+  Standard-`break_even_horizon_months` (Kapitel 5.1) - `task_ceo` enthält
+  außerdem einen einmaligen Rekalibrierungs-Schritt, der bestehende
+  Hypothesen mit alten, zu hohen Schätzungen selbstständig korrigiert.
 - **Kein produktives Monitoring-Produkt existiert noch.** Das System befindet
   sich bewusst in der Hypothesis-Testing-Phase (Kapitel 1/5) - es hat noch
   kein einziges `build`-Outcome durchlaufen.

@@ -87,10 +87,16 @@ SAMPLE_HYP = {
     "duration_days": 10,
     "channel": "reddit",
     "hypothesis_type": "value",
-    "estimated_build_cost": 1000,
+    # AI-native economics: a Dev-agent LLM build, not agency/market rates -
+    # kept at/under SIMPLE_BUILD_COST_CEILING and break_even_horizon_months
+    # at the 1-month default so most tests don't also need to satisfy the
+    # extra-justification-length gate; a few dedicated tests below exercise
+    # that gate explicitly with their own higher-cost/longer-horizon patches.
+    "estimated_build_cost": 5,
     "price_point_monthly": 20,
-    "break_even_horizon_months": 6,
-    "break_even_users": 9,  # ceil(1000 / (20 * 6))
+    "break_even_horizon_months": 1,
+    "break_even_users": 1,  # ceil(5 / (20 * 1))
+    "build_cost_reasoning": "~10 Dev-agent LLM calls to generate the landing page HTML/CSS, no recurring infra beyond what's already provisioned",
     "impact_score": 3,
     "confidence_score": 3,
     "primary_variable_tested": "audience",  # required for a first attempt (no prior_hypothesis_id)
@@ -517,6 +523,80 @@ def test_write_hypothesis_update_merges():
     stored = json.loads(tools.read_hypotheses.run())[0]
     assert stored["measured"]["reach_estimate"] == 5000
     assert stored["measured"]["conversions"] == 0
+
+
+# --- tools.py: AI-native build-cost economics --------------------------
+
+def test_write_hypothesis_requires_build_cost_reasoning():
+    reset_state()
+    bad = dict(SAMPLE_HYP)
+    del bad["build_cost_reasoning"]
+    result = json.loads(tools.write_hypothesis.run(hypothesis=json.dumps(bad)))
+    assert "error" in result
+
+
+def test_write_hypothesis_rejects_high_cost_without_substantial_reasoning():
+    reset_state()
+    bad = {
+        **SAMPLE_HYP, "estimated_build_cost": 15000, "price_point_monthly": 49,
+        "break_even_horizon_months": 1, "break_even_users": 307,
+        "build_cost_reasoning": "agency quote",  # too short, and market-rate framing
+    }
+    result = json.loads(tools.write_hypothesis.run(hypothesis=json.dumps(bad)))
+    assert "error" in result and "sanity-check ceiling" in result["error"]
+
+
+def test_write_hypothesis_accepts_high_cost_with_substantial_reasoning():
+    reset_state()
+    long_reasoning = (
+        "Genuinely multi-integration build: separate webhook listeners for 4 exchange APIs, "
+        "each needing its own auth/retry handling and a shared alert-dispatch layer - roughly "
+        "40 Dev-agent LLM calls across several iteration passes, still token cost not agency rate."
+    )
+    ok = {
+        **SAMPLE_HYP, "estimated_build_cost": 12, "build_cost_reasoning": long_reasoning,
+        "break_even_users": 1,
+    }
+    result = json.loads(tools.write_hypothesis.run(hypothesis=json.dumps(ok)))
+    assert result.get("ok") is True
+
+
+def test_write_hypothesis_rejects_long_horizon_without_reasoning():
+    reset_state()
+    bad = {**SAMPLE_HYP, "break_even_horizon_months": 6, "build_cost_reasoning": ""}
+    result = json.loads(tools.write_hypothesis.run(hypothesis=json.dumps(bad)))
+    assert "error" in result
+
+
+def test_write_hypothesis_accepts_long_horizon_with_reasoning():
+    reset_state()
+    ok = {
+        **SAMPLE_HYP, "break_even_horizon_months": 3,
+        "build_cost_reasoning": "Real recurring infra: a paid webhook-relay service at $4/mo is required for this specific integration, justifying a slightly longer payback window.",
+    }
+    result = json.loads(tools.write_hypothesis.run(hypothesis=json.dumps(ok)))
+    assert result.get("ok") is True
+
+
+def test_write_hypothesis_update_falls_back_to_existing_reasoning():
+    reset_state()
+    short_reasoning = "a few LLM calls"  # short - fine at/under the ceiling, not above it
+    tools.write_hypothesis.run(hypothesis=json.dumps({**SAMPLE_HYP, "build_cost_reasoning": short_reasoning}))
+
+    # updating something unrelated, not re-touching estimated_build_cost -
+    # must not require build_cost_reasoning again
+    result = json.loads(tools.write_hypothesis.run(hypothesis=json.dumps({
+        "id": "hyp_test_0001", "measured": {"reach_estimate": 1000, "reach_source": "estimated_upvotes"},
+    })))
+    assert result.get("ok") is True
+
+    # updating estimated_build_cost itself with no new reasoning at all
+    # (falls back to the existing short one) still needs a substantive one
+    # if pushed above the ceiling
+    result = json.loads(tools.write_hypothesis.run(hypothesis=json.dumps({
+        "id": "hyp_test_0001", "estimated_build_cost": 500,
+    })))
+    assert "error" in result
 
 
 def test_write_hypothesis_rejects_invalid_hypothesis_type():

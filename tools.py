@@ -50,6 +50,9 @@ REQUIRED_HYPOTHESIS_FIELDS = {
     # hypothesis ideas can be ranked against each other the same way
     # competing channels already are, instead of as a disconnected pass.
     "impact_score", "confidence_score",
+    # AI-native economics addendum: the estimate itself must be justified,
+    # not just present - see the ceiling check below.
+    "build_cost_reasoning",
 }
 HYPOTHESIS_TYPES = {"value", "growth"}
 PIVOT_VARIABLES = {"audience", "price", "copy", "channel", "timing"}
@@ -58,6 +61,17 @@ HYPOTHESIS_STATUSES = {"active", "evaluated", "buried"}
 # too many hypotheses at once is the more common failure than picking the
 # wrong one first (four-fixes addendum, point 4).
 MAX_ACTIVE_HYPOTHESES = 3
+# AI-native economics addendum: this system's builds happen via Dev-agent
+# LLM calls, not a human dev team or agency - a landing page/signup form/
+# small webhook should cost token spend (very low single digits), not
+# market-rate thousands. Anything above this ceiling for a Dev-buildable
+# artifact of that scope needs a real, substantive justification (more
+# files/integration points/iteration passes - genuine added token/
+# iteration volume, not a return to agency-rate thinking), enforced as a
+# minimum reasoning length rather than a hard block, since a genuinely
+# more involved build is a real, if rarer, case.
+SIMPLE_BUILD_COST_CEILING = 10.0
+BUILD_COST_JUSTIFICATION_MIN_LENGTH = 80
 CHANNEL_STATUSES = {"not_tested", "bench", "testing", "retired"}
 MAX_CHANNELS_TESTING = 3
 MAX_TOTAL_CHANNELS = 20
@@ -359,6 +373,23 @@ def write_hypothesis(hypothesis: str) -> str:
     and break_even_users (get this last one from compute_break_even() first
     - never estimate it by hand).
 
+    estimated_build_cost MUST be grounded in what this system actually
+    pays to build something - Dev-agent LLM calls plus any genuine
+    recurring infra cost (hosting, domain), never what a human
+    developer/agency/employee would charge. A landing page, signup form,
+    or small backend script/webhook realistically costs low single-digit
+    dollars in tokens here, not hundreds or thousands. build_cost_reasoning
+    is required whenever estimated_build_cost is set (create or update) -
+    break the number down into its real components. Above
+    SIMPLE_BUILD_COST_CEILING (currently 10.0), build_cost_reasoning must
+    also be substantive (at least BUILD_COST_JUSTIFICATION_MIN_LENGTH
+    characters) - genuinely more files/integration points/iteration passes
+    is a valid reason to go higher, "it feels like it should cost more" is
+    not. break_even_horizon_months longer than 1 month also needs
+    build_cost_reasoning explaining why (e.g. real recurring infra cost,
+    not just habit) - default to 1 unless there's a concrete reason, this
+    system is meant to pay for itself fast given how cheap builds are here.
+
     A time-box is mandatory: duration_days is always required. You may
     additionally set sample_size_trigger (a measured.reach_estimate value
     at which this hypothesis becomes due for evaluation early, before
@@ -417,6 +448,44 @@ def write_hypothesis(hypothesis: str) -> str:
 
     hyps = _read_jsonl("hypotheses.jsonl")
     existing_index = next((i for i, h in enumerate(hyps) if h.get("id") == patch["id"]), None)
+    existing_record = hyps[existing_index] if existing_index is not None else {}
+
+    # AI-native economics addendum: whenever estimated_build_cost is being
+    # set (create or update), it must be justified - and justified more
+    # substantively the higher it goes above what a Dev-agent LLM build
+    # actually costs. Falls back to the existing record's own reasoning on
+    # an update that doesn't re-touch build_cost_reasoning, so a legitimate
+    # unrelated update isn't blocked by this.
+    effective_reasoning = (
+        patch["build_cost_reasoning"] if "build_cost_reasoning" in patch
+        else existing_record.get("build_cost_reasoning")
+    )
+    effective_reasoning = (effective_reasoning or "").strip()
+    if "estimated_build_cost" in patch:
+        if not effective_reasoning:
+            return json.dumps({
+                "error": "estimated_build_cost requires a non-empty build_cost_reasoning - ground it in "
+                         "what this system actually pays (Dev-agent LLM calls + genuine recurring infra "
+                         "cost), never a human developer/agency/employee rate"
+            })
+        cost = patch["estimated_build_cost"]
+        if cost > SIMPLE_BUILD_COST_CEILING and len(effective_reasoning) < BUILD_COST_JUSTIFICATION_MIN_LENGTH:
+            return json.dumps({
+                "error": f"estimated_build_cost of {cost} exceeds the ${SIMPLE_BUILD_COST_CEILING:.0f} "
+                         "sanity-check ceiling for a typical Dev-buildable artifact (landing page, signup "
+                         "form, small backend script/webhook) - token cost alone should land in the very "
+                         "low single digits here. Going higher needs a substantive build_cost_reasoning "
+                         f"(at least {BUILD_COST_JUSTIFICATION_MIN_LENGTH} chars) citing genuine additional "
+                         "token/iteration volume (more files, more integration points, more passes needed) "
+                         "- not 'it feels like it should cost more'"
+            })
+    effective_horizon = patch.get("break_even_horizon_months", existing_record.get("break_even_horizon_months"))
+    if effective_horizon is not None and effective_horizon > 1 and not effective_reasoning:
+        return json.dumps({
+            "error": "break_even_horizon_months > 1 requires a non-empty build_cost_reasoning explaining "
+                     "why (e.g. real recurring infra cost) - default to 1 month unless there's a concrete "
+                     "reason, builds are cheap enough here that a validated idea should pay for itself fast"
+        })
 
     if existing_index is None:
         missing = REQUIRED_HYPOTHESIS_FIELDS - patch.keys()
