@@ -9,7 +9,9 @@ from crewai.events.types.tool_usage_events import ToolValidateInputErrorEvent
 from crewai.tasks.conditional_task import ConditionalTask
 
 import crewai_patches
+import holding
 import pricing
+import tools
 
 # Muss vor jeder Agent/Task-Konstruktion passieren, insbesondere vor dem
 # ersten crew.kickoff() - siehe crewai_patches.py: crewai wirft einen
@@ -48,8 +50,10 @@ from tools import (
     read_research_findings,
     read_state,
     read_task_orders,
+    read_webpage,
     request_approval,
     save_cycle_note,
+    search_web,
     send_telegram_message,
     write_channel,
     write_hypothesis,
@@ -167,7 +171,12 @@ growth_agent = Agent(
         "Technical marketer for the Freqtrade/CCXT and quant-bot communities. "
         "Drafts real posts (draft_content) in its own plain words - never "
         "publishing them itself, that's always a human, confirmed back via a "
-        "Telegram 'posted:' reply. Every reach number comes from "
+        "Telegram 'posted:' reply. For a 'thread_reply' specifically - "
+        "replying inside someone else's real thread - read_webpage(url) on "
+        "that actual thread first where practical, so the reply responds "
+        "to what was genuinely said there, not a guess at what the thread "
+        "probably contains; search_web is available too for finding "
+        "related threads/context. Every reach number comes from "
         "read_channel_metrics, never a guess. One account per product per "
         "platform: before drafting for a community, checks that community's "
         "own current rules (rules_checked/rules_notes on every single draft, "
@@ -199,7 +208,7 @@ growth_agent = Agent(
         request_approval, read_channel_metrics, read_channels, read_state, read_hypotheses,
         read_task_orders, complete_task_order, draft_content, read_content_drafts,
         check_community_risk, get_account_stats, log_research_finding, read_research_findings,
-        read_subsidiary_policies, read_knowledge_base, propose_idea,
+        read_subsidiary_policies, read_knowledge_base, propose_idea, search_web, read_webpage,
     ],
     max_iter=AGENT_PROFILE["agents"]["growth"]["max_iter"],
     max_execution_time=AGENT_PROFILE["agents"]["growth"]["max_execution_time"],
@@ -417,6 +426,7 @@ ceo_agent = Agent(
         file_pivot_proposal, file_cross_subsidiary_request, search_research_archive,
         read_subsidiary_policies, read_content_drafts, log_research_finding, read_research_findings,
         read_knowledge_base, write_knowledge_entry, propose_idea, file_stage_skip_request,
+        search_web, read_webpage,
     ],
     max_iter=AGENT_PROFILE["agents"]["sub_ceo"]["max_iter"],
     max_execution_time=AGENT_PROFILE["agents"]["sub_ceo"]["max_execution_time"],
@@ -556,6 +566,7 @@ main_ceo_agent = Agent(
         read_subsidiary_policies, update_subsidiary_policies,
         propose_idea, read_ideas, route_idea,
         read_stage_skip_requests, decide_stage_skip_request,
+        search_web, read_webpage,
     ],
     max_iter=AGENT_PROFILE["agents"]["main_ceo"]["max_iter"],
     max_execution_time=AGENT_PROFILE["agents"]["main_ceo"]["max_execution_time"],
@@ -670,12 +681,12 @@ task_channel_strategy = Task(
         "wins, and swap out ones that stop working instead of grinding on "
         "them. This runs before any hypothesis is picked or created - it "
         "decides which channels are even in play this cycle.\n"
-        "0) Call read_strategic_direction(subsidiary_id='api-sentinel') "
+        "0) Call read_strategic_direction(subsidiary_id='{subsidiary_id}') "
         "first. No direction set is a normal, valid state - most cycles "
         "will have none. If one is set, read it as the frame for this "
         "cycle's channel and hypothesis judgment calls, not as a command "
         "that overrides your own tactical read of the data below. Also call "
-        "read_subsidiary_policies(subsidiary_id='api-sentinel') - if "
+        "read_subsidiary_policies(subsidiary_id='{subsidiary_id}') - if "
         "paid_channels_allowed is false (the default), do not spend any "
         "time brainstorming or scoring paid channels this cycle, they "
         "cannot move to 'testing' regardless of score; cold_email_allowed "
@@ -998,20 +1009,34 @@ task_ceo = ConditionalTask(
         "channel-strategy's testing set) actually fits this specific "
         "hypothesis's audience, not just that it happened to be available. "
         "Before proposing a live experiment, check "
-        "read_research_findings(hypothesis_id) for anything already logged "
-        "- a competitor product, a forum discussion, replies to a genuine "
-        "question Growth posted - and log_research_finding yourself for "
-        "anything relevant you already know, specific to this hypothesis "
-        "(at least RESEARCH_FINDING_MIN_LENGTH characters, a real artifact - "
-        "which threads/posts, what they said, how many, how recent, or an "
-        "equally specific honest negative result - never a one-liner claim, "
-        "log_research_finding rejects those outright). This research-"
-        "evidence tier is cheaper and faster than a live experiment and the "
-        "default first step now (evidence_stage='research', see the fields-"
-        "required guidance above) - it is weaker evidence than a live "
-        "experiment: it can support 'test_further'/'pivot' reasoning, never "
-        "a 'build' outcome on its own - only evaluate_hypothesis's real "
-        "score from actual signups does that. For a hypothesis where real "
+        "read_research_findings(hypothesis_id) for anything already logged. "
+        "For a genuinely new topic, search_web(query) finds real pages/"
+        "threads and read_webpage(url) reads one's actual content - this is "
+        "the real, passive-discovery route to a research artifact "
+        "(evidence_stage='research', section 5.11), and resolves what used "
+        "to be a circularity: replies to an own_question_post are also "
+        "valid research evidence (finding_type='own_question_post_"
+        "replies'), but posting one IS the community_engagement stage's own "
+        "artifact - it can only exist AFTER that stage has already "
+        "happened, so it was never a way to bootstrap a research artifact "
+        "from a cold start, only a real, later, supplementary confirmation "
+        "once community engagement is already underway. search_web + "
+        "read_webpage is the default path to actually satisfy 'research' "
+        "from nothing. Either way, log_research_finding yourself with "
+        "something specific to this hypothesis (at least RESEARCH_FINDING_"
+        "MIN_LENGTH characters, a real artifact - which threads/posts, what "
+        "they actually said (paraphrased from what read_webpage returned, "
+        "never invented), how many, how recent, or an equally specific "
+        "honest negative result - never a one-liner claim, log_research_"
+        "finding rejects those outright, and never text that echoes this "
+        "system's own instruction wording instead of what was actually "
+        "found, section 5.12). This research-evidence tier is cheaper and "
+        "faster than a live experiment and the default first step now "
+        "(evidence_stage='research', see the fields-required guidance "
+        "above) - it is weaker evidence than a live experiment: it can "
+        "support 'test_further'/'pivot' reasoning, never a 'build' outcome "
+        "on its own - only evaluate_hypothesis's real score from actual "
+        "signups does that. For a hypothesis where real "
         "willingness-to-pay would meaningfully strengthen a landing-page-"
         "stage signal, a genuine payment-intent test (pre-order/deposit "
         "instead of or alongside email capture) is an available option, not "
@@ -1155,7 +1180,7 @@ task_ceo = ConditionalTask(
         "outcome. If it returns escalate=true, this is a pivot-level "
         "decision, not something to decide or escalate to the board "
         "yourself: fill out the standard pivot template and call "
-        "file_pivot_proposal(subsidiary_id='api-sentinel', proposal=...) "
+        "file_pivot_proposal(subsidiary_id='{subsidiary_id}', proposal=...) "
         "with all required fields (nature_of_change, validating_data, "
         "evolutionary_or_disruptive, existing_business_disposition, "
         "capability_gap_analysis, new_resources_needed, risk_assessment, "
@@ -1219,7 +1244,7 @@ task_ceo = ConditionalTask(
         "evidence_stage, is_experiment, success_criterion) - never skip "
         "that, on top of the 'deploy' approval already required for build "
         "outcomes above.\n"
-        "7) File a file_status_report(subsidiary_id='api-sentinel', ...) "
+        "7) File a file_status_report(subsidiary_id='{subsidiary_id}', ...) "
         "to the Main-CEO for every hypothesis you evaluated this cycle - "
         "what was being tested, what you found, and the outcome. Set "
         "needs_decision_from_above=true with a concrete decision_context "
@@ -1263,7 +1288,7 @@ task_main_ceo_review = ConditionalTask(
         "so plainly if you route toward one rather than implying it can "
         "start running hypotheses immediately. An empty list is a normal, "
         "valid outcome; don't invent an idea to route.\n"
-        "1) Call read_status_reports(subsidiary_id='api-sentinel', "
+        "1) Call read_status_reports(subsidiary_id='{subsidiary_id}', "
         "needs_decision_only=true) first - these are the Sub-CEO's fixed "
         "reports for anything that actually needs your attention this "
         "cycle, most importantly every 'build' outcome (real resource "
@@ -1504,11 +1529,18 @@ def _format_hypothesis_overview(overview: list) -> list:
     return lines
 
 
-def _aufsichtsrat_lines(pending_approvals, duration_policy: dict, pending_stage_skips: int) -> list:
+def _aufsichtsrat_lines(
+    pending_approvals, duration_policy: dict, pending_stage_skips: int,
+    stagnation_escalations: list = None,
+) -> list:
     """"Fuer den Aufsichtsrat" only appears when something genuinely needs
-    a human decision (section 8) - never printed out of habit. Three
+    a human decision (section 8) - never printed out of habit. Four
     concrete triggers: open approvals, the section-6 duration-policy
-    confirmation still pending, or an open stage-skip escalation.
+    confirmation still pending, an open stage-skip escalation, or a
+    persistent stagnation escalation (section 3) - the last one is
+    deliberately worded to STAY, cycle after cycle, until a human
+    acknowledges it ('stagnation_ack: <subsidiary_id>') or a real build
+    clears it - not a note that appears once and gets buried.
     """
     items = []
     if isinstance(pending_approvals, int) and pending_approvals > 0:
@@ -1522,13 +1554,20 @@ def _aufsichtsrat_lines(pending_approvals, duration_policy: dict, pending_stage_
         )
     if pending_stage_skips:
         items.append(f"- {pending_stage_skips} offene Stage-Skip-Anfrage(n) warten auf Main-CEO-Review.")
+    for sub_id in (stagnation_escalations or []):
+        items.append(
+            f"- {sub_id}: seit {holding.STAGNATION_ESCALATION_THRESHOLD}+ aufeinanderfolgenden Zyklen "
+            f"kein 'build', trotz {holding.STALL_RESOLVED_THRESHOLD}+ aufgeloester Hypothesen - "
+            "bleibt hier stehen, bis 'stagnation_ack: " + sub_id + "' bestaetigt wird oder ein echter "
+            "Build den Trend durchbricht."
+        )
     if not items:
         return []
     return ["", "--- Fuer den Aufsichtsrat ---"] + items
 
 
 def send_cycle_summary(
-    kickoff_error: Exception = None, telegram_action_log: list = None,
+    subsidiary_id: str, kickoff_error: Exception = None, telegram_action_log: list = None,
     persistence_warning: str = None,
 ) -> None:
     """Post a what-happened/what's-next digest of this cycle to Telegram as
@@ -1555,15 +1594,18 @@ def send_cycle_summary(
         usage = _compute_cycle_usage()
         hypothesis_overview = build_hypothesis_overview()
         duration_policy = json.loads(
-            read_subsidiary_policies.run(subsidiary_id="api-sentinel")
+            read_subsidiary_policies.run(subsidiary_id=subsidiary_id)
         ).get("max_duration_days_by_stage")
         pending_stage_skips = len(json.loads(read_stage_skip_requests.run(status="pending")))
+        stagnation_escalations = [
+            s["id"] for s in json.loads(read_subsidiaries.run()) if s.get("stagnation_escalated")
+        ]
         # Total tokens is the single most-glanced-at number in this report -
         # kept as its own standalone line right at the top, ahead of even
         # the profile/model detail line below, so it's unmissable rather
         # than folded mid-sentence into a longer paragraph.
         lines = [
-            f"API Sentinel Zyklus - {datetime.now(timezone.utc).isoformat()}",
+            f"{subsidiary_id} Zyklus - {datetime.now(timezone.utc).isoformat()}",
             _usage_headline(usage),
             "",
             "--- Hypothesen-Uebersicht ---",
@@ -1610,7 +1652,7 @@ def send_cycle_summary(
             "--- Dev ---",
             _task_summary(task_dev)[:400],
         ]
-        lines += _aufsichtsrat_lines(pending, duration_policy, pending_stage_skips)
+        lines += _aufsichtsrat_lines(pending, duration_policy, pending_stage_skips, stagnation_escalations)
         full_summary = "\n".join(lines)
         send_telegram_message(full_summary)
         save_cycle_note(full_summary[:3000])
@@ -1637,13 +1679,41 @@ if __name__ == "__main__":
             skip_message += f"\nWARNUNG: Zustand vermutlich nicht persistent: {persistence['warning']}"
         send_telegram_message(skip_message)
     else:
-        try:
-            crew.kickoff()
-            print("[api-sentinel] Execution finished.")
-            send_cycle_summary(telegram_action_log=telegram_action_log, persistence_warning=persistence["warning"])
-        except Exception as exc:
-            print(f"[api-sentinel] crew.kickoff() failed: {exc}")
-            send_cycle_summary(
-                kickoff_error=exc, telegram_action_log=telegram_action_log,
-                persistence_warning=persistence["warning"],
-            )
+        # Structural-rebuild addendum, section 2: no longer assumes exactly
+        # one subsidiary - loops crew.kickoff() once per active subsidiary
+        # (today: just api-sentinel, so this is one iteration in practice).
+        # tools.set_active_subsidiary() switches which subsidiary's data
+        # STATE_DIR reads/writes resolve against; kickoff(inputs=...)
+        # interpolates {subsidiary_id} placeholders already in the task
+        # text (crewai's own interpolate_only). Per-cycle tracking globals
+        # are reset between subsidiaries so one subsidiary's limit-hits/
+        # token-usage never leaks into the next one's report within the
+        # same process run. Known remaining gap, not fixed here (see README
+        # chapter 15): task descriptions still carry some content baked in
+        # once at module load (e.g. the prior cycle's continuity note,
+        # task_channel_strategy's concrete channel candidates) that isn't
+        # re-rendered per subsidiary - fine with the one subsidiary that
+        # exists today, a real limitation once a second one is genuinely
+        # operative.
+        active_subsidiaries = json.loads(read_subsidiaries.run(status="active"))
+        if not active_subsidiaries:
+            active_subsidiaries = [{"id": "api-sentinel"}]
+        for sub in active_subsidiaries:
+            sub_id = sub["id"]
+            tools.set_active_subsidiary(sub_id)
+            _limit_hits.clear()
+            _task_usage_log.clear()
+            _malformed_tool_calls.clear()
+            try:
+                crew.kickoff(inputs={"subsidiary_id": sub_id})
+                print(f"[api-sentinel] Execution finished for '{sub_id}'.")
+                send_cycle_summary(
+                    subsidiary_id=sub_id, telegram_action_log=telegram_action_log,
+                    persistence_warning=persistence["warning"],
+                )
+            except Exception as exc:
+                print(f"[api-sentinel] crew.kickoff() failed for '{sub_id}': {exc}")
+                send_cycle_summary(
+                    subsidiary_id=sub_id, kickoff_error=exc, telegram_action_log=telegram_action_log,
+                    persistence_warning=persistence["warning"],
+                )

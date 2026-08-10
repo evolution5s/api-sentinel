@@ -806,6 +806,69 @@ Mechanisch mit einer Mindestlänge erzwungen
 mindestens ein solches Artefakt für diese `hypothesis_id` existiert (Kapitel
 5.9) - im Code geprüft, nicht auf eine Selbstauskunft vertraut.
 
+**Echte Recherche-Werkzeuge: `search_web` / `read_webpage`.** Damit dieses
+Artefakt für ein wirklich neues Thema (nicht nur API-Sentinel) überhaupt
+erreichbar ist, haben `ceo_agent`, `growth_agent` und `main_ceo_agent`
+zwei echte Recherche-Tools:
+
+- `search_web(query, num_results=5)` - Websuche über die Serper.dev-API
+  (`google.serper.dev/search`, Umgebungsvariable `API-Sentinel-serper` -
+  bewusst nicht `SERPER_API_KEY` genannt, siehe Kapitel 14 zur Namens-
+  Abweichung). Ohne gesetzten Key liefert das Tool einen klaren Fehlertext
+  statt eines stillen Fehlschlags.
+- `read_webpage(url)` - holt eine echte Seite per `requests`, extrahiert
+  Text via BeautifulSoup (Script/Style/Nav/Header/Footer entfernt),
+  kappt auf `READ_WEBPAGE_MAX_CHARS` = 6000 Zeichen mit `truncated`-Flag.
+
+**Live gegen den echten Key getestet (Real-Serper-Key-Addendum), nicht nur
+implementiert.** Mit dem tatsächlich in Railway angelegten
+`API-Sentinel-serper`-Key (per `railway run`, ohne den Wert je in den Chat
+zu drucken) real ausgeführt: `search_web("QuantConnect forum broker API
+outage postmortem")` lieferte fünf echte, verschiedene Treffer; einer davon
+(ein QuantConnect-Forumsthread über einen unangekündigten API-Zugriffs-
+Fehler im Free-Tier) wurde direkt per `read_webpage` gelesen und lieferte
+echten, substanziellen Klartext - zusammen ein tatsächlich funktionierender
+Such-dann-Lese-Durchlauf, genau wie ein Agent ihn nutzen würde. Ein
+begleitender `search_web`-Testlauf gegen Reddit-lastige Begriffe fand
+ebenfalls echte, relevante Treffer, aber `read_webpage` gegen einen davon
+lieferte nur eine Bot-Verifizierungsseite zurück (HTTP 200, aber der Body
+ist ein Anti-Bot-JS-Challenge-Skript, kein echter Post-Inhalt) - eine neue,
+live bestätigte Erkenntnis: Reddit blockiert nicht nur den `.json`-Endpunkt
+(Kapitel 6.2), sondern auch normale HTML-Seiten gegen nicht-browserartige
+Anfragen. Ein darauf aufbauender `log_research_finding`-Aufruf mit dem
+tatsächlich gefundenen/gelesenen Inhalt als `summary` wurde real
+ausgeführt: kein Anti-Copying-Tripwire-Treffer (Kapitel 5.12), und der
+`evidence_stage='research'`-Artefakt-Gate-Check bestätigt direkt, dass
+dieser Fund den Artefakt-Anspruch erfüllt hätte. Test in `checkup.py`:
+`test_search_web_live_real_key_returns_real_results` und
+`test_search_web_then_read_webpage_live_pipeline`, beide überspringen sich
+selbst sauber, wenn `API-Sentinel-serper` nicht gesetzt ist (Kapitel 13).
+
+Implementierungsentscheidung (drei Optionen echt geprüft, nicht angenommen):
+`crewai_tools`-Bordmittel (`SerperDevTool`/`ScrapeWebsiteTool`/
+`WebsiteSearchTool`) sind lokal installiert, aber nicht in
+`requirements.txt` - in Produktion nicht vorhanden, und `WebsiteSearchTool`
+bräuchte zusätzlich ein Embedding/RAG-Setup, das hier nicht gebraucht wird.
+Anthropics natives `web_search`-Servertool wurde im Quellcode der
+crewai-Anthropic-Anbindung geprüft: die Tool-Konvertierung
+(`_convert_tools_for_interference`) akzeptiert vorgeformte
+Anthropic-Tool-Dicts nur, wenn sie `input_schema`+`name`+`description`
+mitbringen - ein natives `web_search_20250305`-Tool hat das nicht und würde
+in der normalen (fehlschlagenden) Konvertierung landen. Gewählt wurde daher
+eine schlanke Eigenimplementierung gegen die Serper.dev-API: ein API-Key,
+kein ungenutzter Ballast (kein pymupdf/pytube/youtube-transcript-api/
+tiktoken), Kosten vergleichbar mit der `crewai_tools`-Variante.
+
+**Auflösung der Forschung/Community-Engagement-Zirkularität.**
+`own_question_post_replies` bleibt ein gültiger Recherche-Beleg, ist aber
+strukturell erst *nach* `community_engagement` erreichbar - kann also nicht
+der Weg sein, ein `research`-Artefakt aus dem Stand zu erzeugen. Der
+Normalweg für ein neues Thema ist `search_web`/`read_webpage`: passive
+Recherche, bevor überhaupt ein eigener Post existiert. Beide Pfade bleiben
+gültig, aber nicht gleichrangig - das ist jetzt explizit in der
+`ceo_agent`-Backstory und in den Tasks dokumentiert, keine stillschweigende
+Annahme mehr.
+
 ### 5.12 Anti-Copying-Tripwire
 
 Mechanischer Schutz gegen genau den Fehler, der `hyp_bootstrap_001`
@@ -900,6 +963,23 @@ Growth misst reale Reichweite, nie geraten:
 Ein echter, plattformnativer Wert wird immer der Fallback-Schätzformel
 (`reach_estimators.json`, kalibrierbar über `update_reach_multiplier`)
 vorgezogen. Ohne verwertbare Daten: Fehler statt Schätzung.
+
+**Reddit-`.json`-Auto-Fetch: live getestet, aktuell blockiert.** Direkt
+gegen `fetch_reddit_public_metrics` verifiziert (Structural-Rebuild-
+Addendum): ein echter Abruf gegen einen realen Reddit-Post liefert gerade
+`403 Client Error: Blocked` - keine Annahme, ein tatsächlich beobachtetes
+Ergebnis. `read_channel_metrics` degradiert dabei sauber (Fehler +
+`fetch_note`, Fallback auf manuelles `metrics_json`), stürzt nicht ab -
+aber der Auto-Fetch selbst ist damit aktuell **nicht funktionsfähig**, kein
+verlässlicher, laufender Mechanismus. Siehe Kapitel 15 - als live
+beobachtetes, zu überwachendes Risiko geführt, nicht als gelöst.
+**Update (Real-Serper-Key-Addendum):** dieselbe Blockade wurde live auch
+für normale Reddit-HTML-Seiten bestätigt, nicht nur für den `.json`-
+Endpunkt - `read_webpage` gegen einen echten, per `search_web` gefundenen
+Reddit-Post-Link liefert HTTP 200, aber der Seiteninhalt ist eine
+Bot-Verifizierungsseite (Anti-Bot-JS-Challenge), kein echter Post-Text.
+Reddit blockiert also nicht-browserartige Zugriffe konsistent über beide
+Zugriffswege hinweg, nicht nur den einen bereits bekannten (Kapitel 5.11).
 
 ### 6.3 Content-Erstellung (`draft_content`, nur Growth)
 
@@ -1055,12 +1135,30 @@ vermeiden soll:
   liest dafür selbst die Hypothesen-Historie mit. Das ist bewusst **kein**
   zweiter Eskalationsmechanismus neben `check_escalation` (das bleibt pro
   Hypothesen-Linie das Einzige, was tatsächlich einen formalen
-  Pivot-Vorschlag auslöst, von der Sub-CEO-Seite aus) - dieses Tool
-  persistiert nichts und feuert nichts selbst aus; es liefert nur die
+  Pivot-Vorschlag auslöst, von der Sub-CEO-Seite aus) - es liefert nur die
   Zahlen, und der Main-CEO benennt einen möglichen Stillstand explizit im
   eigenen Zyklus-Report, falls das Muster das nahelegt - ohne eine auf dem
   Papier umsatzpositive Hypothese automatisch als echten Fortschritt zu
   werten, wenn das zugrunde liegende Problem nie wirklich validiert wurde.
+- **Der Gesundheits-Check hat jetzt Zähne:** Ohne Gegenmaßnahme konnte
+  `possible_stall=true` jeden Zyklus aufs Neue im Main-CEO-Report auftauchen
+  und wieder verschwinden, ohne dass sich strukturell irgendetwas ändert -
+  ein Signal, das niemand zwingend sieht oder bestätigt. Jetzt zählt
+  `assess_subsidiary_trajectory` `consecutive_stall_cycles` auf dem
+  Subsidiary-Record selbst mit (persistiert in `subsidiaries.jsonl`,
+  Kapitel 11.2) und setzt den Zähler zurück, sobald ein `build` auftaucht.
+  Ab `STAGNATION_ESCALATION_THRESHOLD` (6 aufeinanderfolgende Zyklen ohne
+  `build` - bei einem 2h-Cron rund 12 Stunden durchgehender Stillstand,
+  bewusst über einen einzelnen ungünstigen Report hinaus, aber nicht tagelang
+  unbemerkt) wird `stagnation_escalated=true` gesetzt. Ab dann erscheint die
+  Subsidiary **jeden** Zyklus fest im "Für den Aufsichtsrat"-Telegram-Block
+  (Kapitel 9.6) - nicht als einmalige Randnotiz, sondern so lange, bis ein
+  Mensch per `stagnation_ack: <subsidiary_id>` (Kapitel 8.2) quittiert, oder
+  bis ein echter `build` den Trend von selbst durchbricht (dann läuft der
+  Reset automatisch, ohne Zutun). Bewusst **kein** automatischer
+  Pivot-Auslöser - die Board-Ebenen-Grenzen (Kapitel 3.4/4) bleiben
+  unverändert; es macht nur sichtbar, was vorher stillschweigend im
+  Report-Rauschen untergehen konnte.
 
 ### 7.2 Idee-Intake und Subsidiary-Routing (`ideas.jsonl`)
 
@@ -1175,6 +1273,7 @@ verarbeiteten Update (`telegram_update_offset.txt`) und wertet sie aus
 | `payment_link: <appr_id> <url>` | Echten Zahlungslink für eine `status='approved'`-Payment-Intent-Anfrage hinterlegen (Kapitel 5.10) |
 | `duration_policy: confirm` | Vorgeschlagene `max_duration_days_by_stage`-Werte unverändert bestätigen (Kapitel 5.13) |
 | `duration_policy: <research> <community_engagement> <landing_page> <build>` | Eigene Werte setzen und in einem Schritt bestätigen (Tage, `none` für kein Limit, Kapitel 5.13) |
+| `stagnation_ack: <subsidiary_id>` | Offene Stagnation-Eskalation quittieren (Kapitel 7.1) - setzt `stagnation_escalated=false` und den Zähler zurück; kein Effekt, wenn gerade keine offene Eskalation für diese Subsidiary existiert |
 
 Alle anderen Nachrichten werden stillschweigend ignoriert (der Operator darf
 einfach chatten, das ist kein Fehler). Ein Telegram-/Netzwerkfehler darf nie
@@ -1501,28 +1600,80 @@ Volume namens `data`, Status "Ready", gemountet auf `/data` - siehe Kapitel
 für Tests ist `STATE_DIR` ein gewöhnliches Verzeichnis ohne Volume-Bezug,
 per `STATE_DIR`-Umgebungsvariable überschreibbar.
 
-### 11.1 Subsidiary-Ebene (`tools.py`, direkt unter `STATE_DIR`)
+### 11.1 Subsidiary-Ebene (`tools.py`, pro Subsidiary unter `STATE_DIR/<subsidiary_id>/`)
+
+**Datenisolation auf einem einzigen Railway-Service.** Eine frühere Aussage
+in diesem Repo, eine zweite Subsidiary bräuchte einen eigenen Railway-
+Service, war eine falsche Annahme - korrigiert. Subsidiary-gebundene
+Dateien liegen jetzt unter `STATE_DIR/<subsidiary_id>/...` statt flach
+direkt unter `STATE_DIR`; jeder Record trägt zusätzlich ein
+`subsidiary_id`-Feld (auto-gesetzt beim Schreiben, nicht vom Aufrufer
+mitgegeben). Welche Subsidiary gerade "aktiv" ist, steuert ein
+Modul-weiter Kontext in `tools.py` (`set_active_subsidiary(id)`/
+`get_active_subsidiary()`), den `crew.py` vor jedem `crew.kickoff()`
+für die jeweilige Subsidiary setzt (Kapitel 11.1.2) - kein Threading eines
+`subsidiary_id`-Parameters durch jede einzelne Tool-Signatur.
+
+**Migration statt Breaking Change.** Bestehende Daten aus dem alten flachen
+Layout (`STATE_DIR/hypotheses.jsonl` usw.) werden nicht gelöscht oder
+manuell verschoben, sondern beim ersten Zugriff pro Prozess automatisch
+nach `STATE_DIR/api-sentinel/...` kopiert und mit `subsidiary_id=
+"api-sentinel"` nachgerüstet (`_migrate_legacy_file_if_needed`, einmal pro
+Prozess und Datei gecacht). Die alte Datei bleibt dabei unangetastet liegen
+- kein destruktiver Schritt. Für die aktuell laufende Subsidiary
+(`api-sentinel`) ändert sich dadurch inhaltlich nichts; `checkup.py` deckt
+die Migration mit einem eigenen Test ab (Kapitel 13).
+
+**Nicht subsidiary-gebunden geblieben (bewusste Entscheidung, nicht
+übersehen):** `approval_queue.jsonl` bleibt global unter
+`STATE_DIR/_global/`, weil `approve.py` direkt gegen einen festen Pfad
+läuft und eine einzige, holdingweite Freigabe-Queue operativ sinnvoller ist
+als fragmentierte Queues pro Subsidiary. `system_paused.json` und
+`telegram_update_offset.txt` bleiben ebenfalls global (`STATE_DIR/_global/`)
+- beides ist systemweiter, nicht geschäftsspezifischer Zustand.
 
 | Datei | Inhalt |
 |---|---|
 | `hypotheses.jsonl` | Alle Hypothesen (aktiv/evaluiert/begraben) inkl. Ökonomie, Outcome, Pivot-Kette |
 | `channels.jsonl` | Kanal-Roster (Bullseye) |
 | `signups.jsonl` | Echte Signups, aus GitHub Issues synchronisiert |
-| `approval_queue.jsonl` | Menschliche Freigabe-Queue (die *einzige* im ganzen System) |
 | `task_orders.jsonl` | Sub-CEO → Growth/Dev Aufträge |
 | `content_drafts.jsonl` | Entworfene/geplante/entfernte Community-Posts |
 | `research_findings.jsonl` | Research-Evidence-Tier-Einträge |
 | `knowledge_base.jsonl` | Distillierte Takeaways pro Thema/Kanal/Taktik (siehe Kapitel 5.7) |
 | `usage_history.jsonl` | Token-Nutzung pro Zyklus |
 | `last_cycle_note.txt` | Kontinuitätsnotiz für den nächsten Zyklus |
-| `telegram_update_offset.txt` | Zuletzt verarbeitetes Telegram-Update |
+
+Global, `STATE_DIR/_global/` (nicht subsidiary-gebunden, siehe oben):
+
+| Datei | Inhalt |
+|---|---|
+| `approval_queue.jsonl` | Menschliche Freigabe-Queue (die *einzige* im ganzen System) |
 | `system_paused.json` | Pause-Status (Telegram `stop`/`start`) |
+| `telegram_update_offset.txt` | Zuletzt verarbeitetes Telegram-Update |
+
+#### 11.1.2 Bekannte Grenze: statischer Task-Text
+
+`crew.py` durchläuft pro Zyklus alle aktiven Subsidiaries in einer
+Schleife, setzt vor jedem `crew.kickoff()` den aktiven Kontext
+(`tools.set_active_subsidiary(sub_id)`) und übergibt `subsidiary_id` als
+Kickoff-Input (crewai-natives `{subsidiary_id}`-Platzhalter-Interpolation
+in den Task-Texten) - kein hartcodiertes `OWN_SUBSIDIARY_ID` und keine
+Annahme von genau einer Subsidiary mehr im Code. Heute läuft dabei
+effektiv weiterhin nur ein Crew-Durchlauf, weil nur `api-sentinel` aktiv
+ist. Offen bleibt: die Task-*Inhalte* selbst (Kanal-Kandidaten,
+Freqtrade/CCXT-Framing usw.) sind weiterhin API-Sentinel-spezifischer
+Fließtext, nicht pro Subsidiary dynamisch generiert - eine zweite aktive
+Subsidiary bekäme heute technisch isolierte Daten, aber inhaltlich noch
+dieselben, unpassenden Formulierungen in den Tasks. Bewusst nicht in
+diesem Schritt behoben (ein größerer Folgeschritt, kein Blocker für die
+Datenisolation selbst) - siehe Kapitel 15.
 
 ### 11.2 Holding-Ebene (`holding.py`, `STATE_DIR/_holding/`)
 
 | Datei | Inhalt |
 |---|---|
-| `subsidiaries.jsonl` | Subsidiary-Register inkl. Policies + Policy-Historie |
+| `subsidiaries.jsonl` | Subsidiary-Register inkl. Policies + Policy-Historie + Stagnation-Zähler (`consecutive_stall_cycles`, `stagnation_escalated`, `stagnation_escalated_at`, Kapitel 7.1) |
 | `pivot_proposals.jsonl` | Pivot-Vorschläge der Sub-CEOs |
 | `cross_subsidiary_requests.jsonl` | Cross-Subsidiary-Anfragen |
 | `status_reports.jsonl` | Sub-CEO → Main-CEO Berichte |
@@ -1640,7 +1791,15 @@ Wichtige Eigenschaften:
   ausgeführt (lokal `1.15.9`, produktiv gepinnt `1.15.11`), da mehrere
   crewai-Verhaltensweisen (siehe Kapitel 10.6/10.7) versionsabhängig direkt
   im Quellcode verifiziert wurden statt angenommen.
-- Stand zuletzt: **273 Tests, 273/273 bestanden** auf beiden Versionen.
+- Stand zuletzt: **289 Tests, 289/289 bestanden** auf beiden Versionen.
+  Zwei davon (`test_search_web_live_real_key_returns_real_results`,
+  `test_search_web_then_read_webpage_live_pipeline`) sind echte Live-Smoke-
+  Tests gegen die reale Serper.dev-API - sie überspringen sich selbst
+  sauber (kein Fail/Error), wenn `API-Sentinel-serper` nicht gesetzt ist,
+  damit die restliche Suite nie von einem echten externen Key/Budget
+  abhängt. Lokal ohne Key: 289/289 (beide übersprungen). Per `railway run`
+  mit dem echten Key: 289/289, beide Live-Tests tatsächlich ausgeführt und
+  bestanden (Real-Serper-Key-Addendum).
 
 Ausgabe: Klartext-Report mit `[PASS]`/`[FAIL]`/`[ERR ]` pro Test, am Ende
 eine Zusammenfassung; Exit-Code `0` nur wenn wirklich alles bestanden hat.
@@ -1656,6 +1815,7 @@ eine Zusammenfassung; Exit-Code `0` nur wenn wirklich alles bestanden hat.
 | `TELEGRAM_BOT_TOKEN` | Nein | Zyklus-Benachrichtigungen und Fernsteuerung (Kapitel 8.2) - ohne Token: Warnung im Log, kein Crash |
 | `TELEGRAM_CHAT_ID` | Nein | Ziel-Chat für Telegram-Nachrichten, gleiches Verhalten wie oben |
 | `GITHUB_TOKEN` | Nein | Erhöht das GitHub-API-Rate-Limit für Signup-Sync; **erforderlich** für `open_pull_request` (Dev-Agent) - ohne Token liefert das Tool einen klaren Fehler statt eine Aktion vorzutäuschen |
+| `API-Sentinel-serper` | Nein | Zugriff auf `search_web` (Serper.dev, Kapitel 5.11); ohne Key liefert das Tool einen klaren Fehlertext statt eines stillen Fehlschlags - `read_webpage` braucht keinen Key. **Name weicht bewusst von der sonstigen `UPPER_SNAKE_CASE`-Konvention ab** (Bindestriche, gemischte Groß-/Kleinschreibung) - das ist die exakte Bezeichnung, die tatsächlich in Railway angelegt wurde, kein Code-Stilfehler; `os.environ.get(...)` matcht exakte Strings unabhängig vom Namensschema, also funktioniert es, aber der Name wurde bewusst nicht "aufgeräumt", weil das die echte Railway-Variable brechen würde. Serper.dev: ~2.500 kostenlose Anfragen, danach kostenpflichtig - real gegen den echten Key getestet (Real-Serper-Key-Addendum), siehe Kapitel 15. |
 | `RAILWAY_ENVIRONMENT_ID` | Nein, von Railway gesetzt | Nur gelesen, nie gesetzt - Signal für `check_state_persistence` (Kapitel 9.7), dass der Prozess überhaupt in Railway läuft |
 | `RAILWAY_VOLUME_MOUNT_PATH` / `RAILWAY_VOLUME_NAME` | Nein, von Railway gesetzt, "falls ein Volume angehängt ist" | Nur gelesen, nie gesetzt - `check_state_persistence` vergleicht `RAILWAY_VOLUME_MOUNT_PATH` gegen `STATE_DIR` |
 
@@ -1769,22 +1929,67 @@ eine Zusammenfassung; Exit-Code `0` nur wenn wirklich alles bestanden hat.
   Report-Format-Rewrite selbst war zu diesem Zeitpunkt weiterhin nicht
   umgesetzt - **Update:** im nachfolgenden Structural-Rebuild-Addendum
   (siehe unten) nachgeholt (Kapitel 9.6).
-- **Pricing-/Ökonomie-Isolation zwischen Subsidiaries ist strukturell noch
-  nicht gegeben, nur weil sie noch nie gebraucht wurde.** `tools.py` hat
-  genau ein modulweites `STATE_DIR`, `hypotheses.jsonl`/`channels.jsonl`
-  tragen kein `subsidiary_id`-Feld, und `crew.py` verdrahtet genau eine
-  `Crew` fest auf `api-sentinel`. Kein hartcodierter Preis-Default wurde im
-  Code/in den Prompts gefunden (nur illustrative Beispiel-Spannen wie
-  "~EUR5/Monat" bzw. "~EUR29-99/Monat" in `task_ceo`s Pricing-Tier-
-  Anleitung, `$49` in `hyp_bootstrap_001` ist reine Agenten-Entscheidung),
-  aber falls je eine zweite Subsidiary operativ liefe (eigene Crew gegen
-  dasselbe `tools.py`), würden ihre Hypothesen/Preise faktisch in dieselbe
-  `hypotheses.jsonl` schreiben - keine bloß ungetestete Annahme, sondern ein
-  echter Kollisionspfad. Bewusst nicht in diesem Addendum behoben (wäre ein
-  größerer Umbau von `tools.py`s Kern-Datenmodell) - `register_subsidiary`
-  markiert das jetzt explizit auf jedem neuen Record
-  (`operative_capability`, Kapitel 7), damit es nirgends stillschweigend
-  als "isoliert" missverstanden wird.
+- **Historie: Pricing-/Ökonomie-Isolation zwischen Subsidiaries war
+  strukturell nicht gegeben, nur weil sie noch nie gebraucht wurde** -
+  `tools.py` hatte genau ein modulweites `STATE_DIR` ohne `subsidiary_id`-
+  Feld, `crew.py` verdrahtete genau eine `Crew` fest auf `api-sentinel`;
+  eine zweite operative Subsidiary hätte faktisch in dieselbe
+  `hypotheses.jsonl` geschrieben - ein echter Kollisionspfad, keine bloß
+  ungetestete Annahme. **Update (Real-Research/Multi-Subsidiary-Addendum):**
+  behoben - `subsidiary_id` auf jedem subsidiary-gebundenen Record,
+  per-Subsidiary `STATE_DIR`-Layout, kein hartcodierter Single-Crew-
+  Aufbau mehr (Kapitel 11.1). Weiterhin offen: die Task-*Inhalte* selbst
+  sind noch nicht pro Subsidiary dynamisch (Kapitel 11.1.2), und der
+  eigentliche Multi-Subsidiary-Betrieb (mehrere aktive Subsidiaries
+  gleichzeitig durchlaufen lassen) ist als kleinerer Folgeschritt bewusst
+  noch nicht angegangen - heute läuft weiterhin effektiv nur
+  `api-sentinel`.
+- **Reddit-`.json`-Auto-Fetch ist ein live bestätigtes, laufend zu
+  überwachendes Risiko, kein gelöstes Problem.** Siehe Kapitel 6.2 für den
+  Befund (`403 Client Error: Blocked` bei einem echten Testabruf) und
+  Kapitel 8.1/Tabelle zu `read_channel_metrics` für den sauberen
+  Fallback-Pfad, der einen Absturz verhindert.
+- **Real-Research/Multi-Subsidiary/Health-Check-Addendum:** drei
+  unabhängige Ergänzungen in einem Schritt. (1) `search_web`/`read_webpage`
+  (Serper.dev + BeautifulSoup) geben `ceo_agent`/`growth_agent`/
+  `main_ceo_agent` echte, passive Web-Recherche - vorher war das
+  Forschungsplan-/Artefakt-Gate aus Kapitel 5.11 für ein wirklich neues
+  Thema unerfüllbar, weil `own_question_post_replies` strukturell erst nach
+  `community_engagement` erreichbar ist (Kapitel 5.11 dokumentiert die
+  Auflösung explizit). Drei Optionen echt geprüft (nicht angenommen):
+  `crewai_tools`-Bordmittel (installiert, aber nicht in `requirements.txt`,
+  `WebsiteSearchTool` bräuchte zusätzlich RAG/Embeddings), Anthropics
+  natives `web_search`-Servertool (im crewai-Anthropic-Quellcode geprüft:
+  die Tool-Konvertierung akzeptiert kein rohes `web_search_20250305`-Dict
+  ohne `input_schema`), gewählt wurde eine schlanke Eigenimplementierung
+  gegen Serper.dev. (2) Multi-Subsidiary-Datenisolation auf einem
+  einzigen Railway-Service (Kapitel 11.1) - Migration, kein Breaking
+  Change, `api-sentinel` lief nach der Umstellung unverändert weiter.
+  (3) Der Gesundheits-Check hat jetzt Zähne: `consecutive_stall_cycles` +
+  `STAGNATION_ESCALATION_THRESHOLD` (6 Zyklen) eskalieren in einen
+  persistenten "Für den Aufsichtsrat"-Eintrag, der erst per
+  `stagnation_ack` verschwindet, nie automatisch (Kapitel 7.1). 14 neue
+  `checkup.py`-Tests (273 -> 287).
+- **Real-Serper-Key-Addendum:** der oben unter (1) beschriebene
+  Web-Recherche-Pfad war zu diesem Zeitpunkt implementiert, aber noch nie
+  gegen einen echten Key live getestet - es gab schlicht noch keinen. Nach
+  Anlage der Railway-Variable `API-Sentinel-serper` (bewusst dieser exakte,
+  von der `UPPER_SNAKE_CASE`-Konvention abweichende Name, Kapitel 14): Code
+  auf den echten Variablennamen umgestellt (vorher fälschlich als
+  `SERPER_API_KEY` angenommen); direkt gegen die laufende Railway-Umgebung
+  verifiziert, dass die Variable nach dem automatischen Redeploy tatsächlich
+  zur Laufzeit lesbar ist (`railway run`, nie der Wert selbst in den Chat
+  gedruckt); ein echter `search_web`-Aufruf lieferte fünf echte Treffer zu
+  einer echten API-Sentinel-relevanten Frage; ein Treffer davon wurde per
+  `read_webpage` real gelesen (voller, substanzieller Klartext); ein
+  begleitender Test entdeckte dabei, dass Reddit auch normale HTML-Seiten
+  gegen nicht-browserartige Zugriffe blockiert (Bot-Verifizierungsseite
+  statt Inhalt) - dieselbe Blockade wie beim `.json`-Endpunkt (Kapitel 6.2),
+  jetzt für einen zweiten Zugriffsweg live bestätigt; ein echter
+  `log_research_finding`-Aufruf mit dem tatsächlich gefundenen Inhalt
+  bestand den Anti-Copying-Tripwire und den `evidence_stage='research'`-
+  Artefakt-Gate-Check. 2 neue `checkup.py`-Tests (287 -> 289), beide echte
+  Live-Smoke-Tests mit sauberem Self-Skip ohne Key (Kapitel 13).
 - **Structural-Rebuild-Addendum (Entscheidungs-Framework, Bury Bootstrap,
   Research-Rigor, Reporting, Approvals):** der vollständige, konsolidierte
   Nachfolger der obigen Audit-Addendum-Punkte. Kernbefund:

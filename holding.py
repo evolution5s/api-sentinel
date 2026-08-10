@@ -38,22 +38,29 @@ REQUIRED_SUBSIDIARY_FIELDS = {"id", "name", "focus"}
 IDEA_STATUSES = {"pending", "routed"}
 IDEA_ROUTING_DECISIONS = {"existing_subsidiary", "new_subsidiary", "rejected"}
 # What "a new subsidiary" concretely means in this system today, stated
-# plainly on every subsidiary record rather than left implicit (audit
-# addendum, section 4): register_subsidiary only ever writes a registry row.
-# There is currently no per-subsidiary state partition anywhere in tools.py
-# (STATE_DIR is one single module-level path, hypotheses.jsonl/channels.jsonl
-# carry no subsidiary_id field) and no code path that would instantiate a
-# second Sub-CEO/Growth/Dev crew - crew.py wires up exactly one Crew, hardcoded
-# to api-sentinel throughout its task text. A registered subsidiary beyond the
-# first is bookkeeping only until a human does the separate engineering work
-# (its own STATE_DIR/service, its own crew wiring) - never assume or imply
-# otherwise when reporting on the registry.
+# plainly on every subsidiary record rather than left implicit. Updated by
+# the structural-rebuild addendum, section 2: data isolation is now real -
+# tools.py resolves every subsidiary-scoped file under STATE_DIR/<subsidiary_
+# id>/ (set_active_subsidiary), and crew.py loops crew.kickoff() once per
+# active subsidiary (task_ceo/task_channel_strategy/etc. text is interpolated
+# with {subsidiary_id} rather than hardcoded), so a newly-registered
+# subsidiary genuinely gets its own hypotheses/channels/etc. and a real crew
+# run, not bookkeeping-only. What's still NOT subsidiary-aware: the actual
+# CONTENT of the task instructions (task_channel_strategy's concrete channel
+# candidates, the Freqtrade/CCXT-specific framing running through task_ceo/
+# task_growth) is still written for API Sentinel's specific business - a
+# second subsidiary would run through the same real operative loop with
+# instructions that don't match its actual business until those are made
+# business-agnostic or subsidiary-specific too (a separate, larger piece of
+# work, not blocking today with only one subsidiary).
 NEW_SUBSIDIARY_CAPABILITY_NOTE = (
-    "registry_only - no isolated state directory or operative Sub-CEO/Growth/"
-    "Dev crew exists for this subsidiary yet; register_subsidiary only creates "
-    "this metadata row. Running real hypotheses under this id requires "
-    "separate human engineering work first (its own STATE_DIR, its own crew "
-    "wiring in crew.py) - until then, do not route operative work here."
+    "data_isolated_generic_tasks - this subsidiary gets its own STATE_DIR/"
+    "<id>/ data partition and is picked up by crew.py's per-active-subsidiary "
+    "loop automatically. NOT yet true: the task instructions themselves "
+    "(channel candidates, business framing in task_ceo/task_growth/"
+    "task_channel_strategy) are still written specifically for API "
+    "Sentinel's business - review/rewrite those before expecting this "
+    "subsidiary's cycles to produce business-appropriate output."
 )
 
 # General prerequisites every subsidiary operates under by default - the
@@ -95,7 +102,7 @@ def _bootstrap_default_subsidiary() -> dict:
             "phase - not yet building the monitoring product itself."
         ),
         "status": "active",
-        "state_dir": str(SUBSIDIARY_STATE_DIR),
+        "state_dir": str(SUBSIDIARY_STATE_DIR / "api-sentinel"),
         "created_at": datetime.now(timezone.utc).isoformat(),
         "status_history": [],
         "policies": dict(SUBSIDIARY_POLICY_DEFAULTS),
@@ -134,13 +141,15 @@ def read_subsidiaries(status: str = "") -> str:
 @tool("register_subsidiary")
 def register_subsidiary(subsidiary: str, approved_request_id: str) -> str:
     """Register a new subsidiary (spin-off) in the holding's registry. This
-    only creates the metadata entry - it does NOT provision any actual
-    infrastructure (a new Railway service, its own crew/agents); that stays
-    separate, human-directed engineering work once approved. Requires
-    approved_request_id pointing at an approved entry in the existing human
-    approval queue - reuses request_approval, no separate gate. Never
-    fabricate an approval id; if none exists yet, file request_approval
-    first and wait.
+    creates the metadata entry AND a real, isolated data partition
+    (STATE_DIR/<id>/ - see NEW_SUBSIDIARY_CAPABILITY_NOTE on the record for
+    what's still not automatic, e.g. business-specific task content). It
+    does NOT provision a new Railway service - one service, one crew.py
+    process, one cron handles every active subsidiary via crew.py's per-
+    subsidiary loop. Requires approved_request_id pointing at an approved
+    entry in the existing human approval queue - reuses request_approval,
+    no separate gate. Never fabricate an approval id; if none exists yet,
+    file request_approval first and wait.
     `subsidiary` is a JSON string with at least id, name, focus.
     """
     try:
@@ -174,7 +183,7 @@ def register_subsidiary(subsidiary: str, approved_request_id: str) -> str:
     record = {
         "created_at": datetime.now(timezone.utc).isoformat(),
         "status": "active",
-        "state_dir": None,
+        "state_dir": str(SUBSIDIARY_STATE_DIR / patch["id"]),
         "operative_capability": NEW_SUBSIDIARY_CAPABILITY_NOTE,
         "status_history": [{
             "at": datetime.now(timezone.utc).isoformat(), "to": "active",
@@ -676,6 +685,21 @@ def search_research_archive(query: str, subsidiary_id: str = "") -> str:
 # --------------------------------------------------------------------------
 
 STALL_RESOLVED_THRESHOLD = 5
+# Structural-rebuild addendum, section 3: possible_stall on its own was just
+# a note in the Main-CEO's own report - easy to read past forever, nothing
+# changed no matter how many cycles in a row it fired. This threshold is
+# consecutive CYCLES (not hypotheses), since possible_stall itself is already
+# gated on STALL_RESOLVED_THRESHOLD real resolved hypotheses - the underlying
+# resolved-count rarely changes within a single 2h cycle (a hypothesis's own
+# duration_days is realistically days, not hours), so a low cycle-count
+# threshold would mostly just measure "how long since the flag first
+# appeared" rather than confirm a genuinely persistent pattern. 6 consecutive
+# flagged cycles (~12h at the current 2h cadence) is long enough that this
+# isn't reacting to one glance or a single boundary case, short enough that a
+# real pattern can't hide for days before a human sees it flagged as
+# something that actually needs attention, not just noted once and repeated
+# identically forever.
+STAGNATION_ESCALATION_THRESHOLD = 6
 
 
 @tool("assess_subsidiary_trajectory")
@@ -697,16 +721,30 @@ def assess_subsidiary_trajectory(subsidiary_id: str) -> str:
     the related pattern this can't compute alone - repeated inconclusive
     pivot/test_further cycles covering the same ground without ever
     reaching a real resolution is just as much a sign of spinning in place.
-    Not itself an escalation trigger and files nothing - weigh it in your
-    own judgment alongside everything else this cycle, same as any other
-    read-only tool's output, and never treat a 'build' outcome here as
-    proof of real progress on its own if the underlying hypothesis never
-    actually validated a genuine user problem.
+    Not itself an escalation trigger for a pivot decision and files no pivot
+    of its own - weigh it in your own judgment alongside everything else
+    this cycle, and never treat a 'build' outcome here as proof of real
+    progress on its own if the underlying hypothesis never actually
+    validated a genuine user problem.
+
+    This call itself DOES persist one thing now (section 3): a consecutive-
+    cycle counter for possible_stall on the subsidiary record, so the
+    pattern can't silently repeat forever without ever becoming visible.
+    Once it's been true for STAGNATION_ESCALATION_THRESHOLD consecutive
+    calls, stagnation_escalated becomes true on the subsidiary record and
+    stays there - surfaced in the Telegram report's "Fuer den Aufsichtsrat"
+    section every cycle - until a human explicitly acknowledges it via
+    Telegram ("stagnation_ack: <subsidiary_id>") or a real 'build' clears
+    possible_stall on its own. This is visibility, not autonomous action -
+    it never triggers a pivot or any strategic decision by itself, that
+    still needs the board, same as any other Tier 1/2 boundary in this
+    system.
     """
     subs = _all_subsidiaries()
-    sub = next((s for s in subs if s.get("id") == subsidiary_id), None)
-    if sub is None:
+    idx = next((i for i, s in enumerate(subs) if s.get("id") == subsidiary_id), None)
+    if idx is None:
         return json.dumps({"error": f"no subsidiary with id '{subsidiary_id}'"})
+    sub = subs[idx]
 
     state_dir_value = sub.get("state_dir")
     if not state_dir_value:
@@ -725,11 +763,28 @@ def assess_subsidiary_trajectory(subsidiary_id: str) -> str:
     build_count = outcome_counts["build"]
     possible_stall = resolved_count >= STALL_RESOLVED_THRESHOLD and build_count == 0
 
+    if possible_stall:
+        sub["consecutive_stall_cycles"] = sub.get("consecutive_stall_cycles", 0) + 1
+        if sub["consecutive_stall_cycles"] >= STAGNATION_ESCALATION_THRESHOLD and not sub.get("stagnation_escalated"):
+            sub["stagnation_escalated"] = True
+            sub["stagnation_escalated_at"] = datetime.now(timezone.utc).isoformat()
+    else:
+        # A real build (or simply not stalled anymore) clears the pattern
+        # that caused the escalation - the underlying problem resolved
+        # itself, no human acknowledgment needed to clear it in that case.
+        sub["consecutive_stall_cycles"] = 0
+        sub["stagnation_escalated"] = False
+        sub["stagnation_escalated_at"] = None
+    subs[idx] = sub
+    _write("subsidiaries.jsonl", subs)
+
     return json.dumps({
         "subsidiary_id": subsidiary_id,
         "outcome_counts": outcome_counts,
         "resolved_count": resolved_count,
         "possible_stall": possible_stall,
+        "consecutive_stall_cycles": sub["consecutive_stall_cycles"],
+        "stagnation_escalated": sub.get("stagnation_escalated", False),
         "reason": (
             f"{resolved_count} hypotheses resolved (build/pivot/bury), 0 reached 'build' yet"
             if possible_stall else

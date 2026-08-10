@@ -25,6 +25,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import requests
+from bs4 import BeautifulSoup
 from crewai.tools import tool
 
 import scoring
@@ -130,11 +131,30 @@ MAX_CHANNELS_TESTING = 3
 MAX_TOTAL_CHANNELS = 20
 REQUIRED_CHANNEL_FIELDS = {"id", "name", "category", "is_paid", "impact_score", "confidence_score"}
 
-# This subsidiary's own id in _holding/subsidiaries.jsonl (see holding.py's
-# _bootstrap_default_subsidiary). Read directly rather than importing
-# holding.py, which imports STATE_DIR from this module - importing back
-# would be circular.
-OWN_SUBSIDIARY_ID = "api-sentinel"
+# Structural-rebuild addendum, section 2: no longer a hardcoded assumption
+# that this module only ever serves one subsidiary. crew.py calls
+# set_active_subsidiary(subsidiary_id) once per subsidiary before each
+# crew.kickoff() (today: once, "api-sentinel" - a second subsidiary doesn't
+# need a second Railway service, just a second pass through this same
+# process with the context switched). Every subsidiary-scoped read/write
+# below resolves against whichever subsidiary is currently active; tests
+# and any other direct caller can read/pass this explicitly instead.
+DEFAULT_SUBSIDIARY_ID = "api-sentinel"
+_active_subsidiary_id = DEFAULT_SUBSIDIARY_ID
+
+
+def set_active_subsidiary(subsidiary_id: str) -> None:
+    """Switch which subsidiary's data STATE_DIR reads/writes resolve
+    against for the remainder of this process. Orchestration-level, not an
+    agent tool - called once per subsidiary from crew.py's __main__, same
+    category as check_state_persistence.
+    """
+    global _active_subsidiary_id
+    _active_subsidiary_id = subsidiary_id
+
+
+def get_active_subsidiary() -> str:
+    return _active_subsidiary_id
 # Section 6 (structural-rebuild addendum): duration caps are a board/
 # Aufsichtsrat policy call, not a number this addendum dictates - that
 # would repeat the same mistake as the old hardcoded economics. This is
@@ -163,36 +183,111 @@ _SUBSIDIARY_POLICY_DEFAULTS = {
 
 
 def _read_own_policies() -> dict:
-    """Conservative-by-default read of this subsidiary's holding-level
-    policies (paid_channels_allowed etc., set via Main-CEO's
-    update_subsidiary_policies). Falls back to the same conservative
-    defaults holding.py bootstraps with if the holding registry doesn't
-    exist yet, so this never blocks on init order between the two layers.
+    """Conservative-by-default read of the *active* subsidiary's (see
+    set_active_subsidiary) holding-level policies (paid_channels_allowed
+    etc., set via Main-CEO's update_subsidiary_policies). Falls back to the
+    same conservative defaults holding.py bootstraps with if the holding
+    registry doesn't exist yet, so this never blocks on init order between
+    the two layers.
     """
     subs = read_jsonl(STATE_DIR / "_holding", "subsidiaries.jsonl")
-    sub = next((s for s in subs if s.get("id") == OWN_SUBSIDIARY_ID), None)
+    sub = next((s for s in subs if s.get("id") == _active_subsidiary_id), None)
     if sub is None:
         return dict(_SUBSIDIARY_POLICY_DEFAULTS)
     return {**_SUBSIDIARY_POLICY_DEFAULTS, **(sub.get("policies") or {})}
 
 
 # --------------------------------------------------------------------------
-# STATE_DIR / JSONL primitives
+# STATE_DIR / JSONL primitives (structural-rebuild addendum, section 2).
+# Subsidiary-scoped files (hypotheses/channels/task_orders/content_drafts/
+# signups/research_findings/knowledge_base/usage_history) now live under
+# STATE_DIR/<subsidiary_id>/ - the same pattern already used for holding-
+# level state under STATE_DIR/_holding/, just one level per subsidiary
+# instead of one level for the holding. approval_queue.jsonl and the
+# system-level files (system_paused.json, telegram_update_offset.txt,
+# last_cycle_note.txt) deliberately stay at the flat STATE_DIR root - a
+# single board-wide approval queue and a single system pause/offset state
+# make more operational sense than fragmenting them per subsidiary, and
+# approve.py already reads approval_queue.jsonl directly from STATE_DIR
+# without going through this module at all, so moving it would break that
+# CLI outright. approval_queue.jsonl records still carry a subsidiary_id
+# field (stamped on write) so entries stay traceable/filterable even though
+# the file itself isn't physically split.
 # --------------------------------------------------------------------------
+
+_MIGRATED_LEGACY_FILES: set = set()
+
 
 def _ensure_state_dir() -> None:
     STATE_DIR.mkdir(parents=True, exist_ok=True)
 
 
+def _subsidiary_dir(subsidiary_id: str = None) -> Path:
+    return STATE_DIR / (subsidiary_id or _active_subsidiary_id)
+
+
+def _migrate_legacy_file_if_needed(filename: str) -> None:
+    """One-time backfill (per process, per subsidiary+filename) for files
+    written before subsidiary-scoping existed: STATE_DIR/<file> moves to
+    STATE_DIR/<subsidiary_id>/<file>, with subsidiary_id stamped onto every
+    record that doesn't already have one. The legacy flat file is left in
+    place (never deleted) as a safety net - only the new per-subsidiary
+    copy is ever read/written going forward, so the old file just becomes
+    inert once migrated. Never raises; a failed migration just means the
+    subsidiary starts that file fresh rather than blocking the cycle.
+    """
+    key = (_active_subsidiary_id, filename)
+    if key in _MIGRATED_LEGACY_FILES:
+        return
+    _MIGRATED_LEGACY_FILES.add(key)
+    try:
+        new_dir = _subsidiary_dir()
+        if (new_dir / filename).exists():
+            return
+        legacy_path = STATE_DIR / filename
+        if not legacy_path.exists():
+            return
+        records = read_jsonl(STATE_DIR, filename)
+        if not records:
+            return
+        for record in records:
+            record.setdefault("subsidiary_id", _active_subsidiary_id)
+        write_jsonl(new_dir, filename, records)
+        print(
+            f"[api-sentinel] migrated {filename} ({len(records)} records) to "
+            f"per-subsidiary path for '{_active_subsidiary_id}'"
+        )
+    except OSError as exc:
+        print(f"[api-sentinel] WARNING: migration of {filename} failed ({exc}) - starting fresh")
+
+
 def _append_jsonl(filename: str, record: dict) -> None:
-    append_jsonl(STATE_DIR, filename, record)
+    _migrate_legacy_file_if_needed(filename)
+    record.setdefault("subsidiary_id", _active_subsidiary_id)
+    append_jsonl(_subsidiary_dir(), filename, record)
 
 
 def _read_jsonl(filename: str) -> list:
-    return read_jsonl(STATE_DIR, filename)
+    _migrate_legacy_file_if_needed(filename)
+    return read_jsonl(_subsidiary_dir(), filename)
 
 
 def _write_jsonl(filename: str, records: list) -> None:
+    for record in records:
+        record.setdefault("subsidiary_id", _active_subsidiary_id)
+    write_jsonl(_subsidiary_dir(), filename, records)
+
+
+def _append_global_jsonl(filename: str, record: dict) -> None:
+    record.setdefault("subsidiary_id", _active_subsidiary_id)
+    append_jsonl(STATE_DIR, filename, record)
+
+
+def _read_global_jsonl(filename: str) -> list:
+    return read_jsonl(STATE_DIR, filename)
+
+
+def _write_global_jsonl(filename: str, records: list) -> None:
     write_jsonl(STATE_DIR, filename, records)
 
 
@@ -333,17 +428,22 @@ def sync_signups_from_github() -> int:
 def save_cycle_note(text: str) -> None:
     """Persist a short digest of what happened this cycle so the next
     cycle's channel-strategy task can start with real continuity instead of
-    a blank slate every 6h. Overwrites - only the latest cycle's note is kept.
+    a blank slate every 2h. Overwrites - only the latest cycle's note is
+    kept. Per-subsidiary (structural-rebuild addendum, section 2) - this is
+    genuinely subsidiary-specific continuity, unlike system_paused.json/
+    telegram_update_offset.txt which stay global.
     """
-    _ensure_state_dir()
-    (STATE_DIR / "last_cycle_note.txt").write_text(text, encoding="utf-8")
+    dir_ = _subsidiary_dir()
+    dir_.mkdir(parents=True, exist_ok=True)
+    (dir_ / "last_cycle_note.txt").write_text(text, encoding="utf-8")
 
 
 def read_last_cycle_note() -> str:
-    """Return the previous cycle's note, or "" if there isn't one yet (e.g.
-    the very first run, or the file predates this feature).
+    """Return the active subsidiary's previous cycle note, or "" if there
+    isn't one yet (e.g. its very first run, or the file predates this
+    feature).
     """
-    path = STATE_DIR / "last_cycle_note.txt"
+    path = _subsidiary_dir() / "last_cycle_note.txt"
     if not path.exists():
         return ""
     return path.read_text(encoding="utf-8")
@@ -378,7 +478,7 @@ def read_state() -> str:
     except Exception as exc:
         sync_error = str(exc)
 
-    approvals = _read_jsonl("approval_queue.jsonl")
+    approvals = _read_global_jsonl("approval_queue.jsonl")
     signups = _read_jsonl("signups.jsonl")
     hypotheses = _read_jsonl("hypotheses.jsonl")
     pending = [a for a in approvals if a.get("status") == "pending"]
@@ -460,7 +560,7 @@ def request_approval(category: str, proposal: str, reasoning: str) -> str:
         "reasoning": reasoning,
         "status": "pending",
     }
-    _append_jsonl("approval_queue.jsonl", record)
+    _append_global_jsonl("approval_queue.jsonl", record)
     return json.dumps({"queued": record["id"]})
 
 
@@ -478,7 +578,7 @@ def check_approval_status(approval_id: str) -> str:
     even if status is already 'approved'. This system never creates payment
     infrastructure itself; it only asks a human to hand one back.
     """
-    approvals = _read_jsonl("approval_queue.jsonl")
+    approvals = _read_global_jsonl("approval_queue.jsonl")
     approval = next((a for a in approvals if a.get("id") == approval_id), None)
     if approval is None:
         return json.dumps({"error": f"no approval request with id '{approval_id}'"})
@@ -816,7 +916,7 @@ def write_hypothesis(hypothesis: str) -> str:
                 _ext_approval = None
                 if _ext_approval_id:
                     _ext_approval = next(
-                        (a for a in _read_jsonl("approval_queue.jsonl") if a.get("id") == _ext_approval_id), None
+                        (a for a in _read_global_jsonl("approval_queue.jsonl") if a.get("id") == _ext_approval_id), None
                     )
                 if not _ext_approval or _ext_approval.get("status") != "approved":
                     return json.dumps({
@@ -1421,7 +1521,7 @@ def write_channel(channel: str, reason: str = "") -> str:
             approved_request_id = record.get("approved_request_id")
             approval = None
             if approved_request_id:
-                approvals = _read_jsonl("approval_queue.jsonl")
+                approvals = _read_global_jsonl("approval_queue.jsonl")
                 approval = next((a for a in approvals if a.get("id") == approved_request_id), None)
             if not approval or approval.get("status") != "approved" or approval.get("category") != "spend":
                 return json.dumps({
@@ -1641,10 +1741,126 @@ def open_pull_request(branch_name: str, file_path: str, file_content: str, pr_ti
 
 
 # --------------------------------------------------------------------------
+# Web research: search + read (structural-rebuild addendum, section 1).
+# Before this, no agent in this system could read actual external content -
+# log_research_finding was write-only, read_channel_metrics returns counts
+# never thread text, search_research_archive only searches this system's own
+# past records. That made a genuinely new topic's research artifact
+# (section 5.11) impossible to satisfy honestly: an own_question_post's
+# replies were the only real external content an agent could ever read, but
+# that's the community_engagement stage's own artifact, not research's -
+# real circularity, not just an awkward reading. These two tools resolve it:
+# passive discovery (no posting required) now genuinely exists for the
+# research stage; own_question_post_replies remains valid as a real, later,
+# supplementary confirmation once community_engagement has already happened,
+# not the only way to ever get a research artifact.
+#
+# Hand-rolled with `requests`/`bs4` directly (not the crewai-tools package):
+# same cost as crewai-tools' SerperDevTool+ScrapeWebsiteTool (one new
+# API key, matching this repo's existing not-yet-configured-tool
+# pattern, e.g. GITHUB_TOKEN/open_pull_request) without pulling in
+# crewai-tools' unrelated dependencies (pymupdf, pytube,
+# youtube-transcript-api, tiktoken) for a two-tool use case - consistent
+# with every other tool in this file already being a plain requests call,
+# and with this project's own stated preference for direct tool use over
+# framework layers.
+# --------------------------------------------------------------------------
+
+SERPER_SEARCH_URL = "https://google.serper.dev/search"
+READ_WEBPAGE_MAX_CHARS = 6000
+
+
+@tool("search_web")
+def search_web(query: str, num_results: int = 5) -> str:
+    """Search the public web for a query - finds relevant pages/threads
+    before reading any of them (pair with read_webpage). Real search
+    results (title/link/snippet), never invented. Requires API-Sentinel-serper
+    (serper.dev) in the environment; returns a clear "not configured" error
+    instead of pretending to succeed if it's missing, same pattern as
+    open_pull_request's GITHUB_TOKEN check.
+
+    This is the passive-discovery path for evidence_stage='research'
+    (section 5.11) - use it and read_webpage to actually find and read real
+    content before calling log_research_finding, rather than only having
+    own_question_post_replies (which requires community_engagement to have
+    already happened) as the sole route to a real research artifact.
+    """
+    # Env var name is "API-Sentinel-serper" (hyphens, mixed case) - this is
+    # the exact name actually provisioned in Railway, not a code convention
+    # choice. os.environ.get() does an exact string match regardless of
+    # case/hyphens, so it works fine - but don't silently "clean it up" to
+    # SERPER_API_KEY or similar, that would break the real Railway variable.
+    api_key = os.environ.get("API-Sentinel-serper")
+    if not api_key:
+        return json.dumps({
+            "error": "API-Sentinel-serper not set - cannot search the web. Needs to be provisioned by the "
+                     "board in Railway's environment variables (a serper.dev account/key)."
+        })
+    num_results = max(1, min(int(num_results), 10))
+    try:
+        resp = requests.post(
+            SERPER_SEARCH_URL,
+            headers={"X-API-KEY": api_key, "Content-Type": "application/json"},
+            json={"q": query, "num": num_results},
+            timeout=15,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+    except (requests.RequestException, ValueError) as exc:
+        return json.dumps({"error": f"web search failed: {exc}"})
+
+    results = [
+        {"title": r.get("title"), "link": r.get("link"), "snippet": r.get("snippet")}
+        for r in (data.get("organic") or [])[:num_results]
+    ]
+    return json.dumps({"query": query, "results": results}, ensure_ascii=False)
+
+
+@tool("read_webpage")
+def read_webpage(url: str) -> str:
+    """Fetch a specific URL and return its actual visible text content
+    (scripts/styles/nav stripped), truncated to READ_WEBPAGE_MAX_CHARS
+    characters - real page content to paraphrase into log_research_finding,
+    never fabricated. No API key needed (plain HTTP fetch + parse). Pair
+    with search_web to find URLs worth reading, or read_webpage a URL found
+    some other way (e.g. from read_channel_metrics or a known site).
+
+    Returns an error instead of guessing if the fetch fails (blocked,
+    timeout, non-HTML content) - never invent what a page "probably" says.
+    """
+    try:
+        resp = requests.get(
+            url, headers={"User-Agent": "APISentinel-Research/1.0 (+https://github.com/evolution5s/api-sentinel)"},
+            timeout=15,
+        )
+        resp.raise_for_status()
+    except requests.RequestException as exc:
+        return json.dumps({"error": f"could not fetch '{url}': {exc}"})
+
+    content_type = resp.headers.get("content-type", "")
+    if "html" not in content_type and "text" not in content_type:
+        return json.dumps({"error": f"'{url}' is not readable text/html content (content-type: {content_type})"})
+
+    soup = BeautifulSoup(resp.text, "html.parser")
+    for tag in soup(["script", "style", "nav", "header", "footer"]):
+        tag.decompose()
+    text = " ".join(soup.get_text(separator=" ").split())
+    truncated = len(text) > READ_WEBPAGE_MAX_CHARS
+    return json.dumps({
+        "url": url,
+        "text": text[:READ_WEBPAGE_MAX_CHARS],
+        "truncated": truncated,
+    }, ensure_ascii=False)
+
+
+# --------------------------------------------------------------------------
 # Research-evidence tier (Validated Learning addendum, section 4) - a
 # cheaper, weaker-than-a-live-experiment validation step: existing
 # competitor products, forum discussions, a genuine question post's
-# replies. Logged for reasoning context; never enough on its own to push a
+# replies (the latter only possible once community_engagement has actually
+# happened - a real, later confirmation, not a way to bootstrap a research
+# artifact from nothing; see search_web/read_webpage above for that).
+# Logged for reasoning context; never enough on its own to push a
 # hypothesis to "build" - only evaluate_hypothesis's real score off
 # signups.jsonl does that.
 # --------------------------------------------------------------------------
@@ -2203,6 +2419,9 @@ def _classify_command(text: str, reply_to_text: str):
       DURATION_CAPS or whatever was last proposed).
     - "duration_policy_set": payload is a dict of stage -> days (or None for
       no cap) - sets custom values and confirms in the same step.
+    - "stagnation_ack": payload is the subsidiary_id - a human acknowledging
+      a persistent stagnation escalation (section 3), clearing it from the
+      "Fuer den Aufsichtsrat" section until it would genuinely re-trigger.
 
     Two ways to approve/reject: reply directly to the notification message
     that announced the pending approval (matched via the appr_... id in
@@ -2278,6 +2497,10 @@ def _classify_command(text: str, reply_to_text: str):
                     return None
             return ("duration_policy_set", values)
         return None
+
+    if normalized.startswith("stagnation_ack:"):
+        subsidiary_id = text.split(":", 1)[1].strip()
+        return ("stagnation_ack", subsidiary_id) if subsidiary_id else None
 
     return None
 
@@ -2357,7 +2580,7 @@ def _apply_telegram_commands(messages: list) -> list:
 
         if action == "payment_link":
             approval_id, url = target_id
-            approvals = _read_jsonl("approval_queue.jsonl")
+            approvals = _read_global_jsonl("approval_queue.jsonl")
             idx = next((i for i, a in enumerate(approvals) if a.get("id") == approval_id), None)
             if idx is None:
                 send_telegram_message(f"Keine Freigabe-Anfrage mit id '{approval_id}' gefunden.")
@@ -2370,14 +2593,14 @@ def _apply_telegram_commands(messages: list) -> list:
                 continue
             approvals[idx]["payment_link_url"] = url
             approvals[idx]["payment_link_set_at"] = datetime.now(timezone.utc).isoformat()
-            _write_jsonl("approval_queue.jsonl", approvals)
+            _write_global_jsonl("approval_queue.jsonl", approvals)
             log.append(f"{approval_id} payment_link_url gesetzt (Telegram)")
             send_telegram_message(f"{approval_id}: Payment-Link hinterlegt ({url}).")
             continue
 
         if action == "duration_policy_confirm":
             subs = read_jsonl(STATE_DIR / "_holding", "subsidiaries.jsonl")
-            idx = next((i for i, s in enumerate(subs) if s.get("id") == OWN_SUBSIDIARY_ID), None)
+            idx = next((i for i, s in enumerate(subs) if s.get("id") == _active_subsidiary_id), None)
             if idx is None:
                 send_telegram_message("Noch keine Subsidiary-Policy vorhanden - nichts zu bestaetigen.")
                 continue
@@ -2393,7 +2616,7 @@ def _apply_telegram_commands(messages: list) -> list:
         if action == "duration_policy_set":
             values = target_id
             subs = read_jsonl(STATE_DIR / "_holding", "subsidiaries.jsonl")
-            idx = next((i for i, s in enumerate(subs) if s.get("id") == OWN_SUBSIDIARY_ID), None)
+            idx = next((i for i, s in enumerate(subs) if s.get("id") == _active_subsidiary_id), None)
             if idx is None:
                 send_telegram_message("Noch keine Subsidiary-Policy vorhanden - kann noch nicht gesetzt werden.")
                 continue
@@ -2405,6 +2628,24 @@ def _apply_telegram_commands(messages: list) -> list:
             write_jsonl(STATE_DIR / "_holding", "subsidiaries.jsonl", subs)
             log.append("Duration-Policy gesetzt und bestaetigt (Telegram)")
             send_telegram_message(f"Duration-Policy gesetzt und bestaetigt: {values}")
+            continue
+
+        if action == "stagnation_ack":
+            ack_subsidiary_id = target_id
+            subs = read_jsonl(STATE_DIR / "_holding", "subsidiaries.jsonl")
+            idx = next((i for i, s in enumerate(subs) if s.get("id") == ack_subsidiary_id), None)
+            if idx is None:
+                send_telegram_message(f"Keine Subsidiary mit id '{ack_subsidiary_id}' gefunden.")
+                continue
+            if not subs[idx].get("stagnation_escalated"):
+                send_telegram_message(f"{ack_subsidiary_id}: keine offene Stagnation-Eskalation.")
+                continue
+            subs[idx]["stagnation_escalated"] = False
+            subs[idx]["consecutive_stall_cycles"] = 0
+            subs[idx]["stagnation_acknowledged_at"] = datetime.now(timezone.utc).isoformat()
+            write_jsonl(STATE_DIR / "_holding", "subsidiaries.jsonl", subs)
+            log.append(f"{ack_subsidiary_id} Stagnation-Eskalation bestaetigt (Telegram)")
+            send_telegram_message(f"{ack_subsidiary_id}: Stagnation-Eskalation quittiert.")
             continue
 
         if records is None:
@@ -2476,7 +2717,7 @@ def notify_new_pending_approvals() -> None:
     reasoning is shown as its own clearly-separated line below the block,
     never mixed into the structured fields.
     """
-    approvals = _read_jsonl("approval_queue.jsonl")
+    approvals = _read_global_jsonl("approval_queue.jsonl")
     changed = False
     for record in approvals:
         if record.get("status") != "pending" or record.get("telegram_notified"):
@@ -2496,4 +2737,4 @@ def notify_new_pending_approvals() -> None:
         record["telegram_notified"] = True
         changed = True
     if changed:
-        _write_jsonl("approval_queue.jsonl", approvals)
+        _write_global_jsonl("approval_queue.jsonl", approvals)

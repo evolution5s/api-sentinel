@@ -68,9 +68,9 @@ def _allow_paid_channels():
     """
     holding.read_subsidiaries.run()  # bootstraps api-sentinel
     appr = json.loads(tools.request_approval.run(category="pricing", proposal="allow paid channels", reasoning="r"))
-    approvals = tools._read_jsonl("approval_queue.jsonl")
+    approvals = tools._read_global_jsonl("approval_queue.jsonl")
     approvals[0]["status"] = "approved"
-    tools._write_jsonl("approval_queue.jsonl", approvals)
+    tools._write_global_jsonl("approval_queue.jsonl", approvals)
     holding.update_subsidiary_policies.run(
         subsidiary_id="api-sentinel", policies_patch=json.dumps({"paid_channels_allowed": True}),
         approved_request_id=appr["queued"], reasoning="test setup",
@@ -395,7 +395,11 @@ def test_jsonl_roundtrip():
     reset_state()
     tools._append_jsonl("scratch.jsonl", {"a": 1})
     tools._append_jsonl("scratch.jsonl", {"a": 2})
-    assert tools._read_jsonl("scratch.jsonl") == [{"a": 1}, {"a": 2}]
+    # subsidiary_id is now stamped on every subsidiary-scoped record write
+    # (structural-rebuild addendum, section 2).
+    assert tools._read_jsonl("scratch.jsonl") == [
+        {"a": 1, "subsidiary_id": "api-sentinel"}, {"a": 2, "subsidiary_id": "api-sentinel"},
+    ]
 
 
 def test_jsonl_read_missing_file_returns_empty():
@@ -407,7 +411,21 @@ def test_jsonl_write_overwrites():
     reset_state()
     tools._write_jsonl("scratch2.jsonl", [{"x": 1}, {"x": 2}])
     tools._write_jsonl("scratch2.jsonl", [{"x": 3}])
-    assert tools._read_jsonl("scratch2.jsonl") == [{"x": 3}]
+    assert tools._read_jsonl("scratch2.jsonl") == [{"x": 3, "subsidiary_id": "api-sentinel"}]
+
+
+def test_jsonl_subsidiary_scoping_isolates_data_between_subsidiaries():
+    reset_state()
+    tools.set_active_subsidiary("api-sentinel")
+    tools._append_jsonl("scratch3.jsonl", {"a": 1})
+    tools.set_active_subsidiary("second-co")
+    try:
+        assert tools._read_jsonl("scratch3.jsonl") == []  # second-co sees none of api-sentinel's data
+        tools._append_jsonl("scratch3.jsonl", {"a": 2})
+        assert tools._read_jsonl("scratch3.jsonl") == [{"a": 2, "subsidiary_id": "second-co"}]
+    finally:
+        tools.set_active_subsidiary("api-sentinel")
+    assert tools._read_jsonl("scratch3.jsonl") == [{"a": 1, "subsidiary_id": "api-sentinel"}]
 
 
 # --- tools.py: request_approval / read_state -------------------------------
@@ -416,7 +434,7 @@ def test_request_approval_valid():
     reset_state()
     result = json.loads(tools.request_approval.run(category="deploy", proposal="p", reasoning="r"))
     assert "queued" in result
-    stored = tools._read_jsonl("approval_queue.jsonl")
+    stored = tools._read_global_jsonl("approval_queue.jsonl")
     assert len(stored) == 1 and stored[0]["status"] == "pending" and stored[0]["category"] == "deploy"
 
 
@@ -424,7 +442,7 @@ def test_request_approval_invalid_category():
     reset_state()
     result = json.loads(tools.request_approval.run(category="marketing", proposal="p", reasoning="r"))
     assert "error" in result
-    assert tools._read_jsonl("approval_queue.jsonl") == []
+    assert tools._read_global_jsonl("approval_queue.jsonl") == []
 
 
 # --- tools.py: rigid publish-approval template (structural-rebuild --------
@@ -442,7 +460,7 @@ def test_request_approval_publish_rejects_free_prose():
     reset_state()
     result = json.loads(tools.request_approval.run(category="publish", proposal="just post it, looks fine", reasoning="r"))
     assert "error" in result
-    assert tools._read_jsonl("approval_queue.jsonl") == []
+    assert tools._read_global_jsonl("approval_queue.jsonl") == []
 
 
 def test_request_approval_publish_rejects_missing_template_field():
@@ -472,7 +490,7 @@ def test_request_approval_publish_accepts_full_template():
     reset_state()
     result = json.loads(tools.request_approval.run(category="publish", proposal=json.dumps(_PUBLISH_TEMPLATE), reasoning="r"))
     assert "queued" in result, result
-    stored = tools._read_jsonl("approval_queue.jsonl")
+    stored = tools._read_global_jsonl("approval_queue.jsonl")
     assert stored[0]["category"] == "publish"
 
 
@@ -547,9 +565,9 @@ def test_check_approval_status_reflects_real_state():
     result = json.loads(tools.check_approval_status.run(approval_id=appr["queued"]))
     assert result == {"id": appr["queued"], "status": "pending", "category": "deploy", "payment_link_url": None}
 
-    approvals = tools._read_jsonl("approval_queue.jsonl")
+    approvals = tools._read_global_jsonl("approval_queue.jsonl")
     approvals[0]["status"] = "approved"
-    tools._write_jsonl("approval_queue.jsonl", approvals)
+    tools._write_global_jsonl("approval_queue.jsonl", approvals)
     result = json.loads(tools.check_approval_status.run(approval_id=appr["queued"]))
     assert result["status"] == "approved"
 
@@ -1271,9 +1289,9 @@ def test_write_channel_paid_succeeds_with_approved_spend_request():
     reset_state()
     _allow_paid_channels()
     appr = json.loads(tools.request_approval.run(category="spend", proposal="$1500 reddit ads test", reasoning="r"))
-    approvals = tools._read_jsonl("approval_queue.jsonl")
+    approvals = tools._read_global_jsonl("approval_queue.jsonl")
     approvals[-1]["status"] = "approved"
-    tools._write_jsonl("approval_queue.jsonl", approvals)
+    tools._write_global_jsonl("approval_queue.jsonl", approvals)
     result = json.loads(tools.write_channel.run(channel=json.dumps({
         "id": "reddit_ads", "name": "Reddit Ads", "category": "paid_ads", "is_paid": True,
         "impact_score": 3, "confidence_score": 2, "status": "testing",
@@ -1376,6 +1394,116 @@ def test_read_channel_metrics_tool_reddit_source_url_live():
     result = json.loads(tools.read_channel_metrics.run(channel="reddit", source_url=post_url))
     assert "estimated_reach" in result, result
     assert result["fetch_note"] == "auto-fetched from Reddit's public JSON endpoint"
+
+
+# --- tools.py: web research - search_web/read_webpage (structural-rebuild --
+# addendum, section 1)
+
+def test_search_web_requires_serper_api_key():
+    reset_state()
+    had_key = os.environ.pop("API-Sentinel-serper", None)
+    try:
+        result = json.loads(tools.search_web.run(query="freqtrade api outage"))
+        assert "error" in result
+        assert "API-Sentinel-serper" in result["error"]
+    finally:
+        if had_key is not None:
+            os.environ["API-Sentinel-serper"] = had_key
+
+
+def test_search_web_real_endpoint_rejects_invalid_key():
+    # A real (deliberately invalid) key exercises the real HTTP path against
+    # Serper's actual endpoint without costing anything, confirming this
+    # tool fails cleanly (not silently) rather than fabricating results -
+    # independent of whether a real API-Sentinel-serper key happens to be
+    # set in this environment (temporarily overridden either way).
+    reset_state()
+    had_key = os.environ.pop("API-Sentinel-serper", None)
+    try:
+        os.environ["API-Sentinel-serper"] = "invalid-test-key-not-a-real-account"
+        result = json.loads(tools.search_web.run(query="freqtrade api outage"))
+        assert "error" in result, result
+    finally:
+        if had_key is not None:
+            os.environ["API-Sentinel-serper"] = had_key
+        else:
+            os.environ.pop("API-Sentinel-serper", None)
+
+
+def test_search_web_live_real_key_returns_real_results():
+    # Genuine live smoke test against Serper's real endpoint - only runs
+    # when a real API-Sentinel-serper key is actually present (e.g. via
+    # `railway run`), skips gracefully everywhere else (local dev, CI, a
+    # future contributor's machine) so the suite never depends on a live
+    # external API/budget to pass. Confirmed manually against the real
+    # Railway-provisioned key (Real-Serper-Key addendum): non-empty,
+    # genuine organic results, not a mock or an empty payload.
+    reset_state()
+    if not os.environ.get("API-Sentinel-serper"):
+        print("    (skipped - API-Sentinel-serper not set in this environment)")
+        return
+    result = json.loads(tools.search_web.run(query="algotrading broker API outage"))
+    assert "error" not in result, result
+    assert result["results"], "expected at least one real organic result"
+    first = result["results"][0]
+    assert first.get("link", "").startswith("http")
+
+
+def test_search_web_then_read_webpage_live_pipeline():
+    # End-to-end: a real search_web result fed straight into read_webpage,
+    # as the agents would actually use the two tools together. Skips
+    # gracefully without a real key, same reasoning as the test above.
+    reset_state()
+    if not os.environ.get("API-Sentinel-serper"):
+        print("    (skipped - API-Sentinel-serper not set in this environment)")
+        return
+    search_result = json.loads(tools.search_web.run(query="QuantConnect forum broker API outage"))
+    assert search_result["results"], search_result
+    # Reddit links are known (chapter 6.2/15) to return an anti-bot
+    # challenge page rather than real content - skip those and read the
+    # first non-Reddit result so this test actually exercises real content
+    # extraction rather than asserting against a bot-check page.
+    candidates = [r["link"] for r in search_result["results"] if "reddit.com" not in r["link"]]
+    if not candidates:
+        print("    (skipped - only Reddit links in this result set)")
+        return
+    page = json.loads(tools.read_webpage.run(url=candidates[0]))
+    assert "error" not in page, page
+    assert len(page["text"]) > 0
+
+
+def test_read_webpage_live_fetches_real_content():
+    # example.com is IANA-reserved specifically for documentation/testing
+    # use, extremely stable - a safe target for a genuine live fetch.
+    result = json.loads(tools.read_webpage.run(url="https://example.com"))
+    assert "error" not in result, result
+    assert "Example Domain" in result["text"]
+    assert result["url"] == "https://example.com"
+    assert isinstance(result["truncated"], bool)
+
+
+def test_read_webpage_strips_script_and_style():
+    result = json.loads(tools.read_webpage.run(url="https://example.com"))
+    assert "error" not in result, result
+    assert "<script" not in result["text"] and "<style" not in result["text"]
+
+
+def test_read_webpage_rejects_nonexistent_domain():
+    result = json.loads(tools.read_webpage.run(url="https://this-domain-should-not-exist-xyz-123-abc.invalid"))
+    assert "error" in result
+
+
+def test_read_webpage_truncates_long_content():
+    reset_state()
+    original_max = tools.READ_WEBPAGE_MAX_CHARS
+    tools.READ_WEBPAGE_MAX_CHARS = 50
+    try:
+        result = json.loads(tools.read_webpage.run(url="https://example.com"))
+        assert "error" not in result, result
+        assert len(result["text"]) <= 50
+        assert result["truncated"] is True
+    finally:
+        tools.READ_WEBPAGE_MAX_CHARS = original_max
 
 
 def test_fetch_discord_public_metrics_bad_invite_raises():
@@ -2113,13 +2241,13 @@ def test_apply_telegram_commands_approve_via_reply():
 
         log = tools._apply_telegram_commands([{"text": "approve", "reply_to_text": notification_text}])
         assert any(request_id in entry and "approved" in entry for entry in log)
-        stored = next(r for r in tools._read_jsonl("approval_queue.jsonl") if r["id"] == request_id)
+        stored = next(r for r in tools._read_global_jsonl("approval_queue.jsonl") if r["id"] == request_id)
         assert stored["status"] == "approved"
 
         # already decided - a second reply must not flip it or error
         log = tools._apply_telegram_commands([{"text": "reject", "reply_to_text": notification_text}])
         assert log == []
-        stored = next(r for r in tools._read_jsonl("approval_queue.jsonl") if r["id"] == request_id)
+        stored = next(r for r in tools._read_global_jsonl("approval_queue.jsonl") if r["id"] == request_id)
         assert stored["status"] == "approved"
     finally:
         if had_token is not None:
@@ -2187,7 +2315,7 @@ def test_apply_telegram_commands_payment_link_requires_approved_status():
             "text": f"payment_link: {approval_id} https://buy.stripe.com/xyz", "reply_to_text": "",
         }])
         assert log == []
-        stored = next(r for r in tools._read_jsonl("approval_queue.jsonl") if r["id"] == approval_id)
+        stored = next(r for r in tools._read_global_jsonl("approval_queue.jsonl") if r["id"] == approval_id)
         assert stored.get("payment_link_url") is None
     finally:
         if had_token is not None:
@@ -2203,9 +2331,9 @@ def test_apply_telegram_commands_payment_link_sets_url_once_approved():
     try:
         appr = json.loads(tools.request_approval.run(category="spend", proposal="payment link", reasoning="r"))
         approval_id = appr["queued"]
-        approvals = tools._read_jsonl("approval_queue.jsonl")
+        approvals = tools._read_global_jsonl("approval_queue.jsonl")
         approvals[0]["status"] = "approved"
-        tools._write_jsonl("approval_queue.jsonl", approvals)
+        tools._write_global_jsonl("approval_queue.jsonl", approvals)
 
         log = tools._apply_telegram_commands([{
             "text": f"payment_link: {approval_id} https://buy.stripe.com/xyz", "reply_to_text": "",
@@ -2314,9 +2442,9 @@ def test_write_hypothesis_duration_ceiling_override_via_approved_request():
         holding.read_subsidiaries.run()
         tools._apply_telegram_commands([{"text": "duration_policy: 2 4 10 none", "reply_to_text": ""}])
         appr = json.loads(tools.request_approval.run(category="deploy", proposal="extend research window", reasoning="r"))
-        approvals = tools._read_jsonl("approval_queue.jsonl")
+        approvals = tools._read_global_jsonl("approval_queue.jsonl")
         approvals[0]["status"] = "approved"
-        tools._write_jsonl("approval_queue.jsonl", approvals)
+        tools._write_global_jsonl("approval_queue.jsonl", approvals)
 
         over_ceiling = {**SAMPLE_HYP, "duration_extension_approval_id": appr["queued"]}
         result = json.loads(tools.write_hypothesis.run(hypothesis=json.dumps(over_ceiling)))
@@ -2335,12 +2463,12 @@ def test_notify_new_pending_approvals_marks_and_is_idempotent():
     try:
         appr = json.loads(tools.request_approval.run(category="deploy", proposal="p", reasoning="r"))
         tools.notify_new_pending_approvals()
-        stored = next(r for r in tools._read_jsonl("approval_queue.jsonl") if r["id"] == appr["queued"])
+        stored = next(r for r in tools._read_global_jsonl("approval_queue.jsonl") if r["id"] == appr["queued"])
         assert stored["telegram_notified"] is True
 
         # calling again must not error and must not un-mark it
         tools.notify_new_pending_approvals()
-        stored = next(r for r in tools._read_jsonl("approval_queue.jsonl") if r["id"] == appr["queued"])
+        stored = next(r for r in tools._read_global_jsonl("approval_queue.jsonl") if r["id"] == appr["queued"])
         assert stored["telegram_notified"] is True
     finally:
         if had_token is not None:
@@ -2385,7 +2513,7 @@ def test_read_subsidiaries_auto_bootstraps_api_sentinel():
     assert len(subs) == 1
     assert subs[0]["id"] == "api-sentinel"
     assert subs[0]["status"] == "active"
-    assert subs[0]["state_dir"] == str(tools.STATE_DIR)
+    assert subs[0]["state_dir"] == str(tools.STATE_DIR / "api-sentinel")
 
 
 def test_read_subsidiaries_status_filter():
@@ -2407,9 +2535,9 @@ def test_register_subsidiary_requires_approved_spend_like_request():
 def test_register_subsidiary_succeeds_once_approved():
     reset_state()
     appr = json.loads(tools.request_approval.run(category="deploy", proposal="spin off second-co", reasoning="r"))
-    approvals = tools._read_jsonl("approval_queue.jsonl")
+    approvals = tools._read_global_jsonl("approval_queue.jsonl")
     approvals[0]["status"] = "approved"
-    tools._write_jsonl("approval_queue.jsonl", approvals)
+    tools._write_global_jsonl("approval_queue.jsonl", approvals)
 
     result = json.loads(holding.register_subsidiary.run(
         subsidiary=json.dumps({"id": "second-co", "name": "Second Co", "focus": "test"}),
@@ -2424,15 +2552,17 @@ def test_register_subsidiary_succeeds_once_approved():
     # registry row - it must say so plainly on the record itself, not just
     # in its own docstring, so nothing downstream can miss it.
     assert new_sub["operative_capability"] == holding.NEW_SUBSIDIARY_CAPABILITY_NOTE
-    assert new_sub["state_dir"] is None
+    # Structural-rebuild addendum, section 2: a new subsidiary now gets a
+    # real, isolated data partition automatically - no longer state_dir=None.
+    assert new_sub["state_dir"] == str(tools.STATE_DIR / "second-co")
 
 
 def test_register_subsidiary_rejects_duplicate_id():
     reset_state()
     appr = json.loads(tools.request_approval.run(category="deploy", proposal="p", reasoning="r"))
-    approvals = tools._read_jsonl("approval_queue.jsonl")
+    approvals = tools._read_global_jsonl("approval_queue.jsonl")
     approvals[0]["status"] = "approved"
-    tools._write_jsonl("approval_queue.jsonl", approvals)
+    tools._write_global_jsonl("approval_queue.jsonl", approvals)
     result = json.loads(holding.register_subsidiary.run(
         subsidiary=json.dumps({"id": "api-sentinel", "name": "dup", "focus": "test"}),
         approved_request_id=appr["queued"],
@@ -2477,9 +2607,9 @@ def test_update_subsidiary_policies_roundtrip():
     reset_state()
     holding.read_subsidiaries.run()
     appr = json.loads(tools.request_approval.run(category="pricing", proposal="allow paid channels", reasoning="r"))
-    approvals = tools._read_jsonl("approval_queue.jsonl")
+    approvals = tools._read_global_jsonl("approval_queue.jsonl")
     approvals[0]["status"] = "approved"
-    tools._write_jsonl("approval_queue.jsonl", approvals)
+    tools._write_global_jsonl("approval_queue.jsonl", approvals)
 
     result = json.loads(holding.update_subsidiary_policies.run(
         subsidiary_id="api-sentinel", policies_patch=json.dumps({"paid_channels_allowed": True}),
@@ -2850,6 +2980,98 @@ def test_assess_subsidiary_trajectory_no_stall_once_a_build_exists():
     assert result["possible_stall"] is False
 
 
+# --- holding.py: stagnation escalation (structural-rebuild addendum, -------
+# section 3) - consecutive-cycle counter with a persistent, acknowledgeable
+# escalation, not just a note repeated identically forever.
+
+def test_assess_subsidiary_trajectory_counts_consecutive_stall_cycles():
+    reset_state()
+    holding.read_subsidiaries.run()
+    for i in range(holding.STALL_RESOLVED_THRESHOLD):
+        _write_buried_hyp(i)
+    for expected in range(1, 4):
+        result = json.loads(holding.assess_subsidiary_trajectory.run(subsidiary_id="api-sentinel"))
+        assert result["possible_stall"] is True
+        assert result["consecutive_stall_cycles"] == expected
+        assert result["stagnation_escalated"] is False  # below STAGNATION_ESCALATION_THRESHOLD still
+
+
+def test_assess_subsidiary_trajectory_escalates_at_threshold():
+    reset_state()
+    holding.read_subsidiaries.run()
+    for i in range(holding.STALL_RESOLVED_THRESHOLD):
+        _write_buried_hyp(i)
+    result = None
+    for _ in range(holding.STAGNATION_ESCALATION_THRESHOLD):
+        result = json.loads(holding.assess_subsidiary_trajectory.run(subsidiary_id="api-sentinel"))
+    assert result["consecutive_stall_cycles"] == holding.STAGNATION_ESCALATION_THRESHOLD
+    assert result["stagnation_escalated"] is True
+    stored = json.loads(holding.read_subsidiaries.run())[0]
+    assert stored["stagnation_escalated"] is True
+    assert stored["stagnation_escalated_at"] is not None
+
+
+def test_assess_subsidiary_trajectory_resets_counter_and_escalation_on_recovery():
+    reset_state()
+    holding.read_subsidiaries.run()
+    for i in range(holding.STALL_RESOLVED_THRESHOLD):
+        _write_buried_hyp(i)
+    for _ in range(holding.STAGNATION_ESCALATION_THRESHOLD):
+        holding.assess_subsidiary_trajectory.run(subsidiary_id="api-sentinel")
+    tools.write_hypothesis.run(hypothesis=json.dumps({
+        **SAMPLE_HYP, "id": "hyp_build_recovery", "landing_page_variant_id": "lp_v_recovery",
+        "status": "evaluated", "outcome": "build",
+    }))
+    result = json.loads(holding.assess_subsidiary_trajectory.run(subsidiary_id="api-sentinel"))
+    assert result["possible_stall"] is False
+    assert result["consecutive_stall_cycles"] == 0
+    assert result["stagnation_escalated"] is False
+
+
+def test_apply_telegram_commands_stagnation_ack_clears_escalation():
+    reset_state()
+    had_token = os.environ.pop("TELEGRAM_BOT_TOKEN", None)
+    had_chat = os.environ.pop("TELEGRAM_CHAT_ID", None)
+    try:
+        holding.read_subsidiaries.run()
+        for i in range(holding.STALL_RESOLVED_THRESHOLD):
+            _write_buried_hyp(i)
+        for _ in range(holding.STAGNATION_ESCALATION_THRESHOLD):
+            holding.assess_subsidiary_trajectory.run(subsidiary_id="api-sentinel")
+        assert json.loads(holding.read_subsidiaries.run())[0]["stagnation_escalated"] is True
+
+        log = tools._apply_telegram_commands([{"text": "stagnation_ack: api-sentinel", "reply_to_text": ""}])
+        assert any("Stagnation-Eskalation bestaetigt" in entry for entry in log)
+        stored = json.loads(holding.read_subsidiaries.run())[0]
+        assert stored["stagnation_escalated"] is False
+        assert stored["consecutive_stall_cycles"] == 0
+    finally:
+        if had_token is not None:
+            os.environ["TELEGRAM_BOT_TOKEN"] = had_token
+        if had_chat is not None:
+            os.environ["TELEGRAM_CHAT_ID"] = had_chat
+
+
+def test_apply_telegram_commands_stagnation_ack_no_op_when_not_escalated():
+    reset_state()
+    had_token = os.environ.pop("TELEGRAM_BOT_TOKEN", None)
+    had_chat = os.environ.pop("TELEGRAM_CHAT_ID", None)
+    try:
+        holding.read_subsidiaries.run()
+        log = tools._apply_telegram_commands([{"text": "stagnation_ack: api-sentinel", "reply_to_text": ""}])
+        assert log == []
+    finally:
+        if had_token is not None:
+            os.environ["TELEGRAM_BOT_TOKEN"] = had_token
+        if had_chat is not None:
+            os.environ["TELEGRAM_CHAT_ID"] = had_chat
+
+
+def test_classify_command_stagnation_ack():
+    assert tools._classify_command("stagnation_ack: api-sentinel", "") == ("stagnation_ack", "api-sentinel")
+    assert tools._classify_command("stagnation_ack:", "") is None
+
+
 # --- holding.py: status reports (Sub-CEO -> Main-CEO structured handoff) ----
 
 def test_file_status_report_needs_decision_requires_context():
@@ -3058,6 +3280,7 @@ def test_ceo_agent_tools_match_spec():
         "file_pivot_proposal", "file_cross_subsidiary_request", "search_research_archive",
         "read_subsidiary_policies", "read_content_drafts", "log_research_finding", "read_research_findings",
         "read_knowledge_base", "write_knowledge_entry", "propose_idea", "file_stage_skip_request",
+        "search_web", "read_webpage",
     }, tool_names
 
 
@@ -3073,6 +3296,7 @@ def test_main_ceo_agent_tools_match_spec():
         "read_subsidiary_policies", "update_subsidiary_policies",
         "propose_idea", "read_ideas", "route_idea",
         "read_stage_skip_requests", "decide_stage_skip_request",
+        "search_web", "read_webpage",
     }, tool_names
 
 
@@ -3081,7 +3305,7 @@ def test_growth_dev_tools():
         "request_approval", "read_channel_metrics", "read_channels", "read_state", "read_hypotheses",
         "read_task_orders", "complete_task_order", "draft_content", "read_content_drafts",
         "check_community_risk", "get_account_stats", "log_research_finding", "read_research_findings",
-        "read_subsidiary_policies", "read_knowledge_base", "propose_idea",
+        "read_subsidiary_policies", "read_knowledge_base", "propose_idea", "search_web", "read_webpage",
     }
     assert {t.name for t in crew.dev_agent.tools} == {
         "open_pull_request", "read_task_orders", "complete_task_order", "check_approval_status",
@@ -3145,7 +3369,7 @@ def test_send_cycle_summary_never_raises_without_a_crew_run():
     reset_state()
     had_token = os.environ.pop("TELEGRAM_BOT_TOKEN", None)
     try:
-        crew.send_cycle_summary()  # no kickoff() happened; task.output is None on every task
+        crew.send_cycle_summary(subsidiary_id="api-sentinel")  # no kickoff() happened; task.output is None on every task
     finally:
         if had_token is not None:
             os.environ["TELEGRAM_BOT_TOKEN"] = had_token
@@ -3216,13 +3440,19 @@ def test_aufsichtsrat_lines_pending_stage_skips():
     assert any("3 offene Stage-Skip-Anfrage" in line for line in lines)
 
 
+def test_aufsichtsrat_lines_stagnation_escalation():
+    lines = crew._aufsichtsrat_lines(0, None, 0, ["api-sentinel"])
+    assert any("api-sentinel" in line and "stagnation_ack: api-sentinel" in line for line in lines)
+
+
 def test_aufsichtsrat_lines_combines_all_triggers():
     policy = {"status": "proposed", "values": {}}
-    lines = crew._aufsichtsrat_lines(1, policy, 2)
+    lines = crew._aufsichtsrat_lines(1, policy, 2, ["api-sentinel"])
     joined = "\n".join(lines)
     assert "offene Freigabe" in joined
     assert "Duration-Policy-Vorschlag" in joined
     assert "Stage-Skip-Anfrage" in joined
+    assert "stagnation_ack" in joined
 
 
 def test_usage_headline_is_first_line_in_cycle_summary():
@@ -3237,14 +3467,14 @@ def test_usage_headline_is_first_line_in_cycle_summary():
             "total_tokens": 999, "prompt_tokens": 900, "completion_tokens": 99,
             "cached_prompt_tokens": 0, "cache_creation_tokens": 0, "successful_requests": 3,
         })()
-        crew.send_cycle_summary()
+        crew.send_cycle_summary(subsidiary_id="api-sentinel")
         assert captured, "expected send_telegram_message to be called"
         # Structural-rebuild addendum, section 8: single message now, no
         # separate formatted-table follow-up.
         assert len(captured) == 1
         main_report = captured[0][0]
         lines = main_report.split("\n")
-        assert lines[0].startswith("API Sentinel Zyklus - ")
+        assert lines[0].startswith("api-sentinel Zyklus - ")
         assert lines[1].startswith("Gesamt-Tokens diesen Zyklus: 999")
         assert "$" in lines[1]  # cost figure present (model is priced in the active testing profile)
         assert "--- Hypothesen-Uebersicht ---" in main_report

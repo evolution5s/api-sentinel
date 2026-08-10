@@ -1,3 +1,4 @@
 ﻿crewai[anthropic]==1.15.11
 python-dotenv
 requests
+beautifulsoup4
