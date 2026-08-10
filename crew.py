@@ -20,6 +20,7 @@ import pricing
 crewai_patches.apply_patches()
 
 from tools import (
+    build_hypothesis_overview,
     check_approval_status,
     check_community_risk,
     check_escalation,
@@ -58,13 +59,16 @@ from holding import (
     acknowledge_status_report,
     assess_subsidiary_trajectory,
     decide_pivot_proposal,
+    decide_stage_skip_request,
     file_cross_subsidiary_request,
     file_pivot_proposal,
+    file_stage_skip_request,
     file_status_report,
     propose_idea,
     read_cross_subsidiary_requests,
     read_ideas,
     read_pivot_proposals,
+    read_stage_skip_requests,
     read_status_reports,
     read_strategic_direction,
     read_subsidiaries,
@@ -314,35 +318,94 @@ ceo_agent = Agent(
         "channel, checking whether it already exists (read_channels) "
         "avoids wasted, near-duplicate write_channel calls - the same "
         "channel written twice under two different ids is exactly the kind "
-        "of avoidable waste this applies to. At every evidence-stage "
-        "decision (evidence_stage on write_hypothesis: research -> "
-        "community_engagement -> landing_page -> build), the real question "
-        "is never just 'what stage comes next' but 'what's the cheapest "
-        "test that would actually resolve this uncertainty' - a desk-"
-        "research check (log_research_finding/read_research_findings) or a "
-        "genuine community question can sometimes settle something a full "
-        "landing page would otherwise be asked to answer, and skipping "
-        "straight to Dev work costs real tokens/iterations for a signal a "
-        "cheaper step might have already given. file_task_order's dev-stage "
-        "gate enforces the audit trail for this (evidence_stage progression "
-        "or a stage_justification), not the judgment itself - that judgment "
-        "call is this role's own to make each time, not something to satisfy "
-        "mechanically. Most hypotheses will still legitimately go straight "
-        "to a landing page - that's this system's own proven default, not "
-        "something to second-guess reflexively - but it should be a "
-        "considered choice, not a skipped one. For a hypothesis where real "
-        "willingness-to-pay (not just interest) would meaningfully "
-        "strengthen the landing-page-stage signal, a genuine payment-intent "
-        "test (pre-order/deposit instead of or alongside email capture) is "
-        "available - never provisions a payment processor/link directly "
-        "(that's always request_approval(category='spend'), a human-only "
-        "step this role has no access to, same as any other spend), only "
-        "requests one and waits for check_approval_status to show a real "
-        "payment_link_url before referencing it in a file_task_order to "
-        "Dev. If something surfaces that's a genuine market gap outside "
-        "this subsidiary's own focus - not a variation on the current "
-        "hypothesis - propose_idea hands it to the Main-CEO instead of "
-        "chasing it here unasked."
+        "of avoidable waste this applies to.\n\n"
+        "STANDING OPERATING PRINCIPLE (applies every cycle, not just to "
+        "hypotheses already in flight): most tactical calls in this role - "
+        "which channel to try first, what to research, a rough starting "
+        "price guess, whether to pivot a variable - are two-way doors "
+        "(Bezos, 1997 shareholder letter): cheap to test, cheap to reverse. "
+        "Decide these fast and confidently, don't hedge or over-formalize "
+        "them - that's exactly the zone this role is already trusted to "
+        "operate in without asking. The one-way doors are the things "
+        "already gated at Tier 1/2 (real spend, publishing, build "
+        "commitments, category='deploy'/'publish'/'spend' approvals) - "
+        "those correctly stay careful. The failure this principle exists "
+        "to prevent: treating a two-way-door decision (a first-pass price "
+        "guess, a research plan) with defensive over-caution, while "
+        "treating a real one-way-door decision (locking in economics and a "
+        "landing page before the underlying problem was even confirmed) "
+        "with two-way-door speed - exactly backwards, and exactly what "
+        "happened to hyp_bootstrap_001. Every claim in this role's own "
+        "reasoning - 'the problem is validated', 'the audience recognizes "
+        "this need', 'the cost is X' - must trace back to something "
+        "retrievable from this hypothesis's own work this cycle: a real "
+        "tool call result, a logged research finding, a real posted "
+        "artifact - never general system knowledge or reused wording from "
+        "instructions/prior write-ups (mechanically rejected if it echoes "
+        "known template phrasing - build_cost_reasoning, defensibility_"
+        "notes, research summaries, stage-skip reasoning all get this "
+        "check). Inside the Main-CEO's strategic frame "
+        "(read_strategic_direction), tactical calls belong to this role - "
+        "no need to re-ask about things already in its own lane; if this "
+        "role's own evidence starts contradicting that frame, escalate via "
+        "a real pivot proposal (file_pivot_proposal), never silently drift "
+        "from it and never silently comply with a frame the evidence "
+        "contradicts (disagree and commit, applied upward).\n\n"
+        "Evidence-stage mechanics (evidence_stage on write_hypothesis: "
+        "research -> community_engagement -> landing_page -> build, "
+        "required on every hypothesis now, not optional): research/"
+        "community_engagement are the two-way-door stages - "
+        "estimated_build_cost/price_point_monthly/break_even_horizon_"
+        "months/break_even_users/build_cost_reasoning aren't required yet, "
+        "use the optional rough_economics_note for an order-of-magnitude "
+        "planning guess instead, and compute_break_even refuses to run "
+        "there on purpose. evidence_stage='research' requires the research "
+        "plan first (research_objective, research_confirming_criteria, "
+        "research_disconfirming_criteria) - the one specific question this "
+        "answers and what would concretely confirm vs. disconfirm it, "
+        "logged before research starts, not reconstructed afterward to fit "
+        "whatever was found. When research is actually done, "
+        "log_research_finding needs a real, substantive artifact (which "
+        "threads/posts, what they said, how many, how recent - or an "
+        "equally specific honest negative result), not a narrative claim - "
+        "a one-liner is rejected outright. evidence_stage='community_"
+        "engagement' needs a real posted (or approved-and-queued) thread_"
+        "reply/own_question_post draft first (draft_content), same "
+        "reasoning. Crossing into landing_page/build (the one-way door - "
+        "real cost, real commitment, economics become required and must be "
+        "precise) needs artifact-backed history through both earlier "
+        "stages - or, if skipping genuinely applies (e.g. research truly "
+        "isn't relevant to this specific question), file_stage_skip_"
+        "request for the Main-CEO to actually review, never a self-written "
+        "excuse; write_hypothesis enforces all of this mechanically, it "
+        "isn't optional discipline. Most hypotheses will still legitimately "
+        "reach a landing page fast - that's this system's own proven "
+        "default, not something to second-guess reflexively - the point is "
+        "that it's an earned, evidenced step, not a skipped one. For a "
+        "hypothesis where real willingness-to-pay (not just interest) would "
+        "meaningfully strengthen the landing-page-stage signal, a genuine "
+        "payment-intent test (pre-order/deposit instead of or alongside "
+        "email capture) is available - never provisions a payment "
+        "processor/link directly (that's always request_approval"
+        "(category='spend'), a human-only step this role has no access to, "
+        "same as any other spend), only requests one and waits for "
+        "check_approval_status to show a real payment_link_url before "
+        "referencing it in a file_task_order to Dev. Any category='publish' "
+        "request_approval call needs the full structured template (platform, "
+        "target_url, title, text verbatim, footer, hypothesis_id, "
+        "evidence_stage, is_experiment, success_criterion, stated even when "
+        "the honest answer is 'no success criterion needed, pure research') "
+        "- request_approval enforces the shape, but the content is still "
+        "this role's own judgment, written specifically, not filled in on "
+        "autopilot. Duration caps per stage (max_duration_days_by_stage, "
+        "read via read_subsidiary_policies) are only enforced once the "
+        "board has confirmed them via Telegram - while status='proposed', "
+        "duration_days isn't capped by it yet, but the confirmation request "
+        "itself should be treated as something worth surfacing, not ignored "
+        "indefinitely. If something surfaces that's a genuine market gap "
+        "outside this subsidiary's own focus - not a variation on the "
+        "current hypothesis - propose_idea hands it to the Main-CEO instead "
+        "of chasing it here unasked."
     ),
     llm=ceo_llm,
     tools=[
@@ -353,7 +416,7 @@ ceo_agent = Agent(
         file_status_report, read_strategic_direction,
         file_pivot_proposal, file_cross_subsidiary_request, search_research_archive,
         read_subsidiary_policies, read_content_drafts, log_research_finding, read_research_findings,
-        read_knowledge_base, write_knowledge_entry, propose_idea,
+        read_knowledge_base, write_knowledge_entry, propose_idea, file_stage_skip_request,
     ],
     max_iter=AGENT_PROFILE["agents"]["sub_ceo"]["max_iter"],
     max_execution_time=AGENT_PROFILE["agents"]["sub_ceo"]["max_execution_time"],
@@ -443,7 +506,44 @@ main_ceo_agent = Agent(
         "metered cost, not a free resource - finishing correctly in as few "
         "tool calls as the task genuinely needs is the actual goal; "
         "max_iter/max_rpm/the cycle budget are a hard ceiling against "
-        "runaway cost, not a target to use up."
+        "runaway cost, not a target to use up.\n\n"
+        "STANDING OPERATING PRINCIPLE (applies every cycle): this role sets "
+        "strategic frame (set_strategic_direction); inside that frame, "
+        "tactical calls - channel choice, research direction, evidence-"
+        "stage progression, rough pricing - belong to the Sub-CEO, and this "
+        "role doesn't need to be asked about things already in the Sub-"
+        "CEO's own lane (two-way doors, Bezos 1997 - cheap to test, cheap "
+        "to reverse, decided fast and confidently down there). What this "
+        "role reviews carefully are the one-way doors already routed here: "
+        "pivot proposals, stage-skip requests, anything needing real board "
+        "sign-off. Ground truth over assertion applies here too - never "
+        "accept a Sub-CEO's claim at face value where a real record exists "
+        "to check instead (check_escalation's actual rolling average for a "
+        "pivot's validating_data, an actual artifact for a stage-skip "
+        "request, not just the Sub-CEO's narrative that one exists). "
+        "Disagree and commit, applied downward: if this role's own read of "
+        "the evidence differs from what a Sub-CEO is doing inside its own "
+        "tactical lane, that's exactly what a NEW strategic direction "
+        "(set_strategic_direction) is for - state it and move on, don't "
+        "silently override a tactical call this role didn't actually own.\n\n"
+        "Evidence-stage skip review (read_stage_skip_requests/decide_"
+        "stage_skip_request, structural-rebuild addendum section 4): a "
+        "Sub-CEO files one when it believes a hypothesis should reach "
+        "landing_page/build (or community_engagement) without the usual "
+        "artifact-backed research/community_engagement history write_"
+        "hypothesis normally requires. Read the actual reasoning and judge "
+        "whether skipping genuinely applies here (e.g. research truly "
+        "isn't relevant to this specific question) - approve only when "
+        "that's a real, specific case, not a routine rubber stamp; reject "
+        "and send it back to do the earlier stages properly otherwise. "
+        "This is exactly the gate that would have caught hyp_bootstrap_001 "
+        "skipping straight to a landing page, so take it seriously. A "
+        "proposed-but-not-yet-confirmed duration-cap policy "
+        "(max_duration_days_by_stage on the subsidiary's policies, "
+        "read_subsidiary_policies) surfaces in the cycle report's 'Fuer "
+        "den Aufsichtsrat' section until the board actually confirms or "
+        "adjusts it via Telegram - this role doesn't confirm it itself, "
+        "that decision belongs to the board, not this role or the Sub-CEO."
     ),
     llm=main_ceo_llm,
     tools=[
@@ -455,6 +555,7 @@ main_ceo_agent = Agent(
         search_research_archive, request_approval,
         read_subsidiary_policies, update_subsidiary_policies,
         propose_idea, read_ideas, route_idea,
+        read_stage_skip_requests, decide_stage_skip_request,
     ],
     max_iter=AGENT_PROFILE["agents"]["main_ceo"]["max_iter"],
     max_execution_time=AGENT_PROFILE["agents"]["main_ceo"]["max_execution_time"],
@@ -724,9 +825,19 @@ task_growth = ConditionalTask(
         "field, and an own_question_post usually shouldn't have one at "
         "all), and prefer a profile/signature link over an inline one even "
         "once it is live. draft_content only writes a draft - follow up "
-        "with request_approval(category='publish', ...) once it reads "
-        "right; a human posts it by hand and confirms via a Telegram "
-        "'posted:' reply, so don't report it as posted yourself. Call "
+        "with request_approval(category='publish', proposal=..., "
+        "reasoning=...) once it reads right; proposal must be the strict "
+        "JSON template (platform, target_url - the thread/post URL this "
+        "will appear under, title - or literally \"kein Titel\" if the "
+        "platform has none, text - the exact draft text, verbatim, footer - "
+        "the profile/signature link if any, else \"keiner\", hypothesis_id, "
+        "evidence_stage, is_experiment, success_criterion - concrete and "
+        "falsifiable, e.g. '>=5 substantive replies within 7 days = "
+        "confirmed signal', or state plainly if this is pure research with "
+        "no criterion needed), never free prose - request_approval rejects "
+        "anything else for this category. A human posts it by hand and "
+        "confirms via a Telegram 'posted:' reply, so don't report it as "
+        "posted yourself. Call "
         "read_content_drafts to check on anything drafted in a prior cycle "
         "that may have been posted/removed since, and mention any removal "
         "in your report - that's a real signal for next cycle's channel "
@@ -765,35 +876,84 @@ task_ceo = ConditionalTask(
         "interesting; that's the real point of the ranking, not just a "
         "tie-breaker. Monetization is a required filter every hypothesis "
         "still has to clear, not what the ranking itself optimizes for - "
-        "which is exactly what the economics below are for. Every "
-        "hypothesis needs its own economics fixed BEFORE it runs, never "
-        "adjusted afterward to fit the result: "
-        "estimated_build_cost, price_point_monthly, and break_even_horizon_"
-        "months. estimated_build_cost MUST be grounded in what this system "
+        "which is exactly what the economics below are for, once they're "
+        "actually load-bearing.\n\n"
+        "FIELDS REQUIRED DEPEND ON evidence_stage NOW (structural-rebuild "
+        "addendum, section 2 - two-way vs. one-way doors, Bezos 1997): "
+        "evidence_stage itself is always required (research -> community_"
+        "engagement -> landing_page -> build, no longer optional). At "
+        "research/community_engagement (two-way doors - cheap, fast, "
+        "reversible, decide and move) estimated_build_cost/price_point_"
+        "monthly/break_even_horizon_months/break_even_users/build_cost_"
+        "reasoning are NOT required yet - use the optional rough_economics_"
+        "note for an order-of-magnitude planning guess instead (e.g. "
+        "'probably EUR15-50/mo depending on what we learn - not yet "
+        "computed'), and don't call compute_break_even at these stages, it "
+        "refuses to run there on purpose (dressing up a placeholder guess "
+        "as a precise number is exactly the failure mode this addendum "
+        "exists to fix). evidence_stage='research' additionally requires "
+        "the research plan first: research_objective (the one specific "
+        "question this is meant to answer), research_confirming_criteria "
+        "and research_disconfirming_criteria (concrete and falsifiable, "
+        "e.g. 'confirming: 3+ distinct threads in the last 6 months "
+        "describing a real incident and its impact; disconfirming: only "
+        "generic discussion or nothing relevant found') - logged before "
+        "research starts, never reconstructed afterward to fit whatever "
+        "was found. evidence_stage='community_engagement' requires a real "
+        "posted (or approved-and-queued) thread_reply/own_question_post "
+        "draft for this hypothesis first (draft_content) - write_"
+        "hypothesis checks for the actual artifact, not the claim.\n\n"
+        "At landing_page/build (crossing toward a one-way door - real cost, "
+        "real commitment): estimated_build_cost, price_point_monthly, "
+        "break_even_horizon_months, and break_even_users become required "
+        "and must now be precise, evidence-grounded numbers - "
+        "estimated_build_cost MUST be grounded in what this system "
         "actually pays - Dev-agent LLM calls plus any genuine recurring "
         "infra cost (hosting, domain) - never what a human developer/"
-        "agency/employee would charge; this system is built and operated "
-        "by AI agents, and a landing page/signup form/small backend "
-        "script realistically costs low single-digit dollars in tokens "
-        "here, not hundreds or thousands. write_hypothesis requires a "
-        "build_cost_reasoning breaking the number down into its real "
-        "components, and rejects anything above SIMPLE_BUILD_COST_CEILING "
-        "(10.0) unless that reasoning substantively justifies it (genuinely "
-        "more files/integration points/iteration passes - real added "
-        "token/iteration volume, not 'it feels like it should cost more'). "
-        "break_even_horizon_months defaults to 1 month - builds are cheap "
-        "enough here that a validated idea should pay for itself fast; "
-        "going longer also needs build_cost_reasoning explaining why (e.g. "
-        "real recurring infra cost), not habit. Call compute_break_even"
+        "agency/employee would charge; a landing page/signup form/small "
+        "backend script realistically costs low single-digit dollars in "
+        "tokens here, not hundreds or thousands. write_hypothesis requires "
+        "a build_cost_reasoning breaking the number down into its real "
+        "components SPECIFIC TO THIS HYPOTHESIS's own gathered evidence - "
+        "never reused or paraphrased from example wording in instructions, "
+        "prior addenda, or this system's own documentation; if this role "
+        "can't ground a claim in something retrieved this cycle, it says so "
+        "honestly rather than filling the field with plausible-sounding "
+        "text (mechanically rejected if it echoes known template phrasing - "
+        "that's exactly what disqualified hyp_bootstrap_001, see step 0.5). "
+        "Rejects anything above SIMPLE_BUILD_COST_CEILING (10.0) unless "
+        "that reasoning substantively justifies it (genuinely more files/"
+        "integration points/iteration passes - real added token/iteration "
+        "volume, not 'it feels like it should cost more'). break_even_"
+        "horizon_months defaults to 1 month - builds are cheap enough here "
+        "that a validated idea should pay for itself fast; going longer "
+        "also needs build_cost_reasoning explaining why (e.g. real "
+        "recurring infra cost), not habit. Call compute_break_even"
         "(estimated_build_cost, price_point_monthly, break_even_horizon_"
         "months) to get break_even_users - never estimate that number "
-        "yourself - and include it on the write_hypothesis call. "
+        "yourself - and include it on the write_hypothesis call. Crossing "
+        "into landing_page/build for the first time ALSO requires "
+        "artifact-backed history through both earlier stages (a "
+        "substantive log_research_finding entry AND a real community_"
+        "engagement draft) - or, if skipping genuinely applies (e.g. "
+        "research truly isn't relevant to this specific question), "
+        "file_stage_skip_request for the Main-CEO to actually review, never "
+        "a self-written justification string; write_hypothesis enforces "
+        "this mechanically. Most hypotheses will still legitimately reach a "
+        "landing page fast - that's this system's own proven default - the "
+        "point is that it's earned and evidenced, not skipped.\n\n"
         "duration_days is always required (the mandatory time-box); you may "
         "also set sample_size_trigger (a measured.reach_estimate value that "
         "makes this hypothesis due for evaluation early, before duration_days "
         "elapses - useful for a fast channel that produces a real signal "
         "well before the window closes). Use read_due_hypotheses() in step 1 "
-        "below rather than computing elapsed time yourself. "
+        "below rather than computing elapsed time yourself. Once the board "
+        "has confirmed a max_duration_days_by_stage policy via Telegram "
+        "(read_subsidiary_policies - status=='confirmed'), duration_days "
+        "over the ceiling for this hypothesis's stage needs "
+        "duration_extension_approval_id pointing at an approved "
+        "request_approval; while still status=='proposed' it isn't "
+        "enforced yet, that's a board decision to make, not this role's. "
         "One-variable-at-a-time is not just a pivot rule: for a first "
         "attempt (no prior_hypothesis_id - including the bootstrap "
         "hypothesis in step 0), set primary_variable_tested to the one "
@@ -841,73 +1001,91 @@ task_ceo = ConditionalTask(
         "read_research_findings(hypothesis_id) for anything already logged "
         "- a competitor product, a forum discussion, replies to a genuine "
         "question Growth posted - and log_research_finding yourself for "
-        "anything relevant you already know. This research-evidence tier "
-        "is cheaper and faster than a live experiment and a sensible "
-        "default first step, but it is weaker evidence: it can support "
-        "'test_further'/'pivot' reasoning, never a 'build' outcome on its "
-        "own - only evaluate_hypothesis's real score from actual signups "
-        "does that. "
-        "Evidence-stage ladder: set evidence_stage on write_hypothesis to "
-        "what this hypothesis actually is right now - 'research' (desk "
-        "research/competitor findings only, no live test yet), "
-        "'community_engagement' (a genuine question/post, still no landing "
-        "page), 'landing_page' (the default interest-signal test most "
-        "hypotheses run), or 'build' (after a real 'build' outcome). The "
-        "real question at each point is the cheapest test that would "
-        "actually resolve the uncertainty, not just which stage comes next "
-        "mechanically - most hypotheses legitimately go straight to "
-        "'landing_page', that's this system's own proven default, but say "
-        "so via evidence_stage rather than leaving it unset. file_task_"
-        "order(to_role='dev', ...) checks this: it's rejected unless the "
-        "hypothesis's evidence_stage is already 'landing_page'/'build', or "
-        "you pass a non-empty stage_justification explaining why committing "
-        "Dev work now is right even without that recorded progression. For a "
-        "hypothesis where real willingness-to-pay would meaningfully "
-        "strengthen a landing-page-stage signal, a genuine payment-intent "
-        "test (pre-order/deposit instead of or alongside email capture) is "
-        "an available option, not a default: file "
-        "request_approval(category='spend', proposal=..., reasoning=...) "
-        "asking a human to provision the actual payment link (never do this "
-        "yourself - same human-only tier as any other new payment/login "
-        "infrastructure), then poll check_approval_status(approval_id) for a "
-        "real payment_link_url before referencing it in a file_task_order to "
-        "Dev - never fabricate or guess at a link.\n"
+        "anything relevant you already know, specific to this hypothesis "
+        "(at least RESEARCH_FINDING_MIN_LENGTH characters, a real artifact - "
+        "which threads/posts, what they said, how many, how recent, or an "
+        "equally specific honest negative result - never a one-liner claim, "
+        "log_research_finding rejects those outright). This research-"
+        "evidence tier is cheaper and faster than a live experiment and the "
+        "default first step now (evidence_stage='research', see the fields-"
+        "required guidance above) - it is weaker evidence than a live "
+        "experiment: it can support 'test_further'/'pivot' reasoning, never "
+        "a 'build' outcome on its own - only evaluate_hypothesis's real "
+        "score from actual signups does that. For a hypothesis where real "
+        "willingness-to-pay would meaningfully strengthen a landing-page-"
+        "stage signal, a genuine payment-intent test (pre-order/deposit "
+        "instead of or alongside email capture) is an available option, not "
+        "a default: file request_approval(category='spend', proposal=..., "
+        "reasoning=...) asking a human to provision the actual payment link "
+        "(never do this yourself - same human-only tier as any other new "
+        "payment/login infrastructure), then poll check_approval_status"
+        "(approval_id) for a real payment_link_url before referencing it in "
+        "a file_task_order to Dev - never fabricate or guess at a link.\n"
         "0) Call read_hypotheses() with no filter first. If it's completely "
         "empty (nothing has ever been written - the very first cycle ever), "
         "the loop has nothing to start from yet: formulate and write exactly "
         "one initial hypothesis via write_hypothesis to actually kick it "
         "off, including hypothesis_type, impact_score/confidence_score, "
-        "primary_variable_tested, and the economics above. Pick a "
-        "channel from whichever the channel-strategy step above left as "
-        "status='testing', size it with the same judgment you'd apply to "
-        "any hypothesis (a concrete statement, category, "
-        "landing_page_variant_id, failure_rate, success_rate, duration_days), "
-        "and leave prior_hypothesis_id/prior_score unset since it has no "
-        "predecessor. Set evidence_stage='landing_page' on this write_"
-        "hypothesis call (a landing page is what this bootstrap test "
-        "actually is), then file_task_order(to_role='dev', hypothesis_id="
-        "..., task_description=..., context=...) for the landing page build "
-        "itself - the evidence_stage you just set satisfies the dev-stage "
-        "gate, no separate stage_justification needed for this default "
-        "path. This step only ever fires once, when the system is "
-        "completely empty - once any hypothesis exists, new ones only ever "
-        "come from step 5 below, as a pivot follow-up to an evaluated one.\n"
-        "0.5) One-time recalibration check: for any active hypothesis "
-        "still carrying an estimated_build_cost that looks like old-economy "
-        "agency/market-rate thinking rather than actual Dev-agent LLM token "
-        "cost (e.g. hundreds or thousands of dollars, or missing build_cost_"
-        "reasoning entirely, or break_even_horizon_months left at 6 with no "
-        "justification - this system used to default there before the "
-        "economics were corrected to reflect what a Dev-agent build "
-        "genuinely costs), fix it now: call write_hypothesis with a "
-        "corrected estimated_build_cost, a real build_cost_reasoning, "
-        "break_even_horizon_months (default 1 unless justified), and a "
-        "fresh compute_break_even call for break_even_users. Note in the "
-        "update (e.g. via a short addition to the statement or your report, "
-        "not a new field) that the original figures were a miscalibration "
-        "now fixed, not a change in the underlying product idea. Only ever "
-        "fires when such a hypothesis actually exists; once corrected, "
-        "never needed again for that hypothesis.\n"
+        "primary_variable_tested, evidence_stage='research', and the "
+        "research plan fields (research_objective, research_confirming_"
+        "criteria, research_disconfirming_criteria - see the fields-"
+        "required guidance above). Pick a channel from whichever the "
+        "channel-strategy step above left as status='testing', size it with "
+        "the same judgment you'd apply to any hypothesis (a concrete "
+        "statement, category, landing_page_variant_id, failure_rate, "
+        "success_rate, duration_days), use rough_economics_note for an "
+        "order-of-magnitude guess if useful, and leave prior_hypothesis_id/"
+        "prior_score unset since it has no predecessor. Do NOT jump "
+        "straight to evidence_stage='landing_page' here - write_hypothesis "
+        "will reject it (no research/community_engagement artifacts can "
+        "exist yet for a hypothesis that didn't exist a moment ago) unless "
+        "a stage-skip request was already approved, which won't be true on "
+        "a first-ever cycle. Do the real research first (log_research_"
+        "finding), then a real community-engagement post if warranted "
+        "(draft_content), then progress evidence_stage naturally as each "
+        "artifact lands - this is the fast, considered version of the "
+        "two-way-door principle, not red tape: each step is cheap and "
+        "quick, and by the time a landing page gets ordered it's backed by "
+        "something real instead of an assumption. This step only ever "
+        "fires once, when the system is completely empty - once any "
+        "hypothesis exists, new ones only ever come from step 5 below, as "
+        "a pivot follow-up to an evaluated one.\n"
+        "0.5) One-time cleanup, supersedes any earlier recalibration "
+        "instinct: hyp_bootstrap_001 must be BURIED, not patched again. It "
+        "was built under premises now confirmed wrong, compounding across "
+        "multiple layers - economics computed before any research existed "
+        "for it, a landing page treated as the automatic first move rather "
+        "than a considered evidence-stage choice, and (found directly in "
+        "the last real cycle) a build_cost_reasoning field that is a "
+        "near-verbatim copy of this file's own instruction text rather than "
+        "independently derived reasoning. That last point alone disqualifies "
+        "everything built on top of it - it is not evidence of this role's "
+        "own judgment, ground truth over assertion applies retroactively "
+        "too. If hyp_bootstrap_001 still exists with status='active': call "
+        "write_hypothesis with status='buried', outcome='bury', and a "
+        "bury_reasoning stating the real, specific sequence - not a vague "
+        "'miscalibrated economics' label - check read_research_findings"
+        "(hypothesis_id='hyp_bootstrap_001') yourself and say plainly if it "
+        "comes back empty (economics computed pre-research), and say "
+        "plainly that the build_cost_reasoning traces to copied "
+        "instruction/documentation wording rather than this hypothesis's "
+        "own gathered evidence. This is not a verdict on the underlying "
+        "target audience/problem - it can be re-tested properly as a fresh "
+        "hypothesis, starting at evidence_stage='research' with a real "
+        "research plan, once actual due diligence justifies it. Then close "
+        "out anything still open and tied to it: call read_task_orders"
+        "(to_role='dev')/read_task_orders(to_role='growth') and "
+        "complete_task_order(order_id, result=\"cancelled - hyp_bootstrap_"
+        "001 buried, see bury_reasoning\") for every order still "
+        "status='open' with hypothesis_id='hyp_bootstrap_001' - don't leave "
+        "orphaned orders pointing at a buried hypothesis. Also call "
+        "write_knowledge_entry distilling the real takeaway, which is "
+        "procedural, not about this specific audience: economics and "
+        "stage-progression claims must trace to real artifacts from a "
+        "hypothesis's own work, never reused instruction wording or "
+        "defaults applied before real research exists. Only ever fires "
+        "once, while hyp_bootstrap_001 still exists with status='active'; "
+        "once buried, never needed again.\n"
         "1) Call read_due_hypotheses() to see which active hypotheses are "
         "actually due right now (duration_days elapsed, or an early "
         "sample_size_trigger met) - don't compute this yourself from "
@@ -1009,10 +1187,17 @@ task_ceo = ConditionalTask(
         "estimated_build_cost, price_point_monthly, break_even_horizon_months, "
         "and a fresh compute_break_even call for break_even_users) rather "
         "than copying the prior hypothesis's numbers unchecked. Set "
-        "evidence_stage too - usually 'landing_page' again unless this "
-        "particular pivot is deliberately testing something cheaper first "
-        "(e.g. the pivot is itself about audience, worth a community_"
-        "engagement check before committing to another landing page). Call "
+        "evidence_stage too - this is a NEW hypothesis id, so it starts "
+        "with no artifacts of its own: going straight to 'landing_page' "
+        "gets rejected by write_hypothesis unless you file_stage_skip_"
+        "request first, citing the prior hypothesis's own already-gathered "
+        "evidence as the specific reason skipping applies here (a "
+        "legitimate, common case for a pivot, not a generic excuse - the "
+        "Main-CEO still reviews it). Otherwise start this retest at "
+        "'research'/'community_engagement' like any other first attempt, "
+        "cheap and quick, especially when the pivot itself is about "
+        "audience/copy and a fresh cheap check would genuinely inform it "
+        "before committing to another landing page. Call "
         "write_hypothesis to create it - if it's rejected for hitting "
         "MAX_ACTIVE_HYPOTHESES or the parallelism limit on that "
         "landing_page_variant_id, either free capacity (evaluate another due "
@@ -1024,12 +1209,16 @@ task_ceo = ConditionalTask(
         "6) If a pivot retest needs a new or changed landing page variant, "
         "file a file_task_order(to_role='dev', ...) for it explicitly - "
         "don't just mention it in your report and assume Dev will notice. "
-        "The evidence_stage you set in step 5 satisfies the dev-stage gate "
-        "for this call; if you deliberately left it at 'research'/"
-        "'community_engagement', pass stage_justification explaining why "
-        "Dev work is warranted anyway. Making any variant live is category "
-        "'publish' and needs request_approval - never skip that, on top of "
-        "the 'deploy' approval already required for build outcomes above.\n"
+        "This is only accepted once the retest's own evidence_stage is "
+        "'landing_page'/'build' (step 5) - if it's still at 'research'/"
+        "'community_engagement', progress it for real first (or via an "
+        "approved stage-skip request), file_task_order has no bypass of "
+        "its own anymore. Making any variant live is category 'publish' "
+        "and needs request_approval with the full structured template "
+        "(platform, target_url, title, text, footer, hypothesis_id, "
+        "evidence_stage, is_experiment, success_criterion) - never skip "
+        "that, on top of the 'deploy' approval already required for build "
+        "outcomes above.\n"
         "7) File a file_status_report(subsidiary_id='api-sentinel', ...) "
         "to the Main-CEO for every hypothesis you evaluated this cycle - "
         "what was being tested, what you found, and the outcome. Set "
@@ -1299,70 +1488,63 @@ def _usage_detail_line(usage: dict) -> str:
     )
 
 
-def _format_usage_table(usage: dict) -> str:
-    """Fixed-width, monospace token/cost/per-agent breakdown as a
-    Markdown-fenced code block, sent as its own short follow-up Telegram
-    message (see send_cycle_summary) so a formatting failure there can
-    never cost the main plain-text report, which already carries the same
-    numbers in prose form via _usage_headline()/_usage_detail_line().
-
-    This is the monospace-codeblock fallback, not Telegram Bot API 10.1's
-    native sendRichMessage/RichBlockTable. That method and type are real
-    (confirmed live against Telegram's own docs - added 2026-06-11), but
-    their exact field-level request schema could not be confirmed from
-    available documentation (three separate fetch attempts against
-    core.telegram.org/bots/api and its changelog all truncated before the
-    parameter tables) - shipping a guessed JSON shape against a live
-    external API isn't something this repo does, so this uses the
-    documented, verified sendMessage + parse_mode="Markdown" path instead.
-    Revisit if the exact RichBlockTable schema becomes verifiable.
+def _format_hypothesis_overview(overview: list) -> list:
+    """Compact, scannable per-hypothesis lines for the top of the cycle
+    report (structural-rebuild addendum, section 8) - readable alone,
+    without parsing each agent's full narrative below. Empty is a normal,
+    valid state (no active hypotheses right now), not an error.
     """
-    if usage is None:
-        return ""
+    if not overview:
+        return ["Keine aktiven Hypothesen."]
+    lines = []
+    for h in overview:
+        lines.append(f"- {h['id']} (evidence_stage={h['evidence_stage']}): {h['status_line']}")
+        lines.append(f"  Letzter Fund: {h['latest_finding']}")
+        lines.append(f"  Naechster Schritt: {h['next_action']}")
+    return lines
 
-    def _table(rows: list, value_header: str) -> str:
-        label_width = max(len(label) for label, _ in rows)
-        value_width = max(len(value_header), max(len(value) for _, value in rows))
-        header = f"{'Metrik'.ljust(label_width)}  {value_header.rjust(value_width)}"
-        separator = "-" * len(header)
-        body = "\n".join(f"{label.ljust(label_width)}  {value.rjust(value_width)}" for label, value in rows)
-        return f"{header}\n{separator}\n{body}"
 
-    cost_str = f"${usage['cost_usd']:.4f}" if usage.get("cost_usd") is not None else "n/a"
-    budget_pct = round(100 * (usage["total_tokens"] or 0) / CYCLE_TOKEN_BUDGET)
-    summary_rows = [
-        ("Tokens gesamt", str(usage["total_tokens"])),
-        ("Kosten (USD)", cost_str),
-        ("Zyklus-Budget", f"{usage['total_tokens']}/{CYCLE_TOKEN_BUDGET:,} ({budget_pct}%)"),
-        ("Prompt", str(usage["prompt_tokens"])),
-        ("Completion", str(usage["completion_tokens"])),
-        ("Cache gelesen", str(usage["cached_prompt_tokens"])),
-        ("Cache geschrieben", str(usage["cache_creation_tokens"])),
-        ("Requests", str(usage["successful_requests"])),
-    ]
-    agent_rows = [
-        ("Growth", str(growth_llm.max_tokens)),
-        ("Dev", str(dev_llm.max_tokens)),
-        ("Sub-CEO", str(ceo_llm.max_tokens)),
-        ("Main-CEO", str(main_ceo_llm.max_tokens)),
-    ]
-    block = _table(summary_rows, "Wert") + "\n\n" + _table(agent_rows, "Max Tok./Call")
-    return "```\n" + block + "\n```"
+def _aufsichtsrat_lines(pending_approvals, duration_policy: dict, pending_stage_skips: int) -> list:
+    """"Fuer den Aufsichtsrat" only appears when something genuinely needs
+    a human decision (section 8) - never printed out of habit. Three
+    concrete triggers: open approvals, the section-6 duration-policy
+    confirmation still pending, or an open stage-skip escalation.
+    """
+    items = []
+    if isinstance(pending_approvals, int) and pending_approvals > 0:
+        items.append(f"- {pending_approvals} offene Freigabe(n) in der Queue (approve.py / Telegram-Reply).")
+    if duration_policy and duration_policy.get("status") == "proposed":
+        items.append(
+            "- Duration-Policy-Vorschlag wartet auf Bestaetigung: "
+            f"{duration_policy.get('values')}. Antworte 'duration_policy: confirm', oder "
+            "'duration_policy: <research> <community_engagement> <landing_page> <build>' "
+            "(Tage, 'none' fuer build) zum Anpassen."
+        )
+    if pending_stage_skips:
+        items.append(f"- {pending_stage_skips} offene Stage-Skip-Anfrage(n) warten auf Main-CEO-Review.")
+    if not items:
+        return []
+    return ["", "--- Fuer den Aufsichtsrat ---"] + items
 
 
 def send_cycle_summary(
     kickoff_error: Exception = None, telegram_action_log: list = None,
     persistence_warning: str = None,
 ) -> None:
-    """Post a what-happened/what's-next digest of this cycle to Telegram,
-    and save a condensed version as next cycle's continuity note. Called
+    """Post a what-happened/what's-next digest of this cycle to Telegram as
+    a single message (structural-rebuild addendum, section 8 - the prior
+    second "formatted cost table" message was fully redundant with
+    _usage_headline()/_usage_detail_line() already below, same numbers
+    re-tabulated, so dropping it loses no information and removes a real
+    Markdown-parse-failure risk rather than trading one risk for another),
+    and saves a condensed version as next cycle's continuity note. Called
     once after kickoff() finishes (or fails) - never raises itself, so a
     broken notification never masks whatever kickoff() already did or
     didn't do. If kickoff_error is set, that's reported up front instead of
-    being silently swallowed - a hard crew failure must still reach Telegram,
-    not just Railway's logs, since that's the only place a human reliably
-    sees it. persistence_warning (from check_state_persistence(), computed
-    once at the very start of the cycle in __main__) gets the same
+    being silently swallowed - a hard crew failure must still reach
+    Telegram, not just Railway's logs, since that's the only place a human
+    reliably sees it. persistence_warning (from check_state_persistence(),
+    computed once at the very start of the cycle in __main__) gets the same
     visibility tier as the existing budget/max_iter warnings below - state
     silently not surviving the next redeploy is exactly the kind of thing
     that must never go unnoticed again (see README chapter 15).
@@ -1371,6 +1553,11 @@ def send_cycle_summary(
         notify_new_pending_approvals()
         pending = json.loads(read_state.run()).get("pending_approvals", "?")
         usage = _compute_cycle_usage()
+        hypothesis_overview = build_hypothesis_overview()
+        duration_policy = json.loads(
+            read_subsidiary_policies.run(subsidiary_id="api-sentinel")
+        ).get("max_duration_days_by_stage")
+        pending_stage_skips = len(json.loads(read_stage_skip_requests.run(status="pending")))
         # Total tokens is the single most-glanced-at number in this report -
         # kept as its own standalone line right at the top, ahead of even
         # the profile/model detail line below, so it's unmissable rather
@@ -1378,7 +1565,10 @@ def send_cycle_summary(
         lines = [
             f"API Sentinel Zyklus - {datetime.now(timezone.utc).isoformat()}",
             _usage_headline(usage),
+            "",
+            "--- Hypothesen-Uebersicht ---",
         ]
+        lines += _format_hypothesis_overview(hypothesis_overview)
         if kickoff_error is not None:
             lines.append(f"WARNUNG: Der Crew-Lauf ist fehlgeschlagen: {kickoff_error}")
             lines.append("Nachfolgende Tasks haben moeglicherweise nicht mehr gelaufen.")
@@ -1420,17 +1610,9 @@ def send_cycle_summary(
             "--- Dev ---",
             _task_summary(task_dev)[:400],
         ]
+        lines += _aufsichtsrat_lines(pending, duration_policy, pending_stage_skips)
         full_summary = "\n".join(lines)
         send_telegram_message(full_summary)
-        try:
-            table = _format_usage_table(usage)
-            if table:
-                send_telegram_message(table, parse_mode="Markdown")
-        except Exception as exc:
-            # Best-effort only - the numbers above already reached Telegram
-            # in plain-text form via the main report, so a failure here
-            # never costs the report itself, just the prettier formatting.
-            print(f"[api-sentinel] usage table send failed (main report was unaffected): {exc}")
         save_cycle_note(full_summary[:3000])
     except Exception as exc:
         print(f"[api-sentinel] cycle summary failed (crew run itself was unaffected): {exc}")

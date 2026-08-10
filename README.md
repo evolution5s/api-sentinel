@@ -397,12 +397,16 @@ Schalter, alle konservativ vorbelegt:
 | `cold_email_allowed` | `False` | Aktuell ohnehin irrelevant, da Cold Email nicht in der unterstützten Plattform-Liste (`CONTENT_PLATFORMS`) enthalten ist - rechtliches Risiko (EU ePrivacy/DSGVO, deutsches UWG), kein Stil-Entscheid |
 | `data_collection_allowed` | `False` | Reserviert für zukünftige Nutzung |
 | `risk_tolerance` | `"low"` | Reserviert für zukünftige Nutzung |
+| `max_duration_days_by_stage` | `DEFAULT_PROPOSED_DURATION_CAPS` (`status='proposed'`) | Zeitbox-Obergrenze pro Evidence-Stage - siehe Kapitel 5.11, nur wirksam nach expliziter Telegram-Bestätigung |
 
 Ändern nur über `update_subsidiary_policies` - erfordert eine bereits
 freigegebene `request_approval`, exakt dieselbe Disziplin wie
 `register_subsidiary`. Jede Änderung wird mit Zeitstempel, geändertem Feld,
 Freigabe-ID und Begründung in `policy_history` auf dem Subsidiary-Record
-protokolliert.
+protokolliert. `max_duration_days_by_stage` ist die eine Ausnahme von dieser
+Freigabe-Pflicht: es wird direkt per Telegram-Bestätigung gesetzt (Kapitel
+5.11, 8.2), nicht über `update_subsidiary_policies` - eine bereits explizit
+vom Menschen angestoßene Bestätigung, kein neuer Freigabe-Weg.
 
 **Wichtig:** Die konkrete Kanalliste für API Sentinel (r/algotrading,
 r/quantfinance, r/quant, QuantConnect Forum/Discord, Elite Trader,
@@ -410,6 +414,51 @@ Trade2Win, quant.stackexchange.com) ist bewusst *nicht* Teil dieser
 holdingweiten Policies - sie steht im Task-Text von `task_channel_strategy`
 in `crew.py`, weil sie API-Sentinel-spezifisch ist. Jede neue Subsidiary
 bekäme ihre eigene, andere Kanalliste.
+
+### 4.3 Entscheidungs-Framework: Two-Way vs. One-Way Doors
+
+Ein Textbaustein, der wörtlich (namentlich referenziert) in `ceo_agent`s und
+`main_ceo_agent`s `Backstory` steht (`crew.py`) - keine einmalige
+Hintergrundinfo für einen Fix, sondern ein Standing Operating Principle,
+das jeden Zyklus aktiv angewendet werden soll. Grund für die Einführung:
+das genaue Gegenteil-Muster, das `hyp_bootstrap_001` zum Verhängnis wurde
+(Kapitel 15) - eine Two-Way-Door-Entscheidung (eine erste
+Preis-Schätzung, ein Recherche-Plan) wurde mit übervorsichtigem Hedging
+behandelt, während eine echte One-Way-Door-Entscheidung (Ökonomie und
+Landing Page festgelegt, bevor das zugrunde liegende Problem überhaupt
+bestätigt war) mit Two-Way-Door-Tempo durchgewunken wurde - genau
+andersherum als richtig.
+
+- **Two-Way Doors** (Bezos, Shareholder-Letter 1997): die meisten
+  taktischen Entscheidungen auf Hypothesen-Ebene - welcher Kanal zuerst,
+  was recherchiert wird, eine grobe erste Preis-Schätzung, ob eine Variable
+  pivotiert wird. Billig zu testen, billig umzukehren - **schnell und
+  selbstbewusst entscheiden**, nicht absichern oder über-formalisieren.
+  Genau die Zone, in der der Sub-CEO ohnehin schon ohne Rückfrage agieren
+  darf.
+- **One-Way Doors**: bereits an Tier 1/2 gegated (echtes Spend,
+  Veröffentlichung, Build-Commitments) - bleiben zu Recht vorsichtig und
+  eskaliert. Das bestehende Drei-Tier-Modell (Tier 0 autonom, Tier 1
+  freigabepflichtig, Tier 2 nur Mensch) ändert sich durch dieses Framework
+  nicht - es verbessert die Qualität des Urteils *innerhalb* der Tier-0-Zone,
+  die der Sub-CEO ohnehin schon hat.
+- **Ground truth over assertion** (Anthropics eigene Guidance zum Bauen von
+  Agenten): jede Behauptung in der Sub-CEO-eigenen Reasoning - "das Problem
+  ist validiert", "die Zielgruppe erkennt den Bedarf", "die Kosten sind X" -
+  muss auf etwas Abrufbares aus der eigenen Arbeit dieser Hypothese diesen
+  Zyklus zurückführbar sein: ein echtes Tool-Ergebnis, ein geloggter
+  Research-Fund, ein echt gepostetes Artefakt. Mechanisch erzwungen über den
+  Anti-Copying-Tripwire (Kapitel 5.12) und die Artefakt-Gates (Kapitel 5.9/5.11).
+- **Disagree and commit**, angewendet auf Main-CEO ↔ Sub-CEO: innerhalb des
+  strategischen Rahmens (`set_strategic_direction`) gehören taktische
+  Entscheidungen dem Sub-CEO - keine Rückfrage nötig für Dinge, die ohnehin
+  in dessen eigener Spur liegen. Widerspricht die eigene Evidenz des
+  Sub-CEO dem Rahmen, eskaliert er über einen echten Pivot-Vorschlag
+  (`file_pivot_proposal`) - nie stillschweigendes Abdriften, nie
+  stillschweigendes Befolgen eines Rahmens, dem die eigenen Daten
+  widersprechen. Umgekehrt gilt dasselbe für den Main-CEO: übersteuert eine
+  taktische Sub-CEO-Entscheidung nie direkt, sondern setzt bei echtem
+  Dissens eine neue strategische Richtung.
 
 ---
 
@@ -420,9 +469,11 @@ Funktionen in `scoring.py`. Ablauf pro Hypothese:
 
 ### 5.1 Anlegen einer Hypothese
 
-Jede neue Hypothese (Bootstrap in Schritt 0 oder Pivot-Folgehypothese in
-Schritt 5 von `task_ceo`) braucht **vor** dem Start des Tests fixierte
-Ökonomie, die danach nie an das Ergebnis angepasst wird:
+Seit dem Structural-Rebuild-Addendum (Kapitel 15) hängen Pflichtfelder von
+`evidence_stage` ab, nicht mehr von einer einzigen flachen Checkliste
+(Bezos Two-Way/One-Way-Door-Rahmen, Kapitel 4.3). Immer erforderlich, an
+jeder Hypothese (Bootstrap in Schritt 0 oder Pivot-Folgehypothese in
+Schritt 5 von `task_ceo`):
 
 - `hypothesis_type`: `value` (löst ein echtes Nutzerproblem) oder `growth`
   (hilft bei Distribution/Skalierung von bereits Validiertem).
@@ -430,33 +481,12 @@ Schritt 5 von `task_ceo`) braucht **vor** dem Start des Tests fixierte
   Form wie bei einem Kanal (Kapitel 6.1) - das Ranking-Signal, mit dem
   konkurrierende Hypothesen-Ideen gegeneinander priorisiert werden, sobald
   mehr Ideen als Kapazität vorhanden sind (Kapitel 5.8).
-- `estimated_build_cost`, `price_point_monthly`, `break_even_horizon_months`
-  - grob geschätzte Kosten/Preis/Zeitrahmen für das *echte* Produkt/Feature,
-    nicht für den Test selbst. `estimated_build_cost` muss auf echten
-    KI-Agenten-Ökonomie beruhen - Dev-Agent-LLM-Aufrufe plus etwaige echte
-    laufende Infra-Kosten (Hosting, Domain) - **nie** auf einem
-    Marktpreis/Agentur-/Freelancer-Satz; dieses System wird von KI-Agenten
-    gebaut und betrieben, eine Landing Page/ein Signup-Formular/ein
-    kleines Backend-Skript kostet hier realistisch einen niedrigen
-    einstelligen Dollarbetrag in Tokens, keine Hunderte oder Tausende.
-    `write_hypothesis` verlangt dafür ein Pflichtfeld `build_cost_reasoning`
-    (Aufschlüsselung der echten Kostenkomponenten) und lehnt Schätzungen
-    über `SIMPLE_BUILD_COST_CEILING` (10,0 USD) ohne substanzielle
-    Begründung (mind. `BUILD_COST_JUSTIFICATION_MIN_LENGTH` = 80 Zeichen,
-    echter zusätzlicher Token-/Iterationsaufwand, nicht "fühlt sich teurer
-    an") ab. `break_even_horizon_months` defaultet konzeptionell auf 1
-    Monat - bei so günstigen Builds soll sich eine wirklich validierte Idee
-    schnell amortisieren; länger als 1 Monat braucht ebenfalls
-    `build_cost_reasoning` (z.B. echte laufende Infra-Kosten), nicht
-    Gewohnheit. Siehe Kapitel 15 zur Entstehungsgeschichte dieser Regel
-    (eine $15.000-Fehlschätzung mit Agentur-Logik verzerrte
-    `break_even_users` auf 52 statt der realistischen niedrigen einstelligen
-    Zahl).
-- `break_even_users` - **nie** von Hand geschätzt, sondern via
-  `compute_break_even()` (`scoring.compute_break_even_users`):
-  `ceil(build_cost / (price_point_monthly * horizon_months))`.
+- `evidence_stage` selbst - nicht mehr optional, jede Hypothese erklärt von
+  Anfang an, wo sie tatsächlich steht (Kapitel 5.9).
 - `duration_days` - die verpflichtende Zeitbox (immer erforderlich), plus
   optional `sample_size_trigger` für eine frühere Fälligkeit (Kapitel 5.6).
+  Ab Bestätigung einer `max_duration_days_by_stage`-Policy (Kapitel 5.13)
+  gilt zusätzlich eine Obergrenze pro Stage.
 - Genau eine ungetestete Variable pro Test: bei einem Pivot-Folgetest
   `pivot_variable_changed`; beim ersten Versuch einer Linie (kein
   `prior_hypothesis_id` gesetzt, auch die allererste Hypothese überhaupt)
@@ -467,8 +497,48 @@ Schritt 5 von `task_ceo`) braucht **vor** dem Start des Tests fixierte
   Änderungen eindeutig zuordnen. Optional dazu `holding_constant_notes` -
   was bewusst konstant gehalten wird.
 
+**Bei `research`/`community_engagement` (Two-Way Door - billig, schnell,
+reversibel):** `estimated_build_cost`, `price_point_monthly`,
+`break_even_horizon_months`, `break_even_users`, `build_cost_reasoning`
+sind **noch nicht** erforderlich. Optional `rough_economics_note`
+(Freitext) für eine Größenordnungs-Schätzung fürs eigene Planen (z.B.
+"vermutlich EUR15-50/Monat, je nachdem was wir lernen - noch nicht
+berechnet") - klar getrennt von den späteren, belastbaren Zahlen.
+`compute_break_even()` verweigert die Berechnung an diesen Stages absichtlich
+(`applicable: false`) - eine Platzhalter-Schätzung als präzise Zahl zu
+tarnen ist genau das, was diese Änderung verhindern soll. `evidence_stage=
+'research'` verlangt zusätzlich den Forschungsplan zuerst (Kapitel 5.11).
+
+**Bei `landing_page`/`build` (Übergang zur One-Way Door - echte Kosten,
+echtes Commitment):** `estimated_build_cost`, `price_point_monthly`,
+`break_even_horizon_months`, `break_even_users`, `build_cost_reasoning`
+werden Pflicht und müssen jetzt präzise, evidenzbasiert sein.
+`estimated_build_cost` muss auf echter KI-Agenten-Ökonomie beruhen -
+Dev-Agent-LLM-Aufrufe plus etwaige echte laufende Infra-Kosten (Hosting,
+Domain) - **nie** auf einem Marktpreis/Agentur-/Freelancer-Satz; eine
+Landing Page/ein Signup-Formular/ein kleines Backend-Skript kostet hier
+realistisch einen niedrigen einstelligen Dollarbetrag in Tokens, keine
+Hunderte oder Tausende. `build_cost_reasoning` muss die Kosten in echte
+Komponenten aufschlüsseln, **spezifisch für diese eine Hypothese** - nie
+aus Beispieltext in Instruktionen/früheren Addenda/dieser Dokumentation
+übernommen oder umformuliert (mechanisch abgelehnt bei Übereinstimmung mit
+bekannten Textbausteinen, Kapitel 5.12 - genau das disqualifizierte
+`hyp_bootstrap_001`, Kapitel 15). Über `SIMPLE_BUILD_COST_CEILING` (10,0
+USD) ohne substanzielle Begründung (mind.
+`BUILD_COST_JUSTIFICATION_MIN_LENGTH` = 80 Zeichen, echter zusätzlicher
+Token-/Iterationsaufwand, nicht "fühlt sich teurer an") wird abgelehnt.
+`break_even_horizon_months` defaultet konzeptionell auf 1 Monat - länger
+braucht ebenfalls `build_cost_reasoning`. `break_even_users` **nie** von
+Hand geschätzt, sondern via `compute_break_even()`
+(`scoring.compute_break_even_users`): `ceil(build_cost / (price_point_
+monthly * horizon_months))`. Der Übergang selbst braucht zusätzlich
+artefaktbelegte Historie durch `research` **und** `community_engagement`
+(Kapitel 5.9) - oder eine vom Main-CEO genehmigte Stage-Skip-Anfrage
+(Kapitel 5.9, 7.3).
+
 Dazu optionale, freitextliche Reasoning-Felder (keine neue Pass/Fail-Hürde,
-nur dokumentierte Abwägung): `defensibility_notes` (könnte ein Solo-
+nur dokumentierte Abwägung, ebenfalls dem Anti-Copying-Tripwire unterworfen
+für `defensibility_notes`): `defensibility_notes` (könnte ein Solo-
 Entwickler das an einem Nachmittag mit einem LLM nachbauen?),
 `pricing_tier_reasoning` (niedriger Preis braucht großes, scharfes
 Painpoint + Volumen; höherer Preis braucht weniger Volumen, aber
@@ -478,12 +548,13 @@ genau dieser Zielgruppe passt).
 
 Vor der Formulierung einer neuen Hypothese: `read_knowledge_base(topic=...)`
 prüfen (Kapitel 5.7) - vielleicht existiert schon eine distillierte
-Erkenntnis zu diesem Thema/Kanal/Taktik aus einem früheren Zyklus. Danach,
-vor einem echten Live-Experiment: Research-Evidence-Tier prüfen
-(`read_research_findings`/`log_research_finding`) - Wettbewerbsprodukte,
-Forendiskussionen, Antworten auf einen echten `own_question_post`. Günstiger
-und schneller als ein Live-Test, aber schwächere Evidenz: kann
-`test_further`/`pivot`-Reasoning stützen, nie allein zu `build` führen.
+Erkenntnis zu diesem Thema/Kanal/Taktik aus einem früheren Zyklus. Research-
+Evidence-Tier (`read_research_findings`/`log_research_finding`) ist jetzt
+der Standard-erste Schritt (`evidence_stage='research'`), nicht optional
+davor - Wettbewerbsprodukte, Forendiskussionen, Antworten auf einen echten
+`own_question_post`. Günstiger und schneller als ein Live-Test, aber
+schwächere Evidenz: kann `test_further`/`pivot`-Reasoning stützen, nie
+allein zu `build` führen.
 
 ### 5.2 Score-Formel (`scoring.compute_score`)
 
@@ -646,32 +717,44 @@ falsche zuerst zu wählen.
 
 ### 5.9 Evidence-Stage-Leiter (`evidence_stage`)
 
-Optionales Feld auf `write_hypothesis`, geordnet von billigstem/schwächstem
-zu teuerstem/stärkstem Signal: `EVIDENCE_STAGES = ["research",
-"community_engagement", "landing_page", "build"]`. Nicht auf jeder
-Hypothese verpflichtend - die Bootstrap-Hypothese und jeder andere
-legitime Direkt-zu-Landing-Page-Test bleiben gültig auch ohne dieses Feld -
-aber `file_task_order(to_role="dev", ...)` prüft es, sobald eine
-`hypothesis_id` mitgegeben wird:
+**Seit dem Structural-Rebuild-Addendum ein echtes Gate, kein
+selbstunterschriebener Freibrief mehr.** Die vorherige Version (jeder
+Stage-Skip per selbstgeschriebenem `stage_justification`-String erlaubt)
+war zu leicht trivial zu erfüllen - genau das, was `hyp_bootstrap_001`
+den direkten Sprung zur Landing Page erlaubte (Kapitel 15). Pflichtfeld
+auf `write_hypothesis` (nicht mehr optional), geordnet von billigstem/
+schwächstem zu teuerstem/stärkstem Signal: `EVIDENCE_STAGES = ["research",
+"community_engagement", "landing_page", "build"]`.
 
-- Abgelehnt, wenn `evidence_stage` der Hypothese (noch) nicht
-  `landing_page`/`build` ist **und** kein `stage_justification` mitgegeben
-  wurde.
-- Akzeptiert, sobald entweder `evidence_stage` bereits `landing_page`/
-  `build` zeigt (der Normalfall: eine Landing Page *ist* dieser Test, also
-  setzt der Sub-CEO `evidence_stage='landing_page'` direkt beim
-  `write_hypothesis`-Aufruf, der die Hypothese erzeugt), oder ein
-  nicht-leeres `stage_justification` erklärt, warum echte Dev-Arbeit jetzt
-  trotzdem richtig ist.
+- `evidence_stage='research'` verlangt zuerst den Forschungsplan (Kapitel
+  5.11).
+- `evidence_stage='community_engagement'` verlangt ein echtes, gepostetes
+  (oder freigegeben-und-wartendes) `thread_reply`/`own_question_post`-
+  Draft für diese Hypothese (`draft_content`) - eine bloße Behauptung
+  reicht nicht.
+- Der Übergang zu `landing_page`/`build` verlangt artefaktbelegte Historie
+  durch **beide** früheren Stages: ein substanzielles `log_research_
+  finding`-Ergebnis (Kapitel 5.11) **und** ein echtes `community_
+  engagement`-Draft. Fehlt eines von beiden, wird `write_hypothesis`
+  abgelehnt - **es sei denn**, eine vom Main-CEO genehmigte Stage-Skip-
+  Anfrage (`file_stage_skip_request`/`decide_stage_skip_request`,
+  `holding.py`, Kapitel 7.3) liegt für genau diese `hypothesis_id` und
+  `target_stage` vor. Das ist die Main-CEO-Review, die einen self-written
+  Freibrief ersetzt - der Main-CEO bestätigt nur, wenn das Überspringen
+  wirklich zutrifft (z.B. Recherche ist für diese konkrete Frage wirklich
+  nicht relevant), sonst geht es zurück zu den früheren Stages.
+- `file_task_order(to_role="dev", ...)` prüft `evidence_stage` weiterhin,
+  aber ohne eigenen Bypass mehr - das echte Gate sitzt jetzt vollständig
+  bei `write_hypothesis`; ist `evidence_stage` erst `landing_page`/`build`,
+  wurde es bereits verdient.
 
-Das ist ein auditierbares Gate, kein hartes Verbot - die billigste Version
-ist immer nur eine begründete Entscheidung, keine stillschweigende. Die
-eigentliche Frage ("was ist der billigste Test, der diese Unsicherheit
-tatsächlich auflöst") bleibt Ermessenssache des Sub-CEO (`ceo_agent`s
-Backstory, `crew.py`) - das Gate erzwingt nur die Nachvollziehbarkeit, nicht
-das Urteil selbst. Die meisten Hypothesen gehen weiterhin legitim direkt zu
-`landing_page` - das ist der bewährte Standardpfad dieses Systems, keine
-Regression davon.
+Die eigentliche Frage ("was ist der billigste Test, der diese Unsicherheit
+tatsächlich auflöst") bleibt Ermessenssache des Sub-CEO (Kapitel 4.3,
+Two-Way-Door-Prinzip) - das Gate erzwingt nur die Nachvollziehbarkeit
+(echte Artefakte oder eine echte Main-CEO-Entscheidung), nicht das Urteil
+selbst. Die meisten Hypothesen erreichen weiterhin schnell eine Landing
+Page - das ist der bewährte Standardpfad dieses Systems - der Punkt ist,
+dass es ein verdienter, evidenzbasierter Schritt ist, kein übersprungener.
 
 ### 5.10 Zahlungsbereitschafts-Test (Payment-Intent)
 
@@ -694,6 +777,82 @@ Option, kein Standard:
    schon `'approved'` ist) - der Sub-CEO fragt das ab, statt einen Link
    anzunehmen, und trägt den bestätigten Link wörtlich in den
    `file_task_order` an Dev ein, nie eine Paraphrase.
+
+### 5.11 Forschungsplan und Artefakt-Pflicht
+
+**Vor** Beginn der Recherche loggt der Sub-CEO (auf dem Hypothesen-Record,
+beim `write_hypothesis`-Aufruf, der `evidence_stage='research'` setzt) drei
+Pflichtfelder - der Forschungsplan:
+
+- `research_objective` - die eine konkrete Frage, die diese Recherche
+  beantworten soll (z.B. "enthält r/algotrading, r/quantfinance oder das
+  QuantConnect-Forum echte, aktuelle Erstpersonen-Berichte über API-Ausfälle,
+  die Trading-Verluste oder operative Probleme verursacht haben - nicht nur
+  allgemeines API-Geplauder").
+- `research_confirming_criteria` / `research_disconfirming_criteria` -
+  konkret und falsifizierbar (z.B. "bestätigend: 3+ eigenständige Threads
+  in den letzten 6 Monaten mit einem echten Vorfall und dessen Auswirkung;
+  widerlegend: nur allgemeines Geplauder oder nichts Relevantes gefunden").
+
+**Nach** Abschluss der Recherche muss `log_research_finding` ein echtes,
+abrufbares Artefakt liefern, keine Erzähl-Behauptung: welche Threads/Posts,
+was dort stand (paraphrasiert, nie erfunden), wie viele, wie aktuell - oder
+ein ebenso konkretes, ehrliches negatives Ergebnis ("X/Y/Z-Begriffe in
+diesen Kanälen durchsucht, keine substanzielle Evidenz gefunden").
+Mechanisch mit einer Mindestlänge erzwungen
+(`RESEARCH_FINDING_MIN_LENGTH` = 80 Zeichen, gleiches Muster wie
+`BUILD_COST_JUSTIFICATION_MIN_LENGTH`) - ein Einzeiler wird abgelehnt.
+`evidence_stage` kann nicht über `research` hinaus fortschreiten, ohne dass
+mindestens ein solches Artefakt für diese `hypothesis_id` existiert (Kapitel
+5.9) - im Code geprüft, nicht auf eine Selbstauskunft vertraut.
+
+### 5.12 Anti-Copying-Tripwire
+
+Mechanischer Schutz gegen genau den Fehler, der `hyp_bootstrap_001`
+zusätzlich disqualifizierte (Kapitel 15): `build_cost_reasoning` erwies
+sich als nahezu wortgleiche Kopie von Instruktionstext dieses Repos, nicht
+als eigenständig hergeleitete Begründung. `tools._instruction_echo_match`
+prüft `build_cost_reasoning`/`defensibility_notes` (`write_hypothesis`),
+`summary` (`log_research_finding`) und `reasoning`
+(`file_stage_skip_request`, `holding.py`) gegen eine kleine, gepflegte
+Liste bekannter Textbausteine aus den eigenen Docstrings/Incident-
+Beschreibungen dieses Repos (z.B. "old-economy market-rate thinking",
+"agency/freelancer/employee") - ein einfacher Substring-Abgleich, keine
+Fuzzy-Logik, aber ausreichend, um wortwörtliche/nahezu-wortwörtliche
+Wiederverwendung zu erkennen. Bei Treffer: Ablehnung mit dem konkret
+gefundenen Textbaustein in der Fehlermeldung. Getestet (`checkup.py`)
+gegen genau die Formulierungsfamilie des tatsächlichen Vorfalls.
+
+### 5.13 Zeitbox-Policy pro Stage (`max_duration_days_by_stage`)
+
+**Bewusst kein hier vorgegebener Wert** - das wäre derselbe Fehler wie die
+alten hartcodierten Ökonomie-Zahlen. Zeitbox-Obergrenzen gehören in
+dieselbe Kategorie wie die bestehenden Policy-Schalter (Kapitel 4.2): eine
+Entscheidung für das Board/Aufsichtsrat, nicht etwas, das hier
+vorgeschrieben wird.
+
+`holding.SUBSIDIARY_POLICY_DEFAULTS["max_duration_days_by_stage"]`
+(`tools.DEFAULT_PROPOSED_DURATION_CAPS`) liefert nur einen klar als
+**vorgeschlagen** markierten Startwert (`status='proposed'`:
+`research=3, community_engagement=5, landing_page=14, build=None` Tage) -
+**nicht stillschweigend aktiv**. Solange `status='proposed'` ist, greift
+keine Obergrenze; `write_hypothesis`s Zeitbox-Prüfung liest die Policy live
+(`read_subsidiary_policies`) und wird erst scharf, sobald ein Mensch sie
+per Telegram bestätigt oder anpasst:
+
+- `duration_policy: confirm` - bestätigt die aktuell vorgeschlagenen Werte
+  unverändert.
+- `duration_policy: <research> <community_engagement> <landing_page>
+  <build>` (Tage, `none` für kein Limit) - setzt eigene Werte und
+  bestätigt in einem Schritt.
+
+Nach Bestätigung: `duration_days` über der Obergrenze für den jeweiligen
+`evidence_stage` wird abgelehnt, außer `duration_extension_approval_id`
+zeigt auf einen bereits freigegebenen `request_approval`-Eintrag - der
+bestehende Freigabe-Weg selbst ändert sich nicht, nur woher die
+Obergrenze-Zahl kommt. Solange die Bestätigung noch aussteht, taucht sie
+im Zyklus-Report unter "Für den Aufsichtsrat" auf (Kapitel 9.6), bis sie
+entschieden ist.
 
 ---
 
@@ -931,6 +1090,29 @@ einen Registry-Eintrag mit `operative_capability`-Hinweis, keine lauffähige
 zweite Subsidiary. Der Main-CEO-Task-Text sagt das explizit, damit das nie
 stillschweigend als "die neue Subsidiary läuft jetzt" missverstanden wird.
 
+### 7.3 Evidence-Stage-Skip-Review (`stage_skip_requests.jsonl`)
+
+Das Main-CEO-Gegenstück zum Artefakt-Gate aus Kapitel 5.9 - dieselbe
+Sub-CEO-reicht-ein/Main-CEO-entscheidet-Form wie Pivot-Vorschläge (Kapitel
+7), bewusst als eigene Datei statt in `pivot_proposals.jsonl` überladen (ein
+Stage-Skip ist eine schmalere, anders geformte Entscheidung als ein volles
+Strategie-Pivot mit 8 Pflichtfeldern):
+
+- `file_stage_skip_request(hypothesis_id, subsidiary_id, target_stage,
+  reasoning)` - Sub-CEO. `reasoning` läuft durch denselben
+  Anti-Copying-Tripwire wie `build_cost_reasoning` (Kapitel 5.12).
+- `read_stage_skip_requests(status="")` - Main-CEO liest offene Anfragen.
+- `decide_stage_skip_request(request_id, decision, reasoning)` -
+  `decision` ∈ `approved`/`rejected`. Genehmigt nur, wenn das Überspringen
+  tatsächlich zutrifft (z.B. Recherche ist für diese konkrete Frage
+  wirklich nicht relevant) - kein Routine-Abnicken; sonst zurück zu den
+  früheren Stages. Nicht erneut entscheidbar.
+
+Eine genehmigte Anfrage erlaubt genau einen `write_hypothesis`-Aufruf, der
+`evidence_stage` für genau diese `hypothesis_id`/`target_stage`-Kombination
+ohne Artefakte setzt (Kapitel 5.9) - keine allgemeine Ausnahme für die
+Hypothese insgesamt.
+
 ---
 
 ## 8. Mensch im Loop: Freigabe-Queue und Telegram-Fernsteuerung
@@ -942,6 +1124,19 @@ läuft über `request_approval(category, proposal, reasoning)`.
 `category` ∈ `{spend, legal, publish, deploy, pricing}`. Der Eintrag landet
 mit `status='pending'` in der Queue und wird **nie** vom System selbst
 ausgeführt.
+
+**`category='publish'` verlangt ein starres Template, keine Freitext-Prosa**
+(Structural-Rebuild-Addendum, Kapitel 15): `proposal` muss ein JSON-String
+mit exakt diesen Feldern sein - `platform`, `target_url`, `title` (oder
+wörtlich `"kein Titel"`), `text` (wörtlicher Inhalt, exakt wie gepostet -
+nie paraphrasiert), `footer` (oder wörtlich `"keiner"`), `hypothesis_id`,
+`evidence_stage`, `is_experiment` (bool), `success_criterion` (konkret und
+falsifizierbar, auch wenn die ehrliche Antwort "nein, reine Recherche, kein
+Erfolgskriterium nötig" ist - nie weggelassen). `request_approval` lehnt
+alles andere für diese Kategorie ab; `notify_new_pending_approvals` rendert
+es über `_format_publish_proposal` mit den exakten deutschen Feld-Labels,
+nie zu Prosa umgeflossen - zusätzliche Begründung steht als eigene Zeile
+klar getrennt darunter.
 
 Ein Mensch entscheidet über:
 
@@ -978,6 +1173,8 @@ verarbeiteten Update (`telegram_update_offset.txt`) und wertet sie aus
 | `posted: <draft_id> <url>` | Content-Entwurf als tatsächlich gepostet markieren |
 | `removed: <draft_id> <grund>` | Geposteten Entwurf als entfernt markieren (speist `check_community_risk`) |
 | `payment_link: <appr_id> <url>` | Echten Zahlungslink für eine `status='approved'`-Payment-Intent-Anfrage hinterlegen (Kapitel 5.10) |
+| `duration_policy: confirm` | Vorgeschlagene `max_duration_days_by_stage`-Werte unverändert bestätigen (Kapitel 5.13) |
+| `duration_policy: <research> <community_engagement> <landing_page> <build>` | Eigene Werte setzen und in einem Schritt bestätigen (Tage, `none` für kein Limit, Kapitel 5.13) |
 
 Alle anderen Nachrichten werden stillschweigend ignoriert (der Operator darf
 einfach chatten, das ist kein Fehler). Ein Telegram-/Netzwerkfehler darf nie
@@ -1112,34 +1309,32 @@ USD pro Million Tokens (`pricing.py::PRICING_TABLE`):
 | `claude-sonnet-5` (vor 2026-09-01) | 2,00 | 2,50 | 4,00 | 0,20 | 10,00 |
 | `claude-sonnet-5` (ab 2026-09-01) | 3,00 | 3,75 | 6,00 | 0,30 | 15,00 |
 
-**Report-Aufbau:** in zwei Telegram-Nachrichten gesplittet.
-`_usage_headline()` steht als eigene, unmissverständliche Zeile
-(`Gesamt-Tokens diesen Zyklus: X (Y% Zyklus-Budget) - Kosten: $Z`) direkt am
-Anfang der ersten (Haupt-)Nachricht, noch vor Warnungen und
-Telegram-Kommando-Logs. `_usage_detail_line()` folgt weiter unten mit dem
-Rest in Prosa: Agent-Profil/Modell, Prompt-/Completion-Aufteilung,
-Cache-Erklärung, `max_tokens` pro Agent. Direkt im Anschluss an die
-Hauptnachricht verschickt `_format_usage_table()` eine **zweite, separate**
-Nachricht mit denselben Zahlen als fest formatierte Monospace-Tabelle
-(Markdown-Codeblock, `parse_mode="Markdown"`) - zwei Tabellen: Token-/
-Kosten-Übersicht und `max_tokens` pro Agent. Getrennt von der Hauptnachricht,
-damit ein Formatierungsfehler dort nie den eigentlichen Report gefährdet
-(`send_telegram_message` faengt das selbst ab und würde bei einem
-abgelehnten `parse_mode`-Send automatisch als Klartext erneut versuchen) -
-die Zahlen stehen ohnehin schon in Prosa in der Hauptnachricht, die Tabelle
-ist rein kosmetisch on top.
-
-Telegram Bot API 10.1 (11.06.2026) hat mit `sendRichMessage`/
-`RichBlockTable` echte native Tabellen eingeführt - live gegen Telegrams
-eigene Dokumentation bestätigt real (nicht die hier verwendete Methode:
-drei separate Abruf-Versuche gegen `core.telegram.org/bots/api` und dessen
-Changelog lieferten zwar die Existenz, aber nie die vollständige
-Feld-für-Feld-Parametertabelle). Ein JSON-Schema gegen eine echte externe
-API zu raten, nur weil die Methode nachweislich existiert, widerspricht der
-Verifikationsdisziplin dieses Repos - deshalb der dokumentierte, bewährte
-`sendMessage` + `parse_mode="Markdown"`-Codeblock-Weg statt eines
-ungetesteten `sendRichMessage`-Aufrufs. Aufzugreifen, sobald das exakte
-Schema verifizierbar ist.
+**Report-Aufbau: eine einzige Telegram-Nachricht** (Structural-Rebuild-
+Addendum, Kapitel 15 - die vorherige zweite "formatierte Kosten-Tabelle"-
+Nachricht war vollständig redundant zu `_usage_headline()`/
+`_usage_detail_line()` in der Hauptnachricht, dieselben Zahlen nur
+retabelliert; Wegfall verliert keine Information und entfernt zugleich ein
+echtes Formatierungsfehler-Risiko - eine Prosa-Nachricht mit
+Hypothesen-IDs/Sonderzeichen unter `parse_mode="Markdown"` zu senden hätte
+genau das Risiko zurückgeholt, das die alte Zwei-Nachrichten-Trennung
+eigentlich vermeiden sollte). `_usage_headline()` steht als eigene,
+unmissverständliche Zeile (`Gesamt-Tokens diesen Zyklus: X (Y%
+Zyklus-Budget) - Kosten: $Z`) direkt am Anfang, gefolgt von der neuen
+**Hypothesen-Übersicht** (`build_hypothesis_overview()`/
+`_format_hypothesis_overview()`, Kapitel 5.9-nah) - pro aktiver Hypothese
+ID, `evidence_stage`, eine Statuszeile, der letzte geloggte Research-Fund
+(oder "keine Erkenntnis geloggt"), der nächste konkrete Schritt (älteste
+offene Task-Order, oder "keine offene Task-Order") - lesbar für sich
+allein, ohne jeden Agenten-Report einzeln durchzugehen. Danach Warnungen/
+Telegram-Kommando-Logs, `_usage_detail_line()` (Agent-Profil/Modell,
+Prompt-/Completion-/Cache-Aufteilung, `max_tokens` pro Agent), die
+Pro-Agent-Abschnitte (Channel-Strategie/Wachstum/Sub-CEO/Main-CEO/Dev,
+weiterhin gekürzt), und ganz am Ende optional **"Für den
+Aufsichtsrat"** (`_aufsichtsrat_lines()`) - erscheint nur bei mindestens
+einem von drei konkreten Auslösern: offene Freigaben in der Queue, eine
+noch nicht bestätigte `max_duration_days_by_stage`-Policy (Kapitel 5.13),
+oder offene Stage-Skip-Anfragen (Kapitel 7.3) - sonst komplett
+weggelassen, kein Pflichtabschnitt.
 
 **Instrumentierung (ohne Limit-Änderung):** `_task_usage_log` erfasst pro
 Task den tatsächlichen Token-Verbrauch (Differenz von
@@ -1333,6 +1528,7 @@ per `STATE_DIR`-Umgebungsvariable überschreibbar.
 | `status_reports.jsonl` | Sub-CEO → Main-CEO Berichte |
 | `strategic_directions.jsonl` | Main-CEO → Sub-CEO Ausrichtungen |
 | `ideas.jsonl` | Idee-Intake, jeder Agent schreibt, Main-CEO routet (Kapitel 7.2) |
+| `stage_skip_requests.jsonl` | Evidence-Stage-Skip-Anfragen, Sub-CEO reicht ein, Main-CEO entscheidet (Kapitel 7.3) |
 
 ### 11.3 Repo-lokal, versioniert (kein `STATE_DIR`)
 
@@ -1444,7 +1640,7 @@ Wichtige Eigenschaften:
   ausgeführt (lokal `1.15.9`, produktiv gepinnt `1.15.11`), da mehrere
   crewai-Verhaltensweisen (siehe Kapitel 10.6/10.7) versionsabhängig direkt
   im Quellcode verifiziert wurden statt angenommen.
-- Stand zuletzt: **230 Tests, 230/230 bestanden** auf beiden Versionen.
+- Stand zuletzt: **273 Tests, 273/273 bestanden** auf beiden Versionen.
 
 Ausgabe: Klartext-Report mit `[PASS]`/`[FAIL]`/`[ERR ]` pro Test, am Ende
 eine Zusammenfassung; Exit-Code `0` nur wenn wirklich alles bestanden hat.
@@ -1485,12 +1681,28 @@ eine Zusammenfassung; Exit-Code `0` nur wenn wirklich alles bestanden hat.
   Dollarbeträge). Das verzerrte `break_even_users` auf 52 statt einer
   realistischen niedrigen einstelligen Zahl - genau der Fall, für den
   dieses System eigentlich entworfen wurde (schon 2 echte Nutzer können
-  ein `build` rechtfertigen). Behoben durch das Pflichtfeld
+  ein `build` rechtfertigen). Erste Korrektur: das Pflichtfeld
   `build_cost_reasoning`, `SIMPLE_BUILD_COST_CEILING` (10 USD) mit
-  Substanz-Anforderung darüber, und einen auf 1 Monat gesenkten
-  Standard-`break_even_horizon_months` (Kapitel 5.1) - `task_ceo` enthält
-  außerdem einen einmaligen Rekalibrierungs-Schritt, der bestehende
-  Hypothesen mit alten, zu hohen Schätzungen selbstständig korrigiert.
+  Substanz-Anforderung darüber, und ein auf 1 Monat gesenkter
+  Standard-`break_even_horizon_months` (Kapitel 5.1), plus ein einmaliger
+  Rekalibrierungs-Schritt in `task_ceo`. **Update (Structural-Rebuild-
+  Addendum):** Direkt im letzten echten Zyklus gefunden - `hyp_bootstrap_001`s
+  `build_cost_reasoning` erwies sich zusätzlich als nahezu wortgleiche
+  Kopie von Instruktionstext dieses Repos, nicht als eigenständig
+  hergeleitete Begründung. Das allein disqualifiziert alles darauf
+  Aufgebaute. Statt einer weiteren Rekalibrierung wird die Hypothese jetzt
+  über einen einmaligen `task_ceo`-Schritt (0.5) via `write_hypothesis`
+  **begraben** (`status='buried'`) - mit der konkreten Sequenz als
+  `bury_reasoning` (Ökonomie vor jeder Recherche berechnet, keine
+  Research-Findings für diese Hypothese, kopierter `build_cost_reasoning`-
+  Text), nicht mit einem vagen Label. Da das System während der gesamten
+  Session pausiert war (Telegram `stop`), hatte dieser Schritt zum
+  Zeitpunkt dieses Commits noch keine Gelegenheit zu laufen - Claude Code
+  hat die STATE_DIR-Datei bewusst nicht selbst editiert, siehe das
+  Präzedenzmuster der Rekalibrierung oben. Das zugrunde liegende Problem/
+  die Zielgruppe kann sauber neu getestet werden, beginnend bei
+  `evidence_stage='research'` mit einem echten Forschungsplan (Kapitel
+  5.11), sobald echte Sorgfaltspflicht das rechtfertigt.
 - **Kein produktives Monitoring-Produkt existiert noch.** Das System befindet
   sich bewusst in der Hypothesis-Testing-Phase (Kapitel 1/5) - es hat noch
   kein einziges `build`-Outcome durchlaufen.
@@ -1554,8 +1766,9 @@ eine Zusammenfassung; Exit-Code `0` nur wenn wirklich alles bestanden hat.
   gekommen). Behoben in diesem Addendum: `growth`/`dev`-Limits angehoben
   (Kapitel 9.1), Evidence-Stage-Leiter (Kapitel 5.9), Payment-Intent-Test
   (Kapitel 5.10) und Idee-Intake/Routing (Kapitel 7.2) neu gebaut. Der
-  Report-Format-Rewrite selbst ist weiterhin **nicht** umgesetzt - das war
-  nicht Teil dieses Addendums und bleibt ein offener Punkt.
+  Report-Format-Rewrite selbst war zu diesem Zeitpunkt weiterhin nicht
+  umgesetzt - **Update:** im nachfolgenden Structural-Rebuild-Addendum
+  (siehe unten) nachgeholt (Kapitel 9.6).
 - **Pricing-/Ökonomie-Isolation zwischen Subsidiaries ist strukturell noch
   nicht gegeben, nur weil sie noch nie gebraucht wurde.** `tools.py` hat
   genau ein modulweites `STATE_DIR`, `hypotheses.jsonl`/`channels.jsonl`
@@ -1572,3 +1785,33 @@ eine Zusammenfassung; Exit-Code `0` nur wenn wirklich alles bestanden hat.
   markiert das jetzt explizit auf jedem neuen Record
   (`operative_capability`, Kapitel 7), damit es nirgends stillschweigend
   als "isoliert" missverstanden wird.
+- **Structural-Rebuild-Addendum (Entscheidungs-Framework, Bury Bootstrap,
+  Research-Rigor, Reporting, Approvals):** der vollständige, konsolidierte
+  Nachfolger der obigen Audit-Addendum-Punkte. Kernbefund:
+  `hyp_bootstrap_001`s `build_cost_reasoning` erwies sich als nahezu
+  wortgleiche Kopie von Instruktionstext dieses Repos - keine eigenständige
+  Reasoning, disqualifiziert alles darauf Aufgebaute unabhängig von der
+  konkreten Zahl. Statt einer weiteren Rekalibrierung: Bury (Kapitel 5.1
+  oben). Eingeführt: das Two-Way/One-Way-Door-Entscheidungs-Framework
+  (Kapitel 4.3, wörtlich in beiden Agenten-Backstories referenziert, nicht
+  nur einmalig gelesen); Pflichtfelder jetzt stufenabhängig statt einer
+  flachen Checkliste (Kapitel 5.1); ein echtes Evidence-Stage-Gate mit
+  Artefakt-Pflicht statt eines selbstunterschriebenen
+  `stage_justification`-Strings (Kapitel 5.9, ersetzt die vorherige
+  Version vollständig); Main-CEO-Review für Stage-Skips
+  (`stage_skip_requests.jsonl`, Kapitel 7.3); ein Forschungsplan mit
+  Bestätigungs-/Widerlegungs-Kriterien vor Recherchebeginn plus
+  Mindestlänge für Research-Findings (Kapitel 5.11); ein mechanischer
+  Anti-Copying-Tripwire gegen wiederverwendeten Instruktionstext (Kapitel
+  5.12) - getestet gegen genau die Formulierungsfamilie des tatsächlichen
+  Vorfalls; eine Zeitbox-Policy pro Stage als **Vorschlag**, nicht
+  hartcodiert, nie stillschweigend aktiv (Kapitel 5.13); ein starres
+  Template für `category='publish'`-Freigaben, keine Freitext-Prosa mehr
+  (Kapitel 8.1); und endlich der Report-Format-Rewrite, der seit dem
+  vorherigen Audit-Addendum offen war - eine einzige Telegram-Nachricht
+  mit echter Hypothesen-Übersicht statt zwei redundanter Nachrichten
+  (Kapitel 9.6). 43 neue `checkup.py`-Tests (230 -> 273). Wichtige
+  Einschränkung: Claude Code hat keinen Zugriff auf die laufende
+  Railway-Volume-Instanz - der Bury-Schritt und alle neuen Gates greifen
+  erst, wenn der Sub-CEO tatsächlich einen echten Zyklus durchläuft
+  (System war während dieser Session per Telegram `stop` pausiert).

@@ -100,6 +100,19 @@ SAMPLE_HYP = {
     "impact_score": 3,
     "confidence_score": 3,
     "primary_variable_tested": "audience",  # required for a first attempt (no prior_hypothesis_id)
+    # Structural-rebuild addendum: evidence_stage is now always required.
+    # Defaults to 'research' (no artifact-gate to satisfy at this stage,
+    # unlike landing_page/build) so most tests don't also need to seed a
+    # research/community_engagement artifact or an approved stage-skip
+    # request just to create a hypothesis - dedicated tests below exercise
+    # the later-stage gates explicitly with their own setup. The economics
+    # fields above stay present regardless (harmless at 'research' - they're
+    # simply not required yet - and needed as-is by the tests that exercise
+    # the economics/ceiling checks directly, which fire independent of stage).
+    "evidence_stage": "research",
+    "research_objective": "does the target audience have a real, recurring pain point here",
+    "research_confirming_criteria": "3+ independent accounts describing real impact",
+    "research_disconfirming_criteria": "only generic chatter, nothing concrete found",
 }
 
 SAMPLE_PIVOT = {
@@ -401,10 +414,10 @@ def test_jsonl_write_overwrites():
 
 def test_request_approval_valid():
     reset_state()
-    result = json.loads(tools.request_approval.run(category="publish", proposal="p", reasoning="r"))
+    result = json.loads(tools.request_approval.run(category="deploy", proposal="p", reasoning="r"))
     assert "queued" in result
     stored = tools._read_jsonl("approval_queue.jsonl")
-    assert len(stored) == 1 and stored[0]["status"] == "pending" and stored[0]["category"] == "publish"
+    assert len(stored) == 1 and stored[0]["status"] == "pending" and stored[0]["category"] == "deploy"
 
 
 def test_request_approval_invalid_category():
@@ -412,6 +425,105 @@ def test_request_approval_invalid_category():
     result = json.loads(tools.request_approval.run(category="marketing", proposal="p", reasoning="r"))
     assert "error" in result
     assert tools._read_jsonl("approval_queue.jsonl") == []
+
+
+# --- tools.py: rigid publish-approval template (structural-rebuild --------
+# addendum, section 7) - no narrative prose in the fields that matter.
+
+_PUBLISH_TEMPLATE = {
+    "platform": "reddit", "target_url": "https://reddit.com/r/algotrading/comments/xyz",
+    "title": "kein Titel", "text": "Ran into the same API timeout issue last week.",
+    "footer": "keiner", "hypothesis_id": "hyp_test_0001", "evidence_stage": "community_engagement",
+    "is_experiment": True, "success_criterion": ">=5 substantive replies within 7 days = confirmed signal",
+}
+
+
+def test_request_approval_publish_rejects_free_prose():
+    reset_state()
+    result = json.loads(tools.request_approval.run(category="publish", proposal="just post it, looks fine", reasoning="r"))
+    assert "error" in result
+    assert tools._read_jsonl("approval_queue.jsonl") == []
+
+
+def test_request_approval_publish_rejects_missing_template_field():
+    reset_state()
+    incomplete = dict(_PUBLISH_TEMPLATE)
+    del incomplete["success_criterion"]
+    result = json.loads(tools.request_approval.run(category="publish", proposal=json.dumps(incomplete), reasoning="r"))
+    assert "error" in result
+    assert "success_criterion" in result["error"]
+
+
+def test_request_approval_publish_rejects_empty_template_field():
+    reset_state()
+    bad = {**_PUBLISH_TEMPLATE, "target_url": "  "}
+    result = json.loads(tools.request_approval.run(category="publish", proposal=json.dumps(bad), reasoning="r"))
+    assert "error" in result
+
+
+def test_request_approval_publish_rejects_non_bool_is_experiment():
+    reset_state()
+    bad = {**_PUBLISH_TEMPLATE, "is_experiment": "yes"}
+    result = json.loads(tools.request_approval.run(category="publish", proposal=json.dumps(bad), reasoning="r"))
+    assert "error" in result
+
+
+def test_request_approval_publish_accepts_full_template():
+    reset_state()
+    result = json.loads(tools.request_approval.run(category="publish", proposal=json.dumps(_PUBLISH_TEMPLATE), reasoning="r"))
+    assert "queued" in result, result
+    stored = tools._read_jsonl("approval_queue.jsonl")
+    assert stored[0]["category"] == "publish"
+
+
+def test_request_approval_publish_accepts_no_success_criterion_needed():
+    reset_state()
+    pure_research = {**_PUBLISH_TEMPLATE, "is_experiment": False, "success_criterion": "nein, reine Recherche, kein Erfolgskriterium noetig"}
+    result = json.loads(tools.request_approval.run(category="publish", proposal=json.dumps(pure_research), reasoning="r"))
+    assert "queued" in result, result
+
+
+def test_format_publish_proposal_renders_structured_fields():
+    rendered = tools._format_publish_proposal(json.dumps(_PUBLISH_TEMPLATE))
+    assert "Plattform: reddit" in rendered
+    assert "Ziel-URL: https://reddit.com/r/algotrading/comments/xyz" in rendered
+    assert "Titel: kein Titel" in rendered
+    assert "Text:\nRan into the same API timeout issue last week." in rendered
+    assert "Footer/Signatur: keiner" in rendered
+    assert "Gehoert zu: hyp_test_0001 (evidence_stage: community_engagement)" in rendered
+    assert "Ist das ein Experiment: ja" in rendered
+    assert "Erfolgskriterium: >=5 substantive replies within 7 days = confirmed signal" in rendered
+
+
+def test_format_publish_proposal_falls_back_on_non_json():
+    assert tools._format_publish_proposal("not json at all") == "not json at all"
+
+
+def test_notify_new_pending_approvals_renders_publish_template_structured():
+    reset_state()
+    had_token = os.environ.pop("TELEGRAM_BOT_TOKEN", None)
+    had_chat = os.environ.pop("TELEGRAM_CHAT_ID", None)
+    captured = []
+    original_send = tools.send_telegram_message
+    try:
+        tools.send_telegram_message = lambda text, parse_mode=None: captured.append(text)
+        os.environ["TELEGRAM_BOT_TOKEN"] = "x"
+        os.environ["TELEGRAM_CHAT_ID"] = "1"
+        tools.request_approval.run(category="publish", proposal=json.dumps(_PUBLISH_TEMPLATE), reasoning="research plan checked out")
+        tools.notify_new_pending_approvals()
+        assert captured, "expected a Telegram notification"
+        assert "Plattform: reddit" in captured[0]
+        assert "Begruendung: research plan checked out" in captured[0]
+    finally:
+        tools.send_telegram_message = original_send
+        if had_token is not None:
+            os.environ["TELEGRAM_BOT_TOKEN"] = had_token
+        else:
+            os.environ.pop("TELEGRAM_BOT_TOKEN", None)
+        if had_chat is not None:
+            os.environ["TELEGRAM_CHAT_ID"] = had_chat
+        else:
+            os.environ.pop("TELEGRAM_CHAT_ID", None)
 
 
 def test_read_state_reports_pending_approvals():
@@ -454,9 +566,16 @@ def test_file_task_order_rejects_invalid_role():
 
 def test_file_and_read_task_order():
     reset_state()
+    tools.write_hypothesis.run(hypothesis=json.dumps({**SAMPLE_HYP, "id": "hyp_x"}))
+    _seed_stage_skip_approval(hypothesis_id="hyp_x", target_stage="landing_page")
+    tools.write_hypothesis.run(hypothesis=json.dumps({
+        "id": "hyp_x", "evidence_stage": "landing_page",
+        **{k: SAMPLE_HYP[k] for k in ("estimated_build_cost", "price_point_monthly",
+                                       "break_even_horizon_months", "break_even_users", "build_cost_reasoning")},
+    }))
     filed = json.loads(tools.file_task_order.run(
         to_role="dev", task_description="build variant for hyp_x", context="build outcome",
-        hypothesis_id="hyp_x", stage_justification="evidence-stage gate test bypass",
+        hypothesis_id="hyp_x",
     ))
     assert "filed" in filed
     open_orders = json.loads(tools.read_task_orders.run(to_role="dev", status="open"))
@@ -533,6 +652,54 @@ def test_write_hypothesis_requires_build_cost_reasoning():
     del bad["build_cost_reasoning"]
     result = json.loads(tools.write_hypothesis.run(hypothesis=json.dumps(bad)))
     assert "error" in result
+
+
+# --- tools.py: anti-instruction-copying tripwire (structural-rebuild -------
+# addendum, section 5) - confirms the exact incident that triggered this
+# (hyp_bootstrap_001's build_cost_reasoning traced to copied instruction
+# text describing the $15,000/agency-rate miscalibration) would actually be
+# caught mechanically, not just described in a docstring.
+
+def test_write_hypothesis_build_cost_reasoning_rejects_instruction_echo():
+    reset_state()
+    bad = {
+        **SAMPLE_HYP,
+        "build_cost_reasoning": (
+            "This system is built and operated by AI agents, so estimates must reflect Dev-agent token "
+            "spend, never old-economy market-rate thinking about what a human developer/agency/employee "
+            "would charge for a build like this."
+        ),
+    }
+    result = json.loads(tools.write_hypothesis.run(hypothesis=json.dumps(bad)))
+    assert "error" in result
+    assert "echoes known instruction" in result["error"]
+
+
+def test_write_hypothesis_defensibility_notes_rejects_instruction_echo():
+    reset_state()
+    bad = {
+        **SAMPLE_HYP,
+        "defensibility_notes": (
+            "Going higher needs a substantive reason citing genuinely more files/integration points/"
+            "iteration passes, not because it feels like it should cost more."
+        ),
+    }
+    result = json.loads(tools.write_hypothesis.run(hypothesis=json.dumps(bad)))
+    assert "error" in result
+    assert "echoes known instruction" in result["error"]
+
+
+def test_write_hypothesis_reasoning_fields_accept_genuine_text():
+    reset_state()
+    ok = {
+        **SAMPLE_HYP,
+        "defensibility_notes": (
+            "Accumulates a real dataset of exchange API incident timestamps over time, which a solo dev "
+            "couldn't trivially recreate in an afternoon - the moat grows with usage, not just code."
+        ),
+    }
+    result = json.loads(tools.write_hypothesis.run(hypothesis=json.dumps(ok)))
+    assert "error" not in result, result
 
 
 def test_write_hypothesis_rejects_high_cost_without_substantial_reasoning():
@@ -805,7 +972,28 @@ def test_compute_break_even_tool():
     result = json.loads(tools.compute_break_even.run(
         estimated_build_cost=1000, price_point_monthly=20, break_even_horizon_months=6,
     ))
-    assert result == {"break_even_users": 9}
+    assert result == {"applicable": True, "break_even_users": 9}
+
+
+def test_compute_break_even_refuses_at_early_stage():
+    reset_state()
+    for stage in ("research", "community_engagement"):
+        result = json.loads(tools.compute_break_even.run(
+            estimated_build_cost=1000, price_point_monthly=20, break_even_horizon_months=6,
+            evidence_stage=stage,
+        ))
+        assert result["applicable"] is False, result
+        assert "break_even_users" not in result
+
+
+def test_compute_break_even_applies_normally_at_later_stage():
+    reset_state()
+    for stage in ("landing_page", "build", ""):
+        result = json.loads(tools.compute_break_even.run(
+            estimated_build_cost=1000, price_point_monthly=20, break_even_horizon_months=6,
+            evidence_stage=stage,
+        ))
+        assert result == {"applicable": True, "break_even_users": 9}
 
 
 def test_compute_break_even_tool_rejects_non_positive():
@@ -1284,16 +1472,45 @@ def test_log_research_finding_requires_summary():
     assert "error" in result
 
 
+_SUBSTANTIVE_SUMMARY = (
+    "Checked r/algotrading and r/quantfinance for the last 3 months: 4 distinct threads describe a real "
+    "exchange API outage causing missed stop-losses, two with specific dollar-figure losses mentioned."
+)
+
+
 def test_log_research_finding_and_read_roundtrip():
     reset_state()
     result = json.loads(tools.log_research_finding.run(
         hypothesis_id="hyp_x", finding_type="competitor_product",
-        source="https://example.com/competitor", summary="Existing tool does X but not Y",
+        source="https://example.com/competitor", summary=_SUBSTANTIVE_SUMMARY,
     ))
     assert result["ok"] is True
     found = json.loads(tools.read_research_findings.run(hypothesis_id="hyp_x"))
     assert len(found) == 1 and found[0]["finding_type"] == "competitor_product"
     assert json.loads(tools.read_research_findings.run(hypothesis_id="hyp_other")) == []
+
+
+def test_log_research_finding_rejects_short_summary():
+    reset_state()
+    result = json.loads(tools.log_research_finding.run(
+        hypothesis_id="hyp_x", finding_type="competitor_product",
+        source="https://example.com/competitor", summary="Existing tool does X but not Y",
+    ))
+    assert "error" in result
+    assert json.loads(tools.read_research_findings.run(hypothesis_id="hyp_x")) == []
+
+
+def test_log_research_finding_rejects_instruction_echo():
+    reset_state()
+    result = json.loads(tools.log_research_finding.run(
+        hypothesis_id="hyp_x", finding_type="other", source="n/a",
+        summary=(
+            "This system is built and operated by AI agents, so it typically costs this system a few "
+            "dollars in tokens rather than old-economy market-rate thinking about human developer/agency/"
+            "employee rates for a build like this one."
+        ),
+    ))
+    assert "error" in result
 
 
 # --- tools.py: content drafting ---------------------------------------------
@@ -1307,6 +1524,31 @@ def _draft_kwargs(**overrides):
     )
     kwargs.update(overrides)
     return kwargs
+
+
+def _seed_research_artifact(hypothesis_id=None, summary=None):
+    tools.log_research_finding.run(
+        hypothesis_id=hypothesis_id or SAMPLE_HYP["id"], finding_type="forum_discussion",
+        source="https://reddit.com/r/algotrading/comments/xyz",
+        summary=summary or _SUBSTANTIVE_SUMMARY,
+    )
+
+
+def _seed_community_engagement_artifact(hypothesis_id=None):
+    hyp_id = hypothesis_id or SAMPLE_HYP["id"]
+    drafted = json.loads(tools.draft_content.run(**_draft_kwargs(hypothesis_id=hyp_id, post_type="thread_reply")))
+    drafts = tools._read_jsonl("content_drafts.jsonl")
+    idx = next(i for i, d in enumerate(drafts) if d["id"] == drafted["id"])
+    drafts[idx]["status"] = "posted"
+    tools._write_jsonl("content_drafts.jsonl", drafts)
+
+
+def _seed_stage_skip_approval(hypothesis_id=None, target_stage="landing_page", subsidiary_id="api-sentinel"):
+    filed = json.loads(holding.file_stage_skip_request.run(
+        hypothesis_id=hypothesis_id or SAMPLE_HYP["id"], subsidiary_id=subsidiary_id, target_stage=target_stage,
+        reasoning="Test setup: this specific hypothesis's lineage already gathered equivalent evidence upstream.",
+    ))
+    holding.decide_stage_skip_request.run(request_id=filed["filed"], decision="approved", reasoning="test setup")
 
 
 def test_draft_content_rejects_invalid_platform():
@@ -1423,8 +1665,9 @@ def test_write_hypothesis_defaults_new_optional_fields():
     assert stored["pricing_tier_reasoning"] is None
     assert stored["expansion_notes"] is None
     assert stored["channel_fit_reasoning"] is None
-    assert stored["evidence_stage"] is None
+    assert stored["evidence_stage"] == "research"  # SAMPLE_HYP sets this explicitly now (required field)
     assert stored["payment_intent_approval_id"] is None
+    assert stored["rough_economics_note"] is None
 
 
 # --- tools.py: evidence-stage ladder (Dev/Growth-limits addendum) -----------
@@ -1437,29 +1680,83 @@ def test_write_hypothesis_evidence_stage_rejects_invalid_value():
     assert "error" in result
 
 
-def test_write_hypothesis_evidence_stage_accepts_each_valid_value():
+def test_write_hypothesis_evidence_stage_full_progression_with_real_artifacts():
+    # The real end-to-end path (structural-rebuild addendum, sections 3-4):
+    # research (with plan fields) -> a substantive research artifact ->
+    # community_engagement (with a real posted draft) -> landing_page (now
+    # requiring precise economics) -> build. Each transition only succeeds
+    # once its artifact actually exists - this is what would have caught
+    # hyp_bootstrap_001 skipping straight to a landing page.
     reset_state()
-    for stage in tools.EVIDENCE_STAGES:
-        hyp_id = f"hyp_stage_{stage}"
-        # status='evaluated' sidesteps MAX_ACTIVE_HYPOTHESES/parallelism (both
-        # only apply to status='active') - irrelevant to what's under test here.
-        result = json.loads(tools.write_hypothesis.run(
-            hypothesis=json.dumps({**SAMPLE_HYP, "id": hyp_id, "status": "evaluated", "evidence_stage": stage})
-        ))
-        assert "error" not in result, result
-        stored = next(h for h in json.loads(tools.read_hypotheses.run()) if h["id"] == hyp_id)
-        assert stored["evidence_stage"] == stage
+    hyp_id = SAMPLE_HYP["id"]
+    result = json.loads(tools.write_hypothesis.run(hypothesis=json.dumps(SAMPLE_HYP)))  # evidence_stage='research'
+    assert "error" not in result, result
+
+    _seed_research_artifact(hyp_id)
+    _seed_community_engagement_artifact(hyp_id)
+
+    result = json.loads(tools.write_hypothesis.run(
+        hypothesis=json.dumps({"id": hyp_id, "evidence_stage": "community_engagement"})
+    ))
+    assert "error" not in result, result
+    stored = json.loads(tools.read_hypotheses.run())[0]
+    assert stored["evidence_stage"] == "community_engagement"
+
+    result = json.loads(tools.write_hypothesis.run(
+        hypothesis=json.dumps({"id": hyp_id, "evidence_stage": "landing_page"})
+    ))
+    assert "error" not in result, result
+    stored = json.loads(tools.read_hypotheses.run())[0]
+    assert stored["evidence_stage"] == "landing_page"
+
+    result = json.loads(tools.write_hypothesis.run(hypothesis=json.dumps({"id": hyp_id, "evidence_stage": "build"})))
+    assert "error" not in result, result  # already past the later-stage boundary, no fresh artifact needed
+    stored = json.loads(tools.read_hypotheses.run())[0]
+    assert stored["evidence_stage"] == "build"
 
 
-def test_write_hypothesis_evidence_stage_update_accepts_null():
+def test_write_hypothesis_evidence_stage_community_engagement_requires_artifact():
     reset_state()
-    tools.write_hypothesis.run(hypothesis=json.dumps({**SAMPLE_HYP, "evidence_stage": "research"}))
+    tools.write_hypothesis.run(hypothesis=json.dumps(SAMPLE_HYP))
+    result = json.loads(tools.write_hypothesis.run(
+        hypothesis=json.dumps({"id": SAMPLE_HYP["id"], "evidence_stage": "community_engagement"})
+    ))
+    assert "error" in result
+
+
+def test_write_hypothesis_evidence_stage_landing_page_requires_both_artifacts():
+    reset_state()
+    tools.write_hypothesis.run(hypothesis=json.dumps(SAMPLE_HYP))
+    # only the research artifact exists - community_engagement is still missing
+    _seed_research_artifact()
     result = json.loads(tools.write_hypothesis.run(
         hypothesis=json.dumps({"id": SAMPLE_HYP["id"], "evidence_stage": "landing_page"})
     ))
-    assert "error" not in result
-    stored = json.loads(tools.read_hypotheses.run())[0]
-    assert stored["evidence_stage"] == "landing_page"
+    assert "error" in result
+    assert "community_engagement" in result["error"]
+
+
+def test_write_hypothesis_evidence_stage_landing_page_via_approved_stage_skip():
+    reset_state()
+    tools.write_hypothesis.run(hypothesis=json.dumps(SAMPLE_HYP))  # no artifacts at all
+    _seed_stage_skip_approval(target_stage="landing_page")
+    result = json.loads(tools.write_hypothesis.run(
+        hypothesis=json.dumps({
+            "id": SAMPLE_HYP["id"], "evidence_stage": "landing_page",
+            **{k: SAMPLE_HYP[k] for k in ("estimated_build_cost", "price_point_monthly",
+                                           "break_even_horizon_months", "break_even_users", "build_cost_reasoning")},
+        })
+    ))
+    assert "error" not in result, result
+
+
+def test_write_hypothesis_evidence_stage_landing_page_without_skip_rejected():
+    reset_state()
+    tools.write_hypothesis.run(hypothesis=json.dumps(SAMPLE_HYP))  # no artifacts, no skip request
+    result = json.loads(tools.write_hypothesis.run(
+        hypothesis=json.dumps({"id": SAMPLE_HYP["id"], "evidence_stage": "landing_page"})
+    ))
+    assert "error" in result
 
 
 # --- tools.py: file_task_order dev-stage gate --------------------------------
@@ -1475,9 +1772,24 @@ def test_file_task_order_dev_gate_rejects_without_stage_or_justification():
     assert json.loads(tools.read_task_orders.run(to_role="dev", status="open")) == []
 
 
+def _promote_sample_hyp_to_stage(stage):
+    """Test helper: get SAMPLE_HYP to evidence_stage=stage via an approved
+    stage-skip request (simplest path for tests that only care about what
+    happens *after* the hypothesis is already there, not how it got there -
+    the artifact-backed path itself is covered by the evidence-stage tests).
+    """
+    tools.write_hypothesis.run(hypothesis=json.dumps(SAMPLE_HYP))
+    _seed_stage_skip_approval(target_stage=stage)
+    tools.write_hypothesis.run(hypothesis=json.dumps({
+        "id": SAMPLE_HYP["id"], "evidence_stage": stage,
+        **{k: SAMPLE_HYP[k] for k in ("estimated_build_cost", "price_point_monthly",
+                                       "break_even_horizon_months", "break_even_users", "build_cost_reasoning")},
+    }))
+
+
 def test_file_task_order_dev_gate_accepts_with_landing_page_stage():
     reset_state()
-    tools.write_hypothesis.run(hypothesis=json.dumps({**SAMPLE_HYP, "evidence_stage": "landing_page"}))
+    _promote_sample_hyp_to_stage("landing_page")
     result = json.loads(tools.file_task_order.run(
         to_role="dev", task_description="build landing page", context="first test",
         hypothesis_id=SAMPLE_HYP["id"],
@@ -1487,25 +1799,12 @@ def test_file_task_order_dev_gate_accepts_with_landing_page_stage():
 
 def test_file_task_order_dev_gate_accepts_with_build_stage():
     reset_state()
-    tools.write_hypothesis.run(hypothesis=json.dumps({**SAMPLE_HYP, "evidence_stage": "build"}))
+    _promote_sample_hyp_to_stage("build")
     result = json.loads(tools.file_task_order.run(
         to_role="dev", task_description="build the real product", context="build outcome",
         hypothesis_id=SAMPLE_HYP["id"],
     ))
     assert "filed" in result, result
-
-
-def test_file_task_order_dev_gate_accepts_with_explicit_justification():
-    reset_state()
-    tools.write_hypothesis.run(hypothesis=json.dumps(SAMPLE_HYP))  # evidence_stage still None
-    result = json.loads(tools.file_task_order.run(
-        to_role="dev", task_description="build landing page", context="first test",
-        hypothesis_id=SAMPLE_HYP["id"],
-        stage_justification="cheapest sufficient test is a landing page here, no cheaper step applies",
-    ))
-    assert "filed" in result, result
-    stored = json.loads(tools.read_task_orders.run(to_role="dev"))[0]
-    assert stored["stage_justification"] == "cheapest sufficient test is a landing page here, no cheaper step applies"
 
 
 def test_file_task_order_dev_gate_ignores_unknown_hypothesis_without_justification():
@@ -1534,6 +1833,43 @@ def test_file_task_order_dev_gate_does_not_apply_to_growth():
         to_role="growth", task_description="draft a post", context="ctx", hypothesis_id=SAMPLE_HYP["id"],
     ))
     assert "filed" in result, result
+
+
+# --- tools.py: hypothesis overview (structural-rebuild addendum, section 8) -
+
+def test_build_hypothesis_overview_empty_when_no_active_hypotheses():
+    reset_state()
+    assert tools.build_hypothesis_overview() == []
+
+
+def test_build_hypothesis_overview_reflects_real_records():
+    reset_state()
+    tools.write_hypothesis.run(hypothesis=json.dumps(SAMPLE_HYP))
+    _seed_research_artifact()
+    tools.file_task_order.run(to_role="growth", task_description="measure reddit reach", context="ctx")
+
+    overview = tools.build_hypothesis_overview()
+    assert len(overview) == 1
+    entry = overview[0]
+    assert entry["id"] == SAMPLE_HYP["id"]
+    assert entry["evidence_stage"] == "research"
+    assert "revenue" in entry["status_line"] and "reddit" in entry["status_line"]
+    assert _SUBSTANTIVE_SUMMARY[:50] in entry["latest_finding"]
+    assert entry["next_action"] == "keine offene Task-Order"  # order above has no hypothesis_id
+
+
+def test_build_hypothesis_overview_ignores_non_active_hypotheses():
+    reset_state()
+    buried = {**SAMPLE_HYP, "status": "buried", "bury_reasoning": "not worth pursuing"}
+    tools.write_hypothesis.run(hypothesis=json.dumps(buried))
+    assert tools.build_hypothesis_overview() == []
+
+
+def test_build_hypothesis_overview_no_findings_yet():
+    reset_state()
+    tools.write_hypothesis.run(hypothesis=json.dumps(SAMPLE_HYP))
+    entry = tools.build_hypothesis_overview()[0]
+    assert entry["latest_finding"] == "keine Erkenntnis geloggt"
 
 
 # --- tools.py: cross-cycle continuity + usage log ---------------------------
@@ -1771,9 +2107,9 @@ def test_apply_telegram_commands_approve_via_reply():
     had_token = os.environ.pop("TELEGRAM_BOT_TOKEN", None)
     had_chat = os.environ.pop("TELEGRAM_CHAT_ID", None)
     try:
-        appr = json.loads(tools.request_approval.run(category="publish", proposal="p", reasoning="r"))
+        appr = json.loads(tools.request_approval.run(category="deploy", proposal="p", reasoning="r"))
         request_id = appr["queued"]
-        notification_text = f"Neue Freigabe angefragt: {request_id}\nKategorie: publish"
+        notification_text = f"Neue Freigabe angefragt: {request_id}\nKategorie: deploy"
 
         log = tools._apply_telegram_commands([{"text": "approve", "reply_to_text": notification_text}])
         assert any(request_id in entry and "approved" in entry for entry in log)
@@ -1884,12 +2220,120 @@ def test_apply_telegram_commands_payment_link_sets_url_once_approved():
             os.environ["TELEGRAM_CHAT_ID"] = had_chat
 
 
+# --- tools.py: duration-cap policy proposal (structural-rebuild addendum, --
+# section 6) - a board-set number, never silently active until confirmed.
+
+def test_classify_command_duration_policy_confirm():
+    assert tools._classify_command("duration_policy: confirm", "") == ("duration_policy_confirm", None)
+    assert tools._classify_command("duration_policy: Confirm", "") == ("duration_policy_confirm", None)
+
+
+def test_classify_command_duration_policy_set():
+    action, values = tools._classify_command("duration_policy: 3 5 14 none", "")
+    assert action == "duration_policy_set"
+    assert values == {"research": 3, "community_engagement": 5, "landing_page": 14, "build": None}
+
+
+def test_classify_command_duration_policy_set_rejects_wrong_shape():
+    assert tools._classify_command("duration_policy: 3 5 14", "") is None
+    assert tools._classify_command("duration_policy: three 5 14 none", "") is None
+
+
+def test_write_hypothesis_duration_ceiling_not_enforced_while_proposed():
+    reset_state()
+    # DEFAULT_PROPOSED_DURATION_CAPS ships status='proposed' - not active yet.
+    over_ceiling = {**SAMPLE_HYP, "duration_days": 999}
+    result = json.loads(tools.write_hypothesis.run(hypothesis=json.dumps(over_ceiling)))
+    assert "error" not in result, result
+
+
+def test_apply_telegram_commands_duration_policy_confirm():
+    reset_state()
+    had_token = os.environ.pop("TELEGRAM_BOT_TOKEN", None)
+    had_chat = os.environ.pop("TELEGRAM_CHAT_ID", None)
+    try:
+        holding.read_subsidiaries.run()  # bootstraps api-sentinel with the default proposed policy
+        log = tools._apply_telegram_commands([{"text": "duration_policy: confirm", "reply_to_text": ""}])
+        assert any("bestaetigt" in entry for entry in log)
+        subs = json.loads(holding.read_subsidiaries.run())
+        stored_policy = subs[0]["policies"]["max_duration_days_by_stage"]
+        assert stored_policy["status"] == "confirmed"
+    finally:
+        if had_token is not None:
+            os.environ["TELEGRAM_BOT_TOKEN"] = had_token
+        if had_chat is not None:
+            os.environ["TELEGRAM_CHAT_ID"] = had_chat
+
+
+def test_apply_telegram_commands_duration_policy_set_and_confirm():
+    reset_state()
+    had_token = os.environ.pop("TELEGRAM_BOT_TOKEN", None)
+    had_chat = os.environ.pop("TELEGRAM_CHAT_ID", None)
+    try:
+        holding.read_subsidiaries.run()
+        log = tools._apply_telegram_commands([{"text": "duration_policy: 2 4 10 none", "reply_to_text": ""}])
+        assert any("gesetzt und bestaetigt" in entry for entry in log)
+        subs = json.loads(holding.read_subsidiaries.run())
+        stored_policy = subs[0]["policies"]["max_duration_days_by_stage"]
+        assert stored_policy["status"] == "confirmed"
+        assert stored_policy["values"] == {"research": 2, "community_engagement": 4, "landing_page": 10, "build": None}
+    finally:
+        if had_token is not None:
+            os.environ["TELEGRAM_BOT_TOKEN"] = had_token
+        if had_chat is not None:
+            os.environ["TELEGRAM_CHAT_ID"] = had_chat
+
+
+def test_write_hypothesis_duration_ceiling_enforced_once_confirmed():
+    reset_state()
+    had_token = os.environ.pop("TELEGRAM_BOT_TOKEN", None)
+    had_chat = os.environ.pop("TELEGRAM_CHAT_ID", None)
+    try:
+        holding.read_subsidiaries.run()
+        tools._apply_telegram_commands([{"text": "duration_policy: 2 4 10 none", "reply_to_text": ""}])
+        # SAMPLE_HYP is evidence_stage='research', duration_days=10 - over the confirmed research ceiling (2)
+        result = json.loads(tools.write_hypothesis.run(hypothesis=json.dumps(SAMPLE_HYP)))
+        assert "error" in result
+        assert "confirmed policy ceiling" in result["error"]
+
+        within_ceiling = {**SAMPLE_HYP, "duration_days": 2}
+        result = json.loads(tools.write_hypothesis.run(hypothesis=json.dumps(within_ceiling)))
+        assert "error" not in result, result
+    finally:
+        if had_token is not None:
+            os.environ["TELEGRAM_BOT_TOKEN"] = had_token
+        if had_chat is not None:
+            os.environ["TELEGRAM_CHAT_ID"] = had_chat
+
+
+def test_write_hypothesis_duration_ceiling_override_via_approved_request():
+    reset_state()
+    had_token = os.environ.pop("TELEGRAM_BOT_TOKEN", None)
+    had_chat = os.environ.pop("TELEGRAM_CHAT_ID", None)
+    try:
+        holding.read_subsidiaries.run()
+        tools._apply_telegram_commands([{"text": "duration_policy: 2 4 10 none", "reply_to_text": ""}])
+        appr = json.loads(tools.request_approval.run(category="deploy", proposal="extend research window", reasoning="r"))
+        approvals = tools._read_jsonl("approval_queue.jsonl")
+        approvals[0]["status"] = "approved"
+        tools._write_jsonl("approval_queue.jsonl", approvals)
+
+        over_ceiling = {**SAMPLE_HYP, "duration_extension_approval_id": appr["queued"]}
+        result = json.loads(tools.write_hypothesis.run(hypothesis=json.dumps(over_ceiling)))
+        assert "error" not in result, result
+    finally:
+        if had_token is not None:
+            os.environ["TELEGRAM_BOT_TOKEN"] = had_token
+        if had_chat is not None:
+            os.environ["TELEGRAM_CHAT_ID"] = had_chat
+
+
 def test_notify_new_pending_approvals_marks_and_is_idempotent():
     reset_state()
     had_token = os.environ.pop("TELEGRAM_BOT_TOKEN", None)
     had_chat = os.environ.pop("TELEGRAM_CHAT_ID", None)
     try:
-        appr = json.loads(tools.request_approval.run(category="publish", proposal="p", reasoning="r"))
+        appr = json.loads(tools.request_approval.run(category="deploy", proposal="p", reasoning="r"))
         tools.notify_new_pending_approvals()
         stored = next(r for r in tools._read_jsonl("approval_queue.jsonl") if r["id"] == appr["queued"])
         assert stored["telegram_notified"] is True
@@ -1915,7 +2359,7 @@ def test_sync_signups_from_github_via_read_state():
 
 def test_approve_cli_flow():
     reset_state()
-    tools.request_approval.run(category="publish", proposal="p1", reasoning="r1")
+    tools.request_approval.run(category="deploy", proposal="p1", reasoning="r1")
     records = approve._load()
     assert len(records) == 1
     request_id = records[0]["id"]
@@ -2119,6 +2563,87 @@ def test_decide_pivot_proposal_does_not_redecide():
     assert "error" in result
     decided = json.loads(holding.read_pivot_proposals.run())[0]
     assert decided["decision"] == "rejected", "first decision must stick"
+
+
+# --- holding.py: evidence-stage skip review (structural-rebuild addendum, --
+# section 4) - Sub-CEO files, Main-CEO decides, mirrors pivot proposals.
+
+def test_file_stage_skip_request_rejects_invalid_target_stage():
+    reset_state()
+    result = json.loads(holding.file_stage_skip_request.run(
+        hypothesis_id="hyp_x", subsidiary_id="api-sentinel", target_stage="not_a_real_stage", reasoning="r",
+    ))
+    assert "error" in result
+
+
+def test_file_stage_skip_request_rejects_empty_reasoning():
+    reset_state()
+    result = json.loads(holding.file_stage_skip_request.run(
+        hypothesis_id="hyp_x", subsidiary_id="api-sentinel", target_stage="landing_page", reasoning="  ",
+    ))
+    assert "error" in result
+
+
+def test_file_stage_skip_request_rejects_instruction_echo():
+    reset_state()
+    result = json.loads(holding.file_stage_skip_request.run(
+        hypothesis_id="hyp_x", subsidiary_id="api-sentinel", target_stage="landing_page",
+        reasoning="A landing page realistically costs low single-digit dollars in tokens here, not hundreds or thousands.",
+    ))
+    assert "error" in result
+
+
+def test_file_and_read_stage_skip_request():
+    reset_state()
+    filed = json.loads(holding.file_stage_skip_request.run(
+        hypothesis_id="hyp_x", subsidiary_id="api-sentinel", target_stage="landing_page",
+        reasoning="This lineage's prior hypothesis already gathered equivalent research evidence directly.",
+    ))
+    assert "filed" in filed
+    pending = json.loads(holding.read_stage_skip_requests.run(status="pending"))
+    assert len(pending) == 1 and pending[0]["hypothesis_id"] == "hyp_x"
+    assert json.loads(holding.read_stage_skip_requests.run(status="approved")) == []
+
+
+def test_decide_stage_skip_request_approve_and_reject():
+    reset_state()
+    filed = json.loads(holding.file_stage_skip_request.run(
+        hypothesis_id="hyp_x", subsidiary_id="api-sentinel", target_stage="landing_page",
+        reasoning="This lineage's prior hypothesis already gathered equivalent research evidence directly.",
+    ))
+    result = json.loads(holding.decide_stage_skip_request.run(
+        request_id=filed["filed"], decision="approved", reasoning="checked, genuinely applies here",
+    ))
+    assert result == {"ok": True, "id": filed["filed"], "decision": "approved"}
+    stored = json.loads(holding.read_stage_skip_requests.run(status="approved"))[0]
+    assert stored["decision_reasoning"] == "checked, genuinely applies here"
+
+
+def test_decide_stage_skip_request_rejects_invalid_decision():
+    reset_state()
+    filed = json.loads(holding.file_stage_skip_request.run(
+        hypothesis_id="hyp_x", subsidiary_id="api-sentinel", target_stage="landing_page",
+        reasoning="This lineage's prior hypothesis already gathered equivalent research evidence directly.",
+    ))
+    result = json.loads(holding.decide_stage_skip_request.run(
+        request_id=filed["filed"], decision="maybe", reasoning="r",
+    ))
+    assert "error" in result
+
+
+def test_decide_stage_skip_request_does_not_redecide():
+    reset_state()
+    filed = json.loads(holding.file_stage_skip_request.run(
+        hypothesis_id="hyp_x", subsidiary_id="api-sentinel", target_stage="landing_page",
+        reasoning="This lineage's prior hypothesis already gathered equivalent research evidence directly.",
+    ))
+    holding.decide_stage_skip_request.run(request_id=filed["filed"], decision="rejected", reasoning="r1")
+    result = json.loads(holding.decide_stage_skip_request.run(
+        request_id=filed["filed"], decision="approved", reasoning="r2",
+    ))
+    assert "error" in result
+    decided = json.loads(holding.read_stage_skip_requests.run())[0]
+    assert decided["status"] == "rejected", "first decision must stick"
 
 
 # --- holding.py: cross-subsidiary requests ----------------------------------
@@ -2532,7 +3057,7 @@ def test_ceo_agent_tools_match_spec():
         "file_status_report", "read_strategic_direction",
         "file_pivot_proposal", "file_cross_subsidiary_request", "search_research_archive",
         "read_subsidiary_policies", "read_content_drafts", "log_research_finding", "read_research_findings",
-        "read_knowledge_base", "write_knowledge_entry", "propose_idea",
+        "read_knowledge_base", "write_knowledge_entry", "propose_idea", "file_stage_skip_request",
     }, tool_names
 
 
@@ -2547,6 +3072,7 @@ def test_main_ceo_agent_tools_match_spec():
         "search_research_archive", "request_approval",
         "read_subsidiary_policies", "update_subsidiary_policies",
         "propose_idea", "read_ideas", "route_idea",
+        "read_stage_skip_requests", "decide_stage_skip_request",
     }, tool_names
 
 
@@ -2646,6 +3172,59 @@ def test_usage_headline_and_detail_split():
     assert crew._usage_detail_line(None) == "LLM-Nutzung: nicht verfuegbar"
 
 
+# --- crew.py: hypothesis overview + "Fuer den Aufsichtsrat" (structural-----
+# rebuild addendum, section 8)
+
+def test_format_hypothesis_overview_empty_state():
+    assert crew._format_hypothesis_overview([]) == ["Keine aktiven Hypothesen."]
+
+
+def test_format_hypothesis_overview_renders_entries():
+    overview = [{
+        "id": "hyp_x", "evidence_stage": "research",
+        "status_line": "revenue / reddit, seit 2026-08-01",
+        "latest_finding": "keine Erkenntnis geloggt",
+        "next_action": "keine offene Task-Order",
+    }]
+    lines = crew._format_hypothesis_overview(overview)
+    assert lines[0] == "- hyp_x (evidence_stage=research): revenue / reddit, seit 2026-08-01"
+    assert lines[1] == "  Letzter Fund: keine Erkenntnis geloggt"
+    assert lines[2] == "  Naechster Schritt: keine offene Task-Order"
+
+
+def test_aufsichtsrat_lines_empty_when_nothing_needs_a_decision():
+    assert crew._aufsichtsrat_lines(0, {"status": "confirmed", "values": {}}, 0) == []
+    assert crew._aufsichtsrat_lines("?", None, 0) == []
+
+
+def test_aufsichtsrat_lines_pending_approvals():
+    lines = crew._aufsichtsrat_lines(2, None, 0)
+    assert lines[0] == ""
+    assert lines[1] == "--- Fuer den Aufsichtsrat ---"
+    assert any("2 offene Freigabe" in line for line in lines)
+
+
+def test_aufsichtsrat_lines_proposed_duration_policy():
+    policy = {"status": "proposed", "values": {"research": 3, "community_engagement": 5, "landing_page": 14, "build": None}}
+    lines = crew._aufsichtsrat_lines(0, policy, 0)
+    assert any("Duration-Policy-Vorschlag" in line for line in lines)
+    assert any("duration_policy: confirm" in line for line in lines)
+
+
+def test_aufsichtsrat_lines_pending_stage_skips():
+    lines = crew._aufsichtsrat_lines(0, None, 3)
+    assert any("3 offene Stage-Skip-Anfrage" in line for line in lines)
+
+
+def test_aufsichtsrat_lines_combines_all_triggers():
+    policy = {"status": "proposed", "values": {}}
+    lines = crew._aufsichtsrat_lines(1, policy, 2)
+    joined = "\n".join(lines)
+    assert "offene Freigabe" in joined
+    assert "Duration-Policy-Vorschlag" in joined
+    assert "Stage-Skip-Anfrage" in joined
+
+
 def test_usage_headline_is_first_line_in_cycle_summary():
     reset_state()
     had_token = os.environ.pop("TELEGRAM_BOT_TOKEN", None)
@@ -2660,34 +3239,20 @@ def test_usage_headline_is_first_line_in_cycle_summary():
         })()
         crew.send_cycle_summary()
         assert captured, "expected send_telegram_message to be called"
+        # Structural-rebuild addendum, section 8: single message now, no
+        # separate formatted-table follow-up.
+        assert len(captured) == 1
         main_report = captured[0][0]
         lines = main_report.split("\n")
         assert lines[0].startswith("API Sentinel Zyklus - ")
         assert lines[1].startswith("Gesamt-Tokens diesen Zyklus: 999")
         assert "$" in lines[1]  # cost figure present (model is priced in the active testing profile)
-        # the usage table is sent as its own follow-up, formatted message
-        assert len(captured) == 2
-        assert captured[1][1] == "Markdown"
-        assert "```" in captured[1][0]
+        assert "--- Hypothesen-Uebersicht ---" in main_report
     finally:
         crew.send_telegram_message = original_send
         crew.crew.usage_metrics = original_metrics
         if had_token is not None:
             os.environ["TELEGRAM_BOT_TOKEN"] = had_token
-
-
-def test_format_usage_table_contains_key_figures():
-    usage = {
-        "total_tokens": 12345, "prompt_tokens": 10000, "completion_tokens": 2345,
-        "cached_prompt_tokens": 500, "cache_creation_tokens": 200, "successful_requests": 7,
-        "cost_usd": 0.0456,
-    }
-    table = crew._format_usage_table(usage)
-    assert table.startswith("```\n") and table.endswith("\n```")
-    assert "12345" in table
-    assert "$0.0456" in table
-    assert "Growth" in table and "Sub-CEO" in table and "Main-CEO" in table
-    assert crew._format_usage_table(None) == ""
 
 
 def test_malformed_tool_call_handler_records_events():

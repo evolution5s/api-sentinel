@@ -22,7 +22,7 @@ from crewai.tools import tool
 
 from jsonl_store import append_jsonl, read_jsonl, write_jsonl
 from scoring import HYPOTHESIS_OUTCOMES
-from tools import STATE_DIR as SUBSIDIARY_STATE_DIR
+from tools import EVIDENCE_STAGES, STATE_DIR as SUBSIDIARY_STATE_DIR, _instruction_echo_match
 
 HOLDING_DIR = SUBSIDIARY_STATE_DIR / "_holding"
 
@@ -446,6 +446,102 @@ def decide_pivot_proposal(proposal_id: str, decision: str, reasoning: str) -> st
     proposals[idx]["decided_at"] = datetime.now(timezone.utc).isoformat()
     _write("pivot_proposals.jsonl", proposals)
     return json.dumps({"ok": True, "id": proposal_id, "decision": decision})
+
+
+# --------------------------------------------------------------------------
+# Evidence-stage skip review (structural-rebuild addendum, section 4).
+# write_hypothesis rejects a hypothesis crossing into landing_page/build (or
+# community_engagement) without artifact-backed history through the earlier
+# stages - unless a stage-skip request for that exact hypothesis_id/
+# target_stage is on record here with status='approved'. Mirrors file_
+# pivot_proposal/decide_pivot_proposal's Sub-CEO-files/Main-CEO-decides
+# shape exactly, kept separate from pivot_proposals.jsonl since a stage
+# skip is a narrower, differently-shaped decision (which stage, why skip
+# it) than a full strategy pivot (8 required template fields) - forcing
+# stage-skip reasoning through the pivot template would be an awkward fit
+# for what is usually a much smaller, tactical call.
+# --------------------------------------------------------------------------
+
+STAGE_SKIP_DECISIONS = {"approved", "rejected"}
+
+
+@tool("file_stage_skip_request")
+def file_stage_skip_request(hypothesis_id: str, subsidiary_id: str, target_stage: str, reasoning: str) -> str:
+    """Sub-CEO asks the Main-CEO to approve skipping straight to
+    target_stage (landing_page/build, or community_engagement) for
+    hypothesis_id without the artifact-backed research/community_engagement
+    history write_hypothesis normally requires to get there. Only file this
+    when skipping genuinely applies (e.g. research truly isn't relevant to
+    this specific question) - not as a routine way around the gate; the
+    Main-CEO is expected to actually push back when it isn't warranted.
+    reasoning must trace to something real about this specific hypothesis,
+    not general system knowledge or reused instruction wording (rejected if
+    it echoes known template phrasing, same check as build_cost_reasoning).
+    """
+    if target_stage not in EVIDENCE_STAGES:
+        return json.dumps({"error": f"invalid target_stage '{target_stage}', must be one of {EVIDENCE_STAGES}"})
+    if not reasoning.strip():
+        return json.dumps({"error": "reasoning must not be empty"})
+    echoed = _instruction_echo_match(reasoning)
+    if echoed:
+        return json.dumps({
+            "error": f"reasoning echoes known instruction/incident template language ('{echoed}') rather "
+                     "than something specific to this hypothesis - describe the actual reason, don't reuse "
+                     "example wording"
+        })
+
+    record = {
+        "id": f"skip_{uuid.uuid4().hex[:8]}",
+        "hypothesis_id": hypothesis_id,
+        "subsidiary_id": subsidiary_id,
+        "target_stage": target_stage,
+        "reasoning": reasoning,
+        "filed_at": datetime.now(timezone.utc).isoformat(),
+        "status": "pending",
+        "decision_reasoning": None,
+        "decided_at": None,
+    }
+    _append("stage_skip_requests.jsonl", record)
+    return json.dumps({"filed": record["id"]})
+
+
+@tool("read_stage_skip_requests")
+def read_stage_skip_requests(status: str = "") -> str:
+    """Return filed stage-skip requests as JSON. Pass status="pending" for
+    what's actually waiting on Main-CEO review, "approved"/"rejected" for
+    already-decided ones, or "" for all.
+    """
+    requests = _read("stage_skip_requests.jsonl")
+    if status:
+        requests = [r for r in requests if r.get("status") == status]
+    return json.dumps(requests, ensure_ascii=False)
+
+
+@tool("decide_stage_skip_request")
+def decide_stage_skip_request(request_id: str, decision: str, reasoning: str) -> str:
+    """Main-CEO decides a pending stage-skip request. decision must be
+    'approved' (the skip is genuinely warranted - e.g. research truly
+    doesn't apply to this question) or 'rejected' (send it back to do the
+    earlier stages properly). Never re-decides an already-decided request -
+    file a new one if circumstances genuinely change.
+    """
+    if decision not in STAGE_SKIP_DECISIONS:
+        return json.dumps({"error": f"invalid decision '{decision}', must be one of {sorted(STAGE_SKIP_DECISIONS)}"})
+
+    requests = _read("stage_skip_requests.jsonl")
+    idx = next((i for i, r in enumerate(requests) if r.get("id") == request_id), None)
+    if idx is None:
+        return json.dumps({"error": f"no stage-skip request with id '{request_id}'"})
+    if requests[idx].get("status") != "pending":
+        return json.dumps({
+            "error": f"'{request_id}' is already '{requests[idx].get('status')}', not re-deciding"
+        })
+
+    requests[idx]["status"] = decision
+    requests[idx]["decision_reasoning"] = reasoning
+    requests[idx]["decided_at"] = datetime.now(timezone.utc).isoformat()
+    _write("stage_skip_requests.jsonl", requests)
+    return json.dumps({"ok": True, "id": request_id, "decision": decision})
 
 
 # --------------------------------------------------------------------------

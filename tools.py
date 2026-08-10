@@ -37,22 +37,52 @@ GITHUB_API = "https://api.github.com"
 SIGNUP_TITLE_PREFIX = "[Signup]"
 
 APPROVAL_CATEGORIES = {"spend", "legal", "publish", "deploy", "pricing"}
-REQUIRED_HYPOTHESIS_FIELDS = {
+# Rigid structured template for category='publish' requests (structural-
+# rebuild addendum, section 7) - no narrative prose in the fields that
+# matter, rendered verbatim in Telegram, never reflowed.
+PUBLISH_TEMPLATE_FIELDS = {
+    "platform", "target_url", "title", "text", "footer",
+    "hypothesis_id", "evidence_stage", "is_experiment", "success_criterion",
+}
+#
+# Structural-rebuild addendum (section 2): fields are now required based on
+# reversibility, not a single flat checklist. research/community_engagement
+# are two-way doors (Bezos 1997) - cheap, fast, reversible, decide and move,
+# no load-bearing economics needed yet. landing_page/build cross toward a
+# one-way door - real cost, real commitment - so the numbers backing them
+# must be precise and evidence-grounded by then.
+BASE_REQUIRED_HYPOTHESIS_FIELDS = {
     "id", "statement", "category", "landing_page_variant_id",
     "failure_rate", "success_rate", "duration_days", "channel",
-    # Economics (section 2 of the outcome-engine brief): required before an
-    # experiment is allowed to run at all, same as failure_rate/success_rate
-    # already are - not something computed after the fact to fit a result.
-    "hypothesis_type", "estimated_build_cost", "price_point_monthly",
-    "break_even_horizon_months", "break_even_users",
+    "hypothesis_type",
     # Bullseye-style ranking signal (four-fixes addendum, point 4) - same
     # shape as channels.jsonl's impact_score/confidence_score, so competing
     # hypothesis ideas can be ranked against each other the same way
     # competing channels already are, instead of as a disconnected pass.
     "impact_score", "confidence_score",
-    # AI-native economics addendum: the estimate itself must be justified,
-    # not just present - see the ceiling check below.
-    "build_cost_reasoning",
+    # No longer optional (was under the audit addendum) - every hypothesis
+    # now declares its own evidence stage from the start, since required-ness
+    # of everything else below hinges on it.
+    "evidence_stage",
+}
+# Only required once evidence_stage crosses into landing_page/build - see
+# the module-level comment above. AI-native economics addendum: the
+# estimate itself must be justified, not just present - see the ceiling
+# check below.
+STAGE_GATED_ECONOMICS_FIELDS = {
+    "estimated_build_cost", "price_point_monthly",
+    "break_even_horizon_months", "break_even_users", "build_cost_reasoning",
+}
+# Union, for anything that wants "everything write_hypothesis could ever
+# require" rather than the stage-conditional split (e.g. a full-coverage
+# test fixture at build stage).
+REQUIRED_HYPOTHESIS_FIELDS = BASE_REQUIRED_HYPOTHESIS_FIELDS | STAGE_GATED_ECONOMICS_FIELDS
+# Required (section 3) whenever evidence_stage is being set to "research":
+# the research plan - what question this is meant to answer, and what
+# would count as confirming vs. disconfirming - logged before research
+# starts, not reconstructed afterward to fit whatever was found.
+RESEARCH_PLAN_FIELDS = {
+    "research_objective", "research_confirming_criteria", "research_disconfirming_criteria",
 }
 HYPOTHESIS_TYPES = {"value", "growth"}
 PIVOT_VARIABLES = {"audience", "price", "copy", "channel", "timing"}
@@ -61,17 +91,29 @@ HYPOTHESIS_STATUSES = {"active", "evaluated", "buried"}
 # too many hypotheses at once is the more common failure than picking the
 # wrong one first (four-fixes addendum, point 4).
 MAX_ACTIVE_HYPOTHESES = 3
-# Evidence-stage ladder (audit addendum): ordered from cheapest/weakest to
-# most expensive/strongest signal. Tracked per-hypothesis via the optional
-# evidence_stage field (write_hypothesis) - not required on every hypothesis
-# (the bootstrap hypothesis and any other legitimate straight-to-landing-page
-# test stay valid without one), but file_task_order's dev-stage gate below
-# checks it: ordering real Dev work (a landing page or, later, the actual
-# build) without having recorded progression through research/community_
-# engagement first requires an explicit stage_justification instead - an
-# auditable choice, not a silent default, same self-declared-and-trusted
-# pattern as pivot_reasoning/primary_variable_tested elsewhere in this file.
+# Evidence-stage ladder: ordered from cheapest/weakest to most expensive/
+# strongest signal. Every hypothesis now declares one (BASE_REQUIRED_
+# HYPOTHESIS_FIELDS) from the start. research/community_engagement are
+# two-way doors - real, substantive artifacts are still required to progress
+# past them (see the artifact-gate helpers below), but the bar is "did you
+# actually do the cheap step", not committee review. landing_page/build are
+# where real cost gets committed - crossing into either without artifact-
+# backed history through the earlier stages requires a Main-CEO-reviewed
+# stage-skip request (holding.py's stage_skip_requests.jsonl), not a
+# self-written excuse - the prior self-signed stage_justification string was
+# exactly how the bootstrap hypothesis skipped straight to a landing page.
 EVIDENCE_STAGES = ["research", "community_engagement", "landing_page", "build"]
+EVIDENCE_EARLY_STAGES = {"research", "community_engagement"}
+EVIDENCE_LATER_STAGES = {"landing_page", "build"}
+# Substance-length gate for a research_findings.jsonl entry to count as a
+# real artifact (section 3) - same pattern/rationale as
+# BUILD_COST_JUSTIFICATION_MIN_LENGTH below: a one-liner doesn't qualify as
+# "here's what was actually found."
+RESEARCH_FINDING_MIN_LENGTH = 80
+# A community_engagement-stage artifact must be one of these post_types
+# (section 4) - an actual thread reply or a genuine question post, not
+# passive lurking.
+_COMMUNITY_ENGAGEMENT_POST_TYPES = {"thread_reply", "own_question_post"}
 # AI-native economics addendum: this system's builds happen via Dev-agent
 # LLM calls, not a human dev team or agency - a landing page/signup form/
 # small webhook should cost token spend (very low single digits), not
@@ -93,11 +135,30 @@ REQUIRED_CHANNEL_FIELDS = {"id", "name", "category", "is_paid", "impact_score", 
 # holding.py, which imports STATE_DIR from this module - importing back
 # would be circular.
 OWN_SUBSIDIARY_ID = "api-sentinel"
+# Section 6 (structural-rebuild addendum): duration caps are a board/
+# Aufsichtsrat policy call, not a number this addendum dictates - that
+# would repeat the same mistake as the old hardcoded economics. This is
+# only ever a *proposed* starting point (status='proposed') until a human
+# confirms or adjusts it via Telegram ('duration_policy: confirm' or
+# 'duration_policy: <research> <community_engagement> <landing_page> <build>'
+# in days, 'none' for build) - see _apply_telegram_commands. Never activated
+# silently: write_hypothesis's duration_days ceiling check only fires once
+# status=='confirmed'.
+DEFAULT_PROPOSED_DURATION_CAPS = {
+    "status": "proposed",
+    "values": {"research": 3, "community_engagement": 5, "landing_page": 14, "build": None},
+    "note": (
+        "Proposed starting point, not yet enforced - confirm or adjust via Telegram "
+        "('duration_policy: confirm', or 'duration_policy: <research> <community_engagement> "
+        "<landing_page> <build>' in days, 'none' for build)."
+    ),
+}
 _SUBSIDIARY_POLICY_DEFAULTS = {
     "paid_channels_allowed": False,
     "cold_email_allowed": False,
     "data_collection_allowed": False,
     "risk_tolerance": "low",
+    "max_duration_days_by_stage": DEFAULT_PROPOSED_DURATION_CAPS,
 }
 
 
@@ -133,6 +194,78 @@ def _read_jsonl(filename: str) -> list:
 
 def _write_jsonl(filename: str, records: list) -> None:
     write_jsonl(STATE_DIR, filename, records)
+
+
+# --------------------------------------------------------------------------
+# Evidence-stage artifact gates (structural-rebuild addendum, sections 3-4).
+# Crossing into community_engagement or landing_page/build requires a real,
+# retrievable artifact - not a self-reported claim that the stage was "done".
+# Reads stage_skip_requests.jsonl directly from _holding/ (same reasoning as
+# _read_own_policies above: importing holding.py back would be circular).
+# --------------------------------------------------------------------------
+
+def _has_substantive_research_artifact(hypothesis_id: str) -> bool:
+    return any(
+        len((f.get("summary") or "").strip()) >= RESEARCH_FINDING_MIN_LENGTH
+        for f in _read_jsonl("research_findings.jsonl")
+        if f.get("hypothesis_id") == hypothesis_id
+    )
+
+
+def _has_real_community_engagement_artifact(hypothesis_id: str) -> bool:
+    for d in _read_jsonl("content_drafts.jsonl"):
+        if d.get("hypothesis_id") != hypothesis_id:
+            continue
+        if d.get("post_type") not in _COMMUNITY_ENGAGEMENT_POST_TYPES:
+            continue
+        if d.get("status") == "posted" or d.get("approved_request_id"):
+            return True
+    return False
+
+
+def _has_approved_stage_skip(hypothesis_id: str, target_stage: str) -> bool:
+    requests = read_jsonl(STATE_DIR / "_holding", "stage_skip_requests.jsonl")
+    return any(
+        r.get("hypothesis_id") == hypothesis_id
+        and r.get("target_stage") == target_stage
+        and r.get("status") == "approved"
+        for r in requests
+    )
+
+
+# --------------------------------------------------------------------------
+# Anti-instruction-copying tripwire (structural-rebuild addendum, section 5).
+# hyp_bootstrap_001's build_cost_reasoning was found to be a near-verbatim
+# copy of this module's own instruction text, not independently derived
+# reasoning - disqualifying on its own, regardless of what number it
+# attached to (see README chapter 15). Plain substring match against known
+# template/incident phrasing pulled directly from this file's own docstrings
+# - not sophisticated, just enough to catch verbatim/near-verbatim reuse
+# rather than genuine hypothesis-specific reasoning.
+# --------------------------------------------------------------------------
+
+_INSTRUCTION_ECHO_PHRASES = [
+    "old-economy market-rate thinking",
+    "agency/freelancer/employee",
+    "human developer/agency/employee",
+    "typically costs this system a few dollars in tokens",
+    "hundreds or thousands of dollars",
+    "low single-digit dollars in tokens",
+    "genuinely more files/integration points/iteration passes",
+    "it feels like it should cost more",
+    "a plausible price for a human dev team",
+]
+
+
+def _instruction_echo_match(text: str) -> str:
+    """Returns the matched phrase if `text` echoes known instruction/incident
+    template language, else "".
+    """
+    lowered = (text or "").lower()
+    for phrase in _INSTRUCTION_ECHO_PHRASES:
+        if phrase in lowered:
+            return phrase
+    return ""
 
 
 # --------------------------------------------------------------------------
@@ -283,11 +416,41 @@ def request_approval(category: str, proposal: str, reasoning: str) -> str:
     assuming it exists just because status='approved'. Put the confirmed URL
     literally in the follow-up file_task_order to Dev, same as any other
     concrete artifact (never a paraphrase).
+
+    category='publish' requires `proposal` to be a JSON string (not free
+    prose) matching the rigid template (structural-rebuild addendum,
+    section 7) - required keys: platform, target_url, title (or literally
+    "kein Titel" if the platform has none), text (verbatim content, exactly
+    as it will be posted - never paraphrased or summarized), footer (or
+    literally "keiner"), hypothesis_id, evidence_stage, is_experiment
+    (bool), success_criterion (concrete and falsifiable - state this even
+    when the honest answer is "nein, reine Recherche, kein Erfolgskriterium
+    noetig", never omit it). Rendered verbatim in the Telegram notification
+    (notify_new_pending_approvals) using these exact structured fields,
+    never reflowed into prose.
     """
     if category not in APPROVAL_CATEGORIES:
         return json.dumps({
             "error": f"invalid category '{category}', must be one of {sorted(APPROVAL_CATEGORIES)}"
         })
+    if category == "publish":
+        try:
+            template = json.loads(proposal)
+        except json.JSONDecodeError as exc:
+            return json.dumps({
+                "error": f"category='publish' requires proposal to be a JSON string with the structured "
+                         f"template fields ({sorted(PUBLISH_TEMPLATE_FIELDS)}), not free prose: {exc}"
+            })
+        if not isinstance(template, dict):
+            return json.dumps({"error": "category='publish' proposal must be a JSON object, not a list/scalar"})
+        missing = PUBLISH_TEMPLATE_FIELDS - template.keys()
+        if missing:
+            return json.dumps({"error": f"category='publish' proposal missing required template fields: {sorted(missing)}"})
+        for _field in PUBLISH_TEMPLATE_FIELDS - {"is_experiment"}:
+            if not str(template.get(_field) or "").strip():
+                return json.dumps({"error": f"publish template field '{_field}' must not be empty"})
+        if not isinstance(template.get("is_experiment"), bool):
+            return json.dumps({"error": "publish template field 'is_experiment' must be a boolean (true/false)"})
 
     record = {
         "id": f"appr_{uuid.uuid4().hex[:8]}",
@@ -394,15 +557,45 @@ def write_hypothesis(hypothesis: str) -> str:
     landing_page_variant_id already has 2 other active hypotheses (section
     5.6 parallelism rule) - pick a different variant or wait instead.
 
-    New hypotheses require hypothesis_type ("value" or "growth"), impact_score
-    and confidence_score (your own honest judgment, same shape as a
-    channel's - the ranking signal used to prioritize which candidate
-    hypothesis ideas actually get written this cycle, see
-    MAX_ACTIVE_HYPOTHESES below), and the economics that must be fixed
-    before the experiment runs, not adjusted afterward to fit the result:
-    estimated_build_cost, price_point_monthly, break_even_horizon_months,
-    and break_even_users (get this last one from compute_break_even() first
-    - never estimate it by hand).
+    Fields required now depend on evidence_stage, not a single flat
+    checklist (structural-rebuild addendum, section 2 - Bezos two-way/
+    one-way-door framing). Every hypothesis always requires
+    hypothesis_type ("value" or "growth"), impact_score/confidence_score
+    (your own honest judgment, same shape as a channel's), and
+    evidence_stage itself (one of EVIDENCE_STAGES: research,
+    community_engagement, landing_page, build - no longer optional, every
+    hypothesis declares where it actually is).
+
+    At research/community_engagement (two-way doors - cheap, fast,
+    reversible): estimated_build_cost/price_point_monthly/break_even_
+    horizon_months/break_even_users/build_cost_reasoning are NOT required
+    yet. Use the optional rough_economics_note free-text field for an
+    order-of-magnitude planning guess instead (e.g. "probably EUR15-50/mo
+    depending on what we learn - not yet computed") - clearly separate from
+    the real, load-bearing economics used later. compute_break_even()
+    refuses to compute at these stages for the same reason - don't dress up
+    a placeholder guess as a precise number.
+
+    evidence_stage='research' additionally requires the research plan
+    fields (section 3, logged before research starts, not reconstructed
+    afterward): research_objective (the one specific question this is
+    meant to answer), research_confirming_criteria and research_
+    disconfirming_criteria (concrete and falsifiable). evidence_stage='
+    community_engagement' requires a real posted (or approved-and-queued)
+    thread_reply/own_question_post draft for this hypothesis first
+    (draft_content) - a claim the stage was "done" isn't enough.
+
+    At landing_page/build (crossing toward a one-way door - real cost, real
+    commitment): estimated_build_cost, price_point_monthly, break_even_
+    horizon_months, break_even_users, and build_cost_reasoning become
+    required and must be precise, evidence-grounded numbers. Crossing into
+    either for the first time also requires artifact-backed history through
+    research (a substantive log_research_finding entry, RESEARCH_FINDING_
+    MIN_LENGTH+ chars) AND community_engagement (a real draft_content
+    artifact) - or a Main-CEO-approved stage-skip request
+    (file_stage_skip_request/holding.py) if skipping genuinely applies.
+    This is a real gate, not a self-written excuse - it's what would have
+    caught the bootstrap hypothesis skipping straight to a landing page.
 
     estimated_build_cost MUST be grounded in what this system actually
     pays to build something - Dev-agent LLM calls plus any genuine
@@ -411,7 +604,10 @@ def write_hypothesis(hypothesis: str) -> str:
     or small backend script/webhook realistically costs low single-digit
     dollars in tokens here, not hundreds or thousands. build_cost_reasoning
     is required whenever estimated_build_cost is set (create or update) -
-    break the number down into its real components. Above
+    break the number down into its real components, specific to THIS
+    hypothesis's own gathered evidence - never reused/paraphrased from
+    example wording in instructions or past incident write-ups (rejected
+    mechanically if it echoes known template phrasing, section 5). Above
     SIMPLE_BUILD_COST_CEILING (currently 10.0), build_cost_reasoning must
     also be substantive (at least BUILD_COST_JUSTIFICATION_MIN_LENGTH
     characters) - genuinely more files/integration points/iteration passes
@@ -454,14 +650,10 @@ def write_hypothesis(hypothesis: str) -> str:
     hypotheses are never deleted, only marked, so the reasoning has to be
     on the record for whoever revisits it later.
 
-    Optional evidence_stage (one of EVIDENCE_STAGES: research,
-    community_engagement, landing_page, build) records how far this
-    hypothesis has actually progressed through the evidence ladder - not
-    required here, but file_task_order's dev-stage gate reads it before
-    letting a Dev task order through. Optional payment_intent_approval_id
-    links this hypothesis to a request_approval(category='spend') entry
-    once a real payment-intent (pre-order/deposit) test has been requested
-    for it - see draft/task_ceo guidance for when that's warranted.
+    Optional payment_intent_approval_id links this hypothesis to a
+    request_approval(category='spend') entry once a real payment-intent
+    (pre-order/deposit) test has been requested for it - see task_ceo
+    guidance for when that's warranted.
     """
     try:
         patch = json.loads(hypothesis)
@@ -493,6 +685,65 @@ def write_hypothesis(hypothesis: str) -> str:
     hyps = _read_jsonl("hypotheses.jsonl")
     existing_index = next((i for i, h in enumerate(hyps) if h.get("id") == patch["id"]), None)
     existing_record = hyps[existing_index] if existing_index is not None else {}
+    prior_stage = existing_record.get("evidence_stage")
+    effective_stage = patch.get("evidence_stage", prior_stage)
+
+    # Section 5: reasoning fields must be this hypothesis's own, not reused
+    # instruction/incident-template phrasing - checked before anything else
+    # touches these fields, so a copied field can't slip through via some
+    # other code path first.
+    for _echo_field in ("build_cost_reasoning", "defensibility_notes"):
+        if _echo_field in patch:
+            _echoed = _instruction_echo_match(patch[_echo_field])
+            if _echoed:
+                return json.dumps({
+                    "error": f"{_echo_field} echoes known instruction/incident template language "
+                             f"('{_echoed}') rather than this hypothesis's own reasoning - describe "
+                             "what's actually specific to this hypothesis, don't reuse example wording"
+                })
+
+    # Section 3: research plan required before evidence_stage='research'
+    # actually takes effect - the objective and confirming/disconfirming
+    # criteria, logged before research starts.
+    if effective_stage == "research" and prior_stage != "research":
+        _merged_plan = {**existing_record, **patch}
+        _missing_plan = {f for f in RESEARCH_PLAN_FIELDS if not (_merged_plan.get(f) or "").strip()}
+        if _missing_plan:
+            return json.dumps({
+                "error": f"evidence_stage='research' requires the research plan fields first: "
+                         f"{sorted(_missing_plan)} - the specific question this research answers, and "
+                         "what counts as confirming vs. disconfirming evidence, logged before research starts"
+            })
+
+    # Section 4: crossing into community_engagement needs a real artifact,
+    # not just the claim the stage was "done".
+    if effective_stage == "community_engagement" and prior_stage not in ("community_engagement", *EVIDENCE_LATER_STAGES):
+        if not _has_real_community_engagement_artifact(patch["id"]) and not _has_approved_stage_skip(patch["id"], "community_engagement"):
+            return json.dumps({
+                "error": "evidence_stage='community_engagement' requires a real posted (or "
+                         "approved-and-queued) thread_reply/own_question_post draft for this hypothesis "
+                         "first (draft_content) - or a Main-CEO-approved stage-skip request "
+                         "(file_stage_skip_request) if this genuinely doesn't apply here"
+            })
+
+    # Section 4: crossing into landing_page/build for the first time needs
+    # artifact-backed research AND community_engagement history, or a
+    # Main-CEO-reviewed stage-skip request - never a self-written excuse.
+    if effective_stage in EVIDENCE_LATER_STAGES and prior_stage not in EVIDENCE_LATER_STAGES:
+        _has_research = _has_substantive_research_artifact(patch["id"])
+        _has_engagement = _has_real_community_engagement_artifact(patch["id"])
+        if not (_has_research and _has_engagement) and not _has_approved_stage_skip(patch["id"], effective_stage):
+            _missing_bits = []
+            if not _has_research:
+                _missing_bits.append("a substantive research_findings.jsonl entry (log_research_finding)")
+            if not _has_engagement:
+                _missing_bits.append("a real posted/queued community_engagement draft (draft_content)")
+            return json.dumps({
+                "error": f"evidence_stage='{effective_stage}' requires artifact-backed history first - "
+                         f"missing: {'; '.join(_missing_bits)}. If skipping genuinely applies here (e.g. "
+                         "research truly isn't relevant), file_stage_skip_request for the Main-CEO to "
+                         "review instead of setting this directly."
+            })
 
     # AI-native economics addendum: whenever estimated_build_cost is being
     # set (create or update), it must be justified - and justified more
@@ -531,8 +782,51 @@ def write_hypothesis(hypothesis: str) -> str:
                      "reason, builds are cheap enough here that a validated idea should pay for itself fast"
         })
 
+    # Section 2: economics only load-bearing (required) once the final
+    # state is landing_page/build - a one-way door with real cost/
+    # commitment. Checked against the full merged state, not just this
+    # patch's own keys, so economics set on an earlier update aren't
+    # demanded again on an unrelated later one.
+    if effective_stage in EVIDENCE_LATER_STAGES:
+        _merged_econ = {**existing_record, **patch}
+        _missing_econ = {f for f in STAGE_GATED_ECONOMICS_FIELDS if _merged_econ.get(f) is None}
+        if _missing_econ:
+            return json.dumps({
+                "error": f"evidence_stage='{effective_stage}' requires real economics now: "
+                         f"{sorted(_missing_econ)} - this is a one-way door, the numbers backing it must "
+                         "be precise and evidence-grounded, not a rough_economics_note guess anymore"
+            })
+
+    # Section 6: duration-cap policy, board-set via Telegram confirmation
+    # (see DEFAULT_PROPOSED_DURATION_CAPS) - only enforced once
+    # status=='confirmed', never a silently-active default. Anything over
+    # the confirmed ceiling for this stage still goes through the existing
+    # approval queue (duration_extension_approval_id pointing at an
+    # approved request_approval) - the escalation path itself doesn't
+    # change, only the source of the ceiling number does.
+    effective_duration = patch.get("duration_days", existing_record.get("duration_days"))
+    if effective_duration is not None and effective_stage:
+        _duration_policy = _read_own_policies().get("max_duration_days_by_stage") or {}
+        if _duration_policy.get("status") == "confirmed":
+            _ceiling = (_duration_policy.get("values") or {}).get(effective_stage)
+            if _ceiling is not None and effective_duration > _ceiling:
+                _ext_approval_id = patch.get(
+                    "duration_extension_approval_id", existing_record.get("duration_extension_approval_id")
+                )
+                _ext_approval = None
+                if _ext_approval_id:
+                    _ext_approval = next(
+                        (a for a in _read_jsonl("approval_queue.jsonl") if a.get("id") == _ext_approval_id), None
+                    )
+                if not _ext_approval or _ext_approval.get("status") != "approved":
+                    return json.dumps({
+                        "error": f"duration_days={effective_duration} exceeds the confirmed policy ceiling "
+                                 f"({_ceiling} days) for evidence_stage='{effective_stage}' - shorten it, or "
+                                 "pass duration_extension_approval_id pointing at an approved request_approval"
+                    })
+
     if existing_index is None:
-        missing = REQUIRED_HYPOTHESIS_FIELDS - patch.keys()
+        missing = BASE_REQUIRED_HYPOTHESIS_FIELDS - patch.keys()
         if missing:
             return json.dumps({"error": f"new hypothesis missing required fields: {sorted(missing)}"})
         prior_id = patch.get("prior_hypothesis_id")
@@ -610,6 +904,19 @@ def write_hypothesis(hypothesis: str) -> str:
             "holding_constant_notes": None,
             "evidence_stage": None,
             "payment_intent_approval_id": None,
+            # Economics: no longer unconditionally required at create time
+            # (section 2) - explicit None defaults so the keys are always
+            # present for a reader, even at research/community_engagement
+            # where they're genuinely not known yet.
+            "estimated_build_cost": None,
+            "price_point_monthly": None,
+            "break_even_horizon_months": None,
+            "break_even_users": None,
+            "build_cost_reasoning": None,
+            "rough_economics_note": None,
+            "research_objective": None,
+            "research_confirming_criteria": None,
+            "research_disconfirming_criteria": None,
             **patch,
         }
         hyps.append(record)
@@ -761,27 +1068,43 @@ def check_escalation(hypothesis_id: str) -> str:
 
 
 @tool("compute_break_even")
-def compute_break_even(estimated_build_cost: float, price_point_monthly: float, break_even_horizon_months: float) -> str:
+def compute_break_even(
+    estimated_build_cost: float, price_point_monthly: float, break_even_horizon_months: float,
+    evidence_stage: str = "",
+) -> str:
     """Compute break_even_users for a hypothesis before it's created - how
     many paying users, sustained for break_even_horizon_months at
     price_point_monthly, are needed to recoup estimated_build_cost. Never
     estimate this by hand; this is the same "no mental arithmetic" rule
     evaluate_hypothesis already enforces for scores. The result is required
-    on write_hypothesis for every new hypothesis (section 2 of the
-    outcome-engine addendum) and is what write_hypothesis's parallel
-    evaluate_hypothesis call later checks real conversions against to
-    decide "build" vs "test_further" - a low break_even_users makes even a
-    tiny real sample a legitimate build basis, a high one means a small
-    positive sample is not enough evidence yet, regardless of how good the
-    rate looks.
+    on write_hypothesis once evidence_stage reaches landing_page/build and
+    is what write_hypothesis's parallel evaluate_hypothesis call later
+    checks real conversions against to decide "build" vs "test_further" -
+    a low break_even_users makes even a tiny real sample a legitimate build
+    basis, a high one means a small positive sample is not enough evidence
+    yet, regardless of how good the rate looks.
+
+    Pass evidence_stage to get the section-2 two-way-door check: at
+    research/community_engagement this refuses to compute at all
+    (returns applicable=False) rather than dressing up a placeholder guess
+    as a precise number - use rough_economics_note on write_hypothesis
+    instead at those stages. Omit evidence_stage (or pass landing_page/
+    build) to compute normally.
     """
+    if evidence_stage in EVIDENCE_EARLY_STAGES:
+        return json.dumps({
+            "applicable": False,
+            "reason": f"not yet applicable at evidence_stage='{evidence_stage}' - break_even_users is "
+                      "only meaningful once real economics are being locked in (landing_page/build); use "
+                      "rough_economics_note on write_hypothesis for an order-of-magnitude guess instead",
+        })
     try:
         break_even_users = scoring.compute_break_even_users(
             estimated_build_cost, price_point_monthly, break_even_horizon_months,
         )
     except ValueError as exc:
         return json.dumps({"error": str(exc)})
-    return json.dumps({"break_even_users": break_even_users})
+    return json.dumps({"applicable": True, "break_even_users": break_even_users})
 
 
 # --------------------------------------------------------------------------
@@ -883,10 +1206,7 @@ TASK_ORDER_ROLES = {"growth", "dev"}
 
 
 @tool("file_task_order")
-def file_task_order(
-    to_role: str, task_description: str, context: str, hypothesis_id: str = "",
-    stage_justification: str = "",
-) -> str:
+def file_task_order(to_role: str, task_description: str, context: str, hypothesis_id: str = "") -> str:
     """Sub-CEO hands a concrete task to Growth or Dev as a fixed record,
     instead of leaving it to be inferred from free-text task output.
     to_role must be "growth" or "dev". task_description is the concrete ask
@@ -895,30 +1215,26 @@ def file_task_order(
     ties back to one - most do.
 
     Evidence-stage gate (to_role="dev" with a hypothesis_id only): Dev work
-    is real cost committed on a hypothesis, so this is rejected unless
-    either (a) that hypothesis's evidence_stage (read_hypotheses) already
-    shows real prior progression - "landing_page" or "build" - meaning a
-    cheaper research/community_engagement step already ran or was
-    deliberately not needed, or (b) a non-empty stage_justification explains
-    why going straight to Dev work is the right call here anyway (e.g. "this
-    is the very first test for a brand-new subsidiary, a landing page is
-    already the cheapest sufficient test for this question"). This is an
-    auditable choice, not a hard block - a genuinely cheap landing-page-first
-    test (this system's default pattern) is always valid with a one-line
-    reason, it just can't be silent.
+    is real cost committed on a hypothesis, so this is rejected unless that
+    hypothesis's evidence_stage (read_hypotheses) is already "landing_page"
+    or "build". There is no self-written bypass here anymore (structural-
+    rebuild addendum, section 4) - a self-signed stage_justification string
+    was exactly how the bootstrap hypothesis skipped straight to a landing
+    page. The real gate lives on write_hypothesis: getting evidence_stage to
+    landing_page/build in the first place already requires artifact-backed
+    research/community_engagement history or a Main-CEO-approved stage-skip
+    request (file_stage_skip_request) - by the time it's set, it's earned.
     """
     if to_role not in TASK_ORDER_ROLES:
         return json.dumps({"error": f"invalid to_role '{to_role}', must be one of {sorted(TASK_ORDER_ROLES)}"})
-    if to_role == "dev" and hypothesis_id and not stage_justification.strip():
+    if to_role == "dev" and hypothesis_id:
         hyp = next((h for h in _read_jsonl("hypotheses.jsonl") if h.get("id") == hypothesis_id), None)
         stage = hyp.get("evidence_stage") if hyp else None
-        if stage not in ("landing_page", "build"):
+        if stage not in EVIDENCE_LATER_STAGES:
             return json.dumps({
                 "error": f"hypothesis '{hypothesis_id}' has evidence_stage={stage!r}, not yet "
-                         "'landing_page'/'build' - either record real progression through "
-                         "research/community_engagement first (write_hypothesis evidence_stage), "
-                         "or pass a non-empty stage_justification explaining why committing Dev "
-                         "work now is the right call for this specific hypothesis"
+                         "'landing_page'/'build' - progress it there first via write_hypothesis "
+                         "(artifact-backed, or via an approved stage-skip request) before ordering Dev work"
             })
     record = {
         "id": f"order_{uuid.uuid4().hex[:8]}",
@@ -928,7 +1244,6 @@ def file_task_order(
         "hypothesis_id": hypothesis_id or None,
         "task_description": task_description,
         "context": context,
-        "stage_justification": stage_justification or None,
         "status": "open",
         "result": None,
     }
@@ -1352,13 +1667,35 @@ def log_research_finding(hypothesis_id: str, finding_type: str, source: str, sum
     toward "test_further" or "pivot", but evaluate_hypothesis's real score
     (from actual signups.jsonl conversions) is still the only thing that
     can produce a "build" outcome.
+
+    summary must be a real, retrievable artifact (section 3), at least
+    RESEARCH_FINDING_MIN_LENGTH characters - which threads/posts, what they
+    said (paraphrased, never fabricated), how many, how recent - or an
+    honest, equally specific negative result ("searched X/Y/Z terms across
+    these channels/communities, found no substantive evidence"). A one-liner
+    doesn't qualify; write_hypothesis's evidence_stage gate checks entries
+    logged here for this substance bar before letting a hypothesis progress
+    past 'research'. Also rejected if summary echoes known instruction/
+    incident template phrasing rather than this hypothesis's own findings
+    (section 5).
     """
     if finding_type not in RESEARCH_FINDING_TYPES:
         return json.dumps({
             "error": f"invalid finding_type '{finding_type}', must be one of {sorted(RESEARCH_FINDING_TYPES)}"
         })
-    if not summary.strip():
-        return json.dumps({"error": "summary must not be empty"})
+    if len(summary.strip()) < RESEARCH_FINDING_MIN_LENGTH:
+        return json.dumps({
+            "error": f"summary must be at least {RESEARCH_FINDING_MIN_LENGTH} characters - a real, "
+                     "retrievable artifact (which threads/posts, what they said, how many, how recent - "
+                     "or an equally specific negative result), not a one-liner claim"
+        })
+    _echoed = _instruction_echo_match(summary)
+    if _echoed:
+        return json.dumps({
+            "error": f"summary echoes known instruction/incident template language ('{_echoed}') rather "
+                     "than this hypothesis's own findings - describe what was actually found, don't reuse "
+                     "example wording"
+        })
     record = {
         "id": f"research_{uuid.uuid4().hex[:8]}",
         "created_at": datetime.now(timezone.utc).isoformat(),
@@ -1639,6 +1976,49 @@ def send_telegram_message(text: str, parse_mode: str = None) -> None:
 
 
 # --------------------------------------------------------------------------
+# Hypothesis overview (orchestration-level, not an agent tool - built
+# directly by crew.py's send_cycle_summary, structural-rebuild addendum
+# section 8). The missing "saubere Auswertung": a compact, scannable table
+# of every active hypothesis near the top of the cycle report, readable
+# without parsing each agent's full narrative output.
+# --------------------------------------------------------------------------
+
+def build_hypothesis_overview() -> list:
+    """One entry per active hypothesis: id, evidence_stage, a one-line
+    status, the most recent logged research finding (or an honest "none
+    yet"), and the next concrete action (its oldest open task order, or
+    "none open"). Never fabricates - every field traces to an actual
+    record, same ground-truth discipline as everything else this system
+    reports.
+    """
+    findings = _read_jsonl("research_findings.jsonl")
+    orders = _read_jsonl("task_orders.jsonl")
+    overview = []
+    for h in _read_jsonl("hypotheses.jsonl"):
+        if h.get("status") != "active":
+            continue
+        hyp_id = h.get("id")
+        own_findings = sorted(
+            (f for f in findings if f.get("hypothesis_id") == hyp_id),
+            key=lambda f: f.get("created_at") or "",
+        )
+        latest_finding = own_findings[-1]["summary"][:140] if own_findings else "keine Erkenntnis geloggt"
+        open_orders = sorted(
+            (o for o in orders if o.get("hypothesis_id") == hyp_id and o.get("status") == "open"),
+            key=lambda o: o.get("created_at") or "",
+        )
+        next_action = open_orders[0]["task_description"][:140] if open_orders else "keine offene Task-Order"
+        overview.append({
+            "id": hyp_id,
+            "evidence_stage": h.get("evidence_stage") or "(nicht gesetzt)",
+            "status_line": f"{h.get('category', '?')} / {h.get('channel', '?')}, seit {(h.get('created_at') or '?')[:10]}",
+            "latest_finding": latest_finding,
+            "next_action": next_action,
+        })
+    return overview
+
+
+# --------------------------------------------------------------------------
 # State-persistence check (orchestration-level, not an agent tool - called
 # once at the very start of every cycle, before anything else, so a warning
 # can reach Telegram even if the rest of the cycle then fails). Root cause
@@ -1713,6 +2093,7 @@ _STOP_WORDS = {"stop", "pause"}
 _START_WORDS = {"start", "resume", "weiter"}
 _APPROVE_WORDS = {"approve", "ja", "yes"}
 _REJECT_WORDS = {"reject", "nein", "no"}
+_DURATION_POLICY_STAGE_ORDER = ("research", "community_engagement", "landing_page", "build")
 
 
 def is_system_paused() -> tuple[bool, str]:
@@ -1817,6 +2198,11 @@ def _classify_command(text: str, reply_to_text: str):
     - "payment_link": payload is (approval_id, url) - a human confirming
       they've provisioned the actual payment processor/link for a
       category='spend' payment-intent-test request and handing the URL back.
+    - "duration_policy_confirm": payload is None - confirms the currently
+      proposed max_duration_days_by_stage policy as-is (DEFAULT_PROPOSED_
+      DURATION_CAPS or whatever was last proposed).
+    - "duration_policy_set": payload is a dict of stage -> days (or None for
+      no cap) - sets custom values and confirms in the same step.
 
     Two ways to approve/reject: reply directly to the notification message
     that announced the pending approval (matched via the appr_... id in
@@ -1874,6 +2260,24 @@ def _classify_command(text: str, reply_to_text: str):
             return None
         url = rest[approval_match.end():].strip()
         return ("payment_link", (approval_match.group(0), url)) if url else None
+
+    if normalized.startswith("duration_policy:"):
+        rest = text.split(":", 1)[1].strip()
+        if rest.lower() == "confirm":
+            return ("duration_policy_confirm", None)
+        parts = rest.split()
+        if len(parts) == len(_DURATION_POLICY_STAGE_ORDER):
+            values = {}
+            for stage, raw in zip(_DURATION_POLICY_STAGE_ORDER, parts):
+                if raw.lower() == "none":
+                    values[stage] = None
+                    continue
+                try:
+                    values[stage] = int(raw)
+                except ValueError:
+                    return None
+            return ("duration_policy_set", values)
+        return None
 
     return None
 
@@ -1971,6 +2375,38 @@ def _apply_telegram_commands(messages: list) -> list:
             send_telegram_message(f"{approval_id}: Payment-Link hinterlegt ({url}).")
             continue
 
+        if action == "duration_policy_confirm":
+            subs = read_jsonl(STATE_DIR / "_holding", "subsidiaries.jsonl")
+            idx = next((i for i, s in enumerate(subs) if s.get("id") == OWN_SUBSIDIARY_ID), None)
+            if idx is None:
+                send_telegram_message("Noch keine Subsidiary-Policy vorhanden - nichts zu bestaetigen.")
+                continue
+            policies = subs[idx].get("policies") or dict(_SUBSIDIARY_POLICY_DEFAULTS)
+            current_policy = policies.get("max_duration_days_by_stage") or DEFAULT_PROPOSED_DURATION_CAPS
+            policies["max_duration_days_by_stage"] = {**current_policy, "status": "confirmed"}
+            subs[idx]["policies"] = policies
+            write_jsonl(STATE_DIR / "_holding", "subsidiaries.jsonl", subs)
+            log.append("Duration-Policy bestaetigt (Telegram)")
+            send_telegram_message(f"Duration-Policy bestaetigt: {policies['max_duration_days_by_stage']['values']}")
+            continue
+
+        if action == "duration_policy_set":
+            values = target_id
+            subs = read_jsonl(STATE_DIR / "_holding", "subsidiaries.jsonl")
+            idx = next((i for i, s in enumerate(subs) if s.get("id") == OWN_SUBSIDIARY_ID), None)
+            if idx is None:
+                send_telegram_message("Noch keine Subsidiary-Policy vorhanden - kann noch nicht gesetzt werden.")
+                continue
+            policies = subs[idx].get("policies") or dict(_SUBSIDIARY_POLICY_DEFAULTS)
+            policies["max_duration_days_by_stage"] = {
+                "status": "confirmed", "values": values, "note": "Set and confirmed via Telegram.",
+            }
+            subs[idx]["policies"] = policies
+            write_jsonl(STATE_DIR / "_holding", "subsidiaries.jsonl", subs)
+            log.append("Duration-Policy gesetzt und bestaetigt (Telegram)")
+            send_telegram_message(f"Duration-Policy gesetzt und bestaetigt: {values}")
+            continue
+
         if records is None:
             records = approve._load()
         record = next((r for r in records if r.get("id") == target_id), None)
@@ -2003,22 +2439,57 @@ def process_telegram_commands() -> list:
         return []
 
 
+def _format_publish_proposal(proposal: str) -> str:
+    """Render a category='publish' proposal's structured template (section
+    7) with fixed German field labels, exactly as filed - never reflowed
+    into prose. Falls back to the raw string if it isn't valid template
+    JSON (defensive only; request_approval itself already rejects a
+    malformed publish proposal before it ever reaches the queue).
+    """
+    try:
+        t = json.loads(proposal)
+        if not isinstance(t, dict):
+            raise ValueError("not an object")
+    except (json.JSONDecodeError, ValueError):
+        return proposal
+    experiment = "ja" if t.get("is_experiment") else "nein"
+    return (
+        f"Plattform: {t.get('platform')}\n"
+        f"Ziel-URL: {t.get('target_url')}\n"
+        f"Titel: {t.get('title')}\n"
+        f"Text:\n{t.get('text')}\n"
+        f"Footer/Signatur: {t.get('footer')}\n\n"
+        f"Gehoert zu: {t.get('hypothesis_id')} (evidence_stage: {t.get('evidence_stage')})\n"
+        f"Ist das ein Experiment: {experiment}\n"
+        f"Erfolgskriterium: {t.get('success_criterion')}"
+    )
+
+
 def notify_new_pending_approvals() -> None:
     """Send a separate Telegram message for each pending approval that
     hasn't been announced yet, so there's something concrete to reply
     'approve'/'reject' to (see process_telegram_commands). Tracked via a
     telegram_notified flag written onto the record itself so nothing is
-    announced twice across cycles.
+    announced twice across cycles. category='publish' proposals are
+    rendered via the structured template (_format_publish_proposal,
+    section 7) instead of dumped as raw text/JSON - any additional
+    reasoning is shown as its own clearly-separated line below the block,
+    never mixed into the structured fields.
     """
     approvals = _read_jsonl("approval_queue.jsonl")
     changed = False
     for record in approvals:
         if record.get("status") != "pending" or record.get("telegram_notified"):
             continue
+        proposal_text = (
+            _format_publish_proposal(record.get("proposal") or "")
+            if record.get("category") == "publish"
+            else f"Antrag: {record.get('proposal')}"
+        )
         send_telegram_message(
             f"Neue Freigabe angefragt: {record['id']}\n"
             f"Kategorie: {record.get('category')}\n"
-            f"Antrag: {record.get('proposal')}\n"
+            f"{proposal_text}\n\n"
             f"Begruendung: {record.get('reasoning')}\n\n"
             "Antworte auf diese Nachricht mit 'approve' oder 'reject'."
         )
