@@ -67,6 +67,7 @@ from holding import (
     decide_pivot_proposal,
     decide_stage_skip_request,
     file_cross_subsidiary_request,
+    file_kaizen_report,
     file_pivot_proposal,
     file_stage_skip_request,
     file_status_report,
@@ -582,7 +583,7 @@ main_ceo_agent = Agent(
         read_subsidiary_policies, update_subsidiary_policies,
         propose_idea, read_ideas, route_idea,
         read_stage_skip_requests, decide_stage_skip_request,
-        search_web, read_webpage,
+        search_web, read_webpage, file_kaizen_report,
     ],
     max_iter=AGENT_PROFILE["agents"]["main_ceo"]["max_iter"],
     max_execution_time=AGENT_PROFILE["agents"]["main_ceo"]["max_execution_time"],
@@ -1269,7 +1270,27 @@ task_ceo = ConditionalTask(
         "genuinely needs a call from above; false is a normal, valid "
         "answer for a routine bury/pivot/test_further.\n"
         "8) Never invent conversion, reach, revenue, or economics numbers. "
-        "Every number in your report must trace back to a tool call above."
+        "Every number in your report must trace back to a tool call above.\n"
+        "9) Kaizen (routine self-improvement reflection, every real cycle, "
+        "regardless of whether anything above was 'good' or 'bad'): before "
+        "filing your file_status_report, gather 1-3 subsidiary-level "
+        "observations about what could genuinely move this subsidiary "
+        "forward - each one must cite something concrete from THIS cycle's "
+        "own real data: a specific hypothesis id and its real outcome, a "
+        "specific channel and its real numbers, a specific approval that "
+        "was rejected or sat unanswered. Generic startup advice with no "
+        "cited fact behind it is worthless here, don't write it. Pass these "
+        "as kaizen_points (a JSON list, each item an object with an "
+        "'observation' string and a 'grounding' string naming the real id) "
+        "on your file_status_report call - never file a separate Kaizen "
+        "report of your own, the Main-CEO "
+        "consolidates yours with its own into the one combined report per "
+        "cycle (file_kaizen_report). If you find something small enough to "
+        "act on immediately within your own existing tools (never spend/"
+        "publish/deploy/pricing/legal - those always need request_approval "
+        "regardless of how small they seem), you may act on it this same "
+        "cycle and say so in the observation itself; otherwise just flag "
+        "it, the Main-CEO decides what's selbst_umsetzbar vs needs Jan."
     ),
     agent=ceo_agent,
     expected_output=(
@@ -1279,7 +1300,8 @@ task_ceo = ConditionalTask(
         "knowledge_base entries written for a resolved hypothesis. Any "
         "pending approval, escalation, or status report filed for the "
         "Main-CEO. Pending Dev work stated as task orders filed, not just "
-        "narrated."
+        "narrated. 1-3 grounded Kaizen observations passed as kaizen_points "
+        "on the status report, each citing a real id from this cycle."
     ),
     callback=_make_iteration_watchdog(ceo_agent, "Sub-CEO (Build-Measure-Learn)"),
 )
@@ -1358,6 +1380,30 @@ task_main_ceo_review = ConditionalTask(
         "check_escalation's own trigger (that stays the one thing that "
         "actually starts a formal pivot proposal, from the Sub-CEO's side) "
         "- this is your own observation to raise, not a mechanical gate.\n"
+        "5.5) Kaizen (routine self-improvement reflection, every real "
+        "cycle): read each active subsidiary's latest status report(s) from "
+        "step 1 above for their kaizen_points field - the Sub-CEO's own "
+        "grounded subsidiary-level observations. Merge those with your own "
+        "holding-level observations (also grounded in this cycle's real "
+        "data - a real subsidiary/channel/approval, never generic advice) "
+        "into exactly ONE file_kaizen_report(subsidiary_id=..., "
+        "kaizen_report=...) call per active subsidiary this cycle - never "
+        "let the Sub-CEO file its own separate Kaizen report, this is the "
+        "one place it's surfaced. Split every point into selbst_umsetzbar "
+        "(genuinely small enough to act on immediately, within either "
+        "agent's existing Tier-0 tools - if you can act on one yourself "
+        "right now with an existing tool call, do it this same cycle and "
+        "mark it status='acted'; if it's flagged but too large for one "
+        "cycle or needs groundwork first, status='deferred' with a real "
+        "deferred_reason, never a silent no-op) vs fuer_aufsichtsrat "
+        "(needs Jan - a policy change, a budget/spend/publish/deploy/"
+        "pricing/legal decision, anything crossing Tier 1/2, a structural "
+        "question). Never put anything touching spend/publish/deploy/"
+        "pricing/legal in selbst_umsetzbar even if it looks small - "
+        "file_kaizen_report rejects it, and Kaizen must never become a "
+        "backdoor around the existing approval-queue boundary. Passing an "
+        "empty list for either bucket is a completely valid, honest "
+        "outcome some cycles - never invent a point just to have one.\n"
         "6) Call read_strategic_direction(subsidiary_id=...) for every "
         "active subsidiary. If it returns direction=null - this subsidiary "
         "has NEVER had a strategic direction set, not even once - call "
@@ -1400,7 +1446,10 @@ task_main_ceo_review = ConditionalTask(
         "(monetization stated as a required filter, not the goal) if this "
         "was the first time for that subsidiary, or an additional one on "
         "top and why, or explicitly none beyond the baseline and why not. "
-        "Any request_approval filed for board sign-off."
+        "Any request_approval filed for board sign-off. One consolidated "
+        "file_kaizen_report per active subsidiary, both buckets shown, with "
+        "what was actually acted on this cycle under selbst_umsetzbar "
+        "versus deferred and why."
     ),
     callback=_make_iteration_watchdog(main_ceo_agent, "Main-CEO"),
 )
@@ -1721,6 +1770,9 @@ def send_cycle_summary(
         fix_md_new_entries = holding.read_unnotified_fix_entries()
         if fix_md_new_entries:
             holding.mark_fix_entries_notified([e["id"] for e in fix_md_new_entries])
+        kaizen_new_entries = holding.read_unnotified_kaizen_suggestions()
+        if kaizen_new_entries:
+            holding.mark_kaizen_suggestions_notified([e["id"] for e in kaizen_new_entries])
         # Total tokens is the single most-glanced-at number in this report -
         # kept as its own standalone line right at the top, ahead of even
         # the profile/model detail line below, so it's unmissable rather
@@ -1775,7 +1827,7 @@ def send_cycle_summary(
         ]
         lines += _aufsichtsrat_lines(
             pending, duration_policy, pending_stage_skips, stagnation_escalations,
-            fix_md_new_entries=fix_md_new_entries,
+            fix_md_new_entries=fix_md_new_entries, kaizen_new_count=len(kaizen_new_entries),
         )
         full_summary = "\n".join(lines)
         send_telegram_message(full_summary)

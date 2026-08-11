@@ -3544,7 +3544,7 @@ def test_main_ceo_agent_tools_match_spec():
         "read_subsidiary_policies", "update_subsidiary_policies",
         "propose_idea", "read_ideas", "route_idea",
         "read_stage_skip_requests", "decide_stage_skip_request",
-        "search_web", "read_webpage",
+        "search_web", "read_webpage", "file_kaizen_report",
     }, tool_names
 
 
@@ -4061,6 +4061,126 @@ def test_aufsichtsrat_lines_fix_md_new_entries():
     assert "FIX.md aktualisiert" in joined
     assert "Something broke" in joined
     assert "fix_resolved: fix_abc12345" in joined
+
+
+# --------------------------------------------------------------------------
+# Kaizen (FIX.md/Kaizen/payment-propensity addendum, Part 2).
+# --------------------------------------------------------------------------
+
+def _seed_hypothesis_for_grounding(hyp_id="hyp_kaizen_ground"):
+    hyp = {
+        "id": hyp_id, "statement": "s", "category": "value", "landing_page_variant_id": "v1",
+        "failure_rate": 0.5, "success_rate": 0.5, "duration_days": 3, "channel": "reddit",
+        "hypothesis_type": "value", "impact_score": 3, "confidence_score": 3, "evidence_stage": "research",
+        "research_objective": "o", "research_confirming_criteria": "c", "research_disconfirming_criteria": "d",
+        "primary_variable_tested": "audience",
+    }
+    tools.write_hypothesis.run(hypothesis=json.dumps(hyp))
+    return hyp_id
+
+
+def test_file_kaizen_report_rejects_non_json():
+    reset_state()
+    result = json.loads(holding.file_kaizen_report.run(subsidiary_id="api-sentinel", kaizen_report="not json"))
+    assert "error" in result
+
+
+def test_file_kaizen_report_rejects_missing_buckets():
+    reset_state()
+    result = json.loads(holding.file_kaizen_report.run(
+        subsidiary_id="api-sentinel", kaizen_report=json.dumps({"selbst_umsetzbar": []})
+    ))
+    assert "error" in result
+
+
+def test_file_kaizen_report_rejects_ungrounded_item():
+    reset_state()
+    report = {
+        "selbst_umsetzbar": [],
+        "fuer_aufsichtsrat": [{"suggestion": "do more marketing", "grounding": "hyp_does_not_exist"}],
+    }
+    result = json.loads(holding.file_kaizen_report.run(subsidiary_id="api-sentinel", kaizen_report=json.dumps(report)))
+    assert "error" in result
+    assert "not a real" in result["error"]
+
+
+def test_file_kaizen_report_rejects_selbst_umsetzbar_touching_spend():
+    reset_state()
+    hyp_id = _seed_hypothesis_for_grounding()
+    report = {
+        "selbst_umsetzbar": [{
+            "action": "spend $50 on ads for this channel", "grounding": hyp_id, "status": "acted",
+        }],
+        "fuer_aufsichtsrat": [],
+    }
+    result = json.loads(holding.file_kaizen_report.run(subsidiary_id="api-sentinel", kaizen_report=json.dumps(report)))
+    assert "error" in result
+    assert "spend" in result["error"]
+
+
+def test_file_kaizen_report_rejects_deferred_without_reason():
+    reset_state()
+    hyp_id = _seed_hypothesis_for_grounding()
+    report = {
+        "selbst_umsetzbar": [{"action": "revisit channel fit", "grounding": hyp_id, "status": "deferred"}],
+        "fuer_aufsichtsrat": [],
+    }
+    result = json.loads(holding.file_kaizen_report.run(subsidiary_id="api-sentinel", kaizen_report=json.dumps(report)))
+    assert "error" in result
+
+
+def test_file_kaizen_report_accepts_grounded_items_and_persists_board_bucket():
+    reset_state()
+    hyp_id = _seed_hypothesis_for_grounding()
+    report = {
+        "selbst_umsetzbar": [{
+            "action": f"re-read {hyp_id}'s research findings before the next hypothesis on this channel",
+            "grounding": hyp_id, "status": "acted",
+        }],
+        "fuer_aufsichtsrat": [{
+            "suggestion": f"{hyp_id} suggests this channel needs a policy review", "grounding": hyp_id,
+        }],
+    }
+    result = json.loads(holding.file_kaizen_report.run(subsidiary_id="api-sentinel", kaizen_report=json.dumps(report)))
+    assert result == {"logged_selbst_umsetzbar": 1, "logged_fuer_aufsichtsrat": 1}
+
+    stored = holding._read("kaizen_suggestions.jsonl")
+    assert len(stored) == 1
+    assert stored[0]["grounding"] == hyp_id
+    assert stored[0]["telegram_notified_at"] is None
+
+    unnotified = holding.read_unnotified_kaizen_suggestions()
+    assert len(unnotified) == 1
+    holding.mark_kaizen_suggestions_notified([stored[0]["id"]])
+    assert holding.read_unnotified_kaizen_suggestions() == []
+
+
+def test_file_status_report_accepts_kaizen_points():
+    reset_state()
+    hyp_id = _seed_hypothesis_for_grounding()
+    result = json.loads(holding.file_status_report.run(
+        subsidiary_id="api-sentinel", what_was_asked="test", what_was_found="found",
+        kaizen_points=json.dumps([{"observation": f"{hyp_id} is worth revisiting", "grounding": hyp_id}]),
+    ))
+    assert "filed" in result
+    reports = holding._read("status_reports.jsonl")
+    assert reports[-1]["kaizen_points"][0]["grounding"] == hyp_id
+
+
+def test_file_status_report_rejects_invalid_kaizen_points():
+    reset_state()
+    result = json.loads(holding.file_status_report.run(
+        subsidiary_id="api-sentinel", what_was_asked="test", what_was_found="found",
+        kaizen_points="not json",
+    ))
+    assert "error" in result
+
+
+def test_aufsichtsrat_lines_kaizen_new_count():
+    lines = crew._aufsichtsrat_lines(0, None, 0, kaizen_new_count=2)
+    joined = "\n".join(lines)
+    assert "2 neue Kaizen-Vorschlaege" in joined
+    assert "kaizen_suggestions.jsonl" in joined
 
 
 def main():

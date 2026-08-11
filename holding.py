@@ -1105,6 +1105,164 @@ def resolve_fix_entry(entry_id: str) -> tuple:
 
 
 # --------------------------------------------------------------------------
+# Kaizen (FIX.md/Kaizen/payment-propensity addendum, Part 2). One combined
+# self-improvement report per cycle, assembled at the Main-CEO level from
+# the Sub-CEO's own subsidiary-level points (already gathered in its status
+# report, see file_status_report's kaizen_points field) merged with the
+# Main-CEO's own holding-level observations - filed here as one call, not
+# duplicated per agent. Two buckets: selbst_umsetzbar (already acted on or
+# explicitly deferred, this cycle, strictly inside the existing Tier-0
+# boundary - see the guardrail below) and fuer_aufsichtsrat (persisted,
+# needs Jan). Every item in both buckets must cite a real id that actually
+# exists in this subsidiary's current data - the same ground-truth
+# discipline as the anti-copying tripwire (tools._instruction_echo_match),
+# just enforced against real state instead of a fixed phrase list, since a
+# citable id is a stronger and simpler proxy for "genuinely grounded" than
+# matching known generic-advice phrasing.
+# --------------------------------------------------------------------------
+
+KAIZEN_ITEM_STATUSES = {"acted", "deferred"}
+# Anything an action mentions from this list must go through
+# fuer_aufsichtsrat + tools.request_approval, never selbst_umsetzbar -
+# mirrors tools.APPROVAL_CATEGORIES exactly (spend/legal/publish/deploy/
+# pricing) plus their common German phrasing, since Kaizen items are free
+# text, not a structured category field.
+_KAIZEN_TIER_KEYWORDS = [
+    "spend", "ausgeben", "kaufen", "bezahlen", "payment", "zahlung", "budget",
+    "publish", "veroeffentlichen", "veröffentlichen", "posten", "post ",
+    "deploy", "deployen", "pricing", "preis setzen", "preisaenderung", "preisänderung",
+    "legal", "vertrag", "contract",
+]
+
+
+def _kaizen_tier_violation(text: str) -> str:
+    lowered = (text or "").lower()
+    for kw in _KAIZEN_TIER_KEYWORDS:
+        if kw in lowered:
+            return kw.strip()
+    return ""
+
+
+def _kaizen_grounding_exists(subsidiary_id: str, grounding: str) -> bool:
+    """A Kaizen item is grounded only if `grounding` is an id that actually
+    exists in this subsidiary's real current hypotheses.jsonl/channels.jsonl
+    or the global approval_queue.jsonl - not just a non-empty string.
+    """
+    if not grounding:
+        return False
+    subs, idx = _get_subsidiary(subsidiary_id)
+    state_dir = _subsidiary_state_dir(subs[idx] if idx is not None else None, subsidiary_id)
+    ids = {h.get("id") for h in read_jsonl(state_dir, "hypotheses.jsonl")}
+    ids |= {c.get("id") for c in read_jsonl(state_dir, "channels.jsonl")}
+    ids |= {a.get("id") for a in read_jsonl(SUBSIDIARY_STATE_DIR, "approval_queue.jsonl")}
+    return grounding in ids
+
+
+@tool("file_kaizen_report")
+def file_kaizen_report(subsidiary_id: str, kaizen_report: str) -> str:
+    """File THIS CYCLE's one consolidated Kaizen self-improvement report -
+    called once per cycle by task_main_ceo_review, after merging the
+    Sub-CEO's own subsidiary-level points (from its status report) with the
+    Main-CEO's own holding-level observations. Never call this more than
+    once per cycle, and never from the Sub-CEO's own task.
+
+    kaizen_report is a JSON string: {"selbst_umsetzbar": [...],
+    "fuer_aufsichtsrat": [...]} (either list may be empty, never omitted).
+
+    selbst_umsetzbar items: {"action": str, "grounding": <a real
+    hypothesis_id/channel_id/approval_id from THIS subsidiary's actual
+    current data>, "status": "acted"|"deferred", "deferred_reason": str
+    (required when status="deferred")}. HARD GUARDRAIL, enforced here, not
+    just by instruction: action is rejected if it mentions spend/publish/
+    deploy/pricing/legal in any form - anything touching those belongs in
+    fuer_aufsichtsrat + tools.request_approval only. Kaizen must never
+    become a backdoor around the existing Tier boundary
+    (tools.APPROVAL_CATEGORIES).
+
+    fuer_aufsichtsrat items: {"suggestion": str, "grounding": <same
+    real-id requirement>} - persisted to kaizen_suggestions.jsonl every
+    cycle they occur, surfaced via a short Telegram pointer only (see
+    crew.py's _aufsichtsrat_lines) - never the full suggestion text
+    repeated in chat every cycle.
+
+    Every item in both buckets is rejected unless `grounding` names an id
+    that genuinely exists right now in this subsidiary's hypotheses.jsonl/
+    channels.jsonl or the global approval_queue.jsonl - generic startup
+    advice with no cited fact behind it doesn't get filed.
+    """
+    try:
+        report = json.loads(kaizen_report)
+    except json.JSONDecodeError as exc:
+        return json.dumps({"error": f"kaizen_report must be a JSON string: {exc}"})
+    if not isinstance(report, dict):
+        return json.dumps({"error": "kaizen_report must be a JSON object"})
+
+    selbst_umsetzbar = report.get("selbst_umsetzbar")
+    fuer_aufsichtsrat = report.get("fuer_aufsichtsrat")
+    if not isinstance(selbst_umsetzbar, list) or not isinstance(fuer_aufsichtsrat, list):
+        return json.dumps({
+            "error": "kaizen_report needs 'selbst_umsetzbar' and 'fuer_aufsichtsrat' as lists (may be empty)"
+        })
+
+    for item in selbst_umsetzbar:
+        if not isinstance(item, dict) or not (item.get("action") or "").strip():
+            return json.dumps({"error": "every selbst_umsetzbar item needs a non-empty 'action'"})
+        if not _kaizen_grounding_exists(subsidiary_id, item.get("grounding", "")):
+            return json.dumps({
+                "error": f"selbst_umsetzbar item's grounding '{item.get('grounding')}' is not a real "
+                         "hypothesis/channel/approval id from this subsidiary's current data - generic "
+                         "advice without a cited fact isn't accepted"
+            })
+        violation = _kaizen_tier_violation(item["action"])
+        if violation:
+            return json.dumps({
+                "error": f"selbst_umsetzbar item's action mentions '{violation}' - anything touching spend/"
+                         "publish/deploy/pricing/legal belongs in fuer_aufsichtsrat only, never "
+                         "selbst_umsetzbar (Kaizen never expands what's autonomous)"
+            })
+        if item.get("status") not in KAIZEN_ITEM_STATUSES:
+            return json.dumps({"error": "selbst_umsetzbar item's status must be 'acted' or 'deferred'"})
+        if item["status"] == "deferred" and not (item.get("deferred_reason") or "").strip():
+            return json.dumps({"error": "a 'deferred' selbst_umsetzbar item needs a non-empty deferred_reason"})
+
+    for item in fuer_aufsichtsrat:
+        if not isinstance(item, dict) or not (item.get("suggestion") or "").strip():
+            return json.dumps({"error": "every fuer_aufsichtsrat item needs a non-empty 'suggestion'"})
+        if not _kaizen_grounding_exists(subsidiary_id, item.get("grounding", "")):
+            return json.dumps({
+                "error": f"fuer_aufsichtsrat item's grounding '{item.get('grounding')}' is not a real "
+                         "hypothesis/channel/approval id from this subsidiary's current data - generic "
+                         "advice without a cited fact isn't accepted"
+            })
+
+    now = datetime.now(timezone.utc).isoformat()
+    for item in fuer_aufsichtsrat:
+        _append("kaizen_suggestions.jsonl", {
+            "id": f"kaizen_{uuid.uuid4().hex[:8]}", "created_at": now, "subsidiary_id": subsidiary_id,
+            "suggestion": item["suggestion"], "grounding": item["grounding"], "telegram_notified_at": None,
+        })
+
+    return json.dumps({
+        "logged_selbst_umsetzbar": len(selbst_umsetzbar), "logged_fuer_aufsichtsrat": len(fuer_aufsichtsrat),
+    })
+
+
+def read_unnotified_kaizen_suggestions() -> list:
+    return [e for e in _read("kaizen_suggestions.jsonl") if not e.get("telegram_notified_at")]
+
+
+def mark_kaizen_suggestions_notified(entry_ids: list) -> None:
+    if not entry_ids:
+        return
+    entries = _read("kaizen_suggestions.jsonl")
+    now = datetime.now(timezone.utc).isoformat()
+    for e in entries:
+        if e.get("id") in entry_ids:
+            e["telegram_notified_at"] = now
+    _write("kaizen_suggestions.jsonl", entries)
+
+
+# --------------------------------------------------------------------------
 # Structured handoff: Sub-CEO -> Main-CEO (status report). Generalizes the
 # pivot-proposal pattern to every cycle's report, not just fundamental-
 # strategy escalations - a fixed record instead of the Main-CEO having to
@@ -1120,6 +1278,7 @@ def file_status_report(
     outcome: str = "",
     needs_decision_from_above: bool = False,
     decision_context: str = "",
+    kaizen_points: str = "",
 ) -> str:
     """Sub-CEO reports this cycle's work to the Main-CEO as a fixed record -
     what was being worked on, what was found, and whether anything needs a
@@ -1128,11 +1287,27 @@ def file_status_report(
     hypothesis's result. If needs_decision_from_above is true,
     decision_context is required - say plainly what the Main-CEO actually
     needs to decide, not just that something happened.
+
+    kaizen_points (Kaizen addendum, Part 2): optional JSON string, a list of
+    this cycle's subsidiary-level self-improvement observations, e.g.
+    [{"observation": str, "grounding": <a real hypothesis/channel/approval
+    id from this cycle's own data>}]. The Main-CEO reads this every cycle
+    (via read_status_reports) and merges it with its own holding-level
+    observations into the ONE consolidated report filed via
+    file_kaizen_report - never file a separate Kaizen report from here.
     """
     if needs_decision_from_above and not decision_context.strip():
         return json.dumps({"error": "needs_decision_from_above=true requires a non-empty decision_context"})
     if outcome and outcome not in HYPOTHESIS_OUTCOMES:
         return json.dumps({"error": f"invalid outcome '{outcome}', must be one of {sorted(HYPOTHESIS_OUTCOMES)} or empty"})
+    parsed_kaizen_points = []
+    if kaizen_points:
+        try:
+            parsed_kaizen_points = json.loads(kaizen_points)
+        except json.JSONDecodeError as exc:
+            return json.dumps({"error": f"kaizen_points must be a JSON string (list): {exc}"})
+        if not isinstance(parsed_kaizen_points, list):
+            return json.dumps({"error": "kaizen_points must be a JSON list"})
 
     record = {
         "id": f"report_{uuid.uuid4().hex[:8]}",
@@ -1145,6 +1320,7 @@ def file_status_report(
         "needs_decision_from_above": needs_decision_from_above,
         "decision_context": decision_context or None,
         "acknowledged": False,
+        "kaizen_points": parsed_kaizen_points,
     }
     _append("status_reports.jsonl", record)
     return json.dumps({"filed": record["id"]})
