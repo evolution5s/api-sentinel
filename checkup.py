@@ -333,10 +333,18 @@ def test_get_pricing_sonnet5_from_price_step():
 
 def test_get_pricing_unknown_model_raises():
     try:
-        pricing.get_pricing("claude-opus-5", date(2026, 1, 1))
+        pricing.get_pricing("claude-nonexistent-model", date(2026, 1, 1))
         assert False, "expected ValueError for an unpriced model"
     except ValueError:
         pass
+
+
+def test_get_pricing_opus5():
+    rates = pricing.get_pricing("claude-opus-5", date(2026, 1, 1))
+    assert rates == {
+        "base_input": 5.0, "cache_write_5m": 6.25, "cache_write_1h": 10.0,
+        "cache_hit": 0.50, "output": 25.0,
+    }
 
 
 def test_compute_cycle_cost_haiku_known_value():
@@ -3786,6 +3794,273 @@ def test_task_usage_watchdog_records_per_task_tokens():
         _Crew.calculate_usage_metrics = original_calc
         crew._task_usage_log.clear()
         crew._last_cumulative_tokens = original_cumulative
+
+
+# --------------------------------------------------------------------------
+# FIX.md mechanism (FIX.md/Kaizen/payment-propensity addendum, Part 1).
+# --------------------------------------------------------------------------
+
+def test_check_zero_state_streak_fires_after_threshold():
+    # The first call only establishes the baseline snapshot (nothing to
+    # compare against yet), so reaching a streak of N takes N+1 calls -
+    # same "first observation just sets the baseline" shape as
+    # assess_subsidiary_trajectory's own consecutive-cycle counter.
+    reset_state()
+    fired, _ = holding.check_zero_state_streak("api-sentinel", 3)
+    assert fired is False
+    fired, _ = holding.check_zero_state_streak("api-sentinel", 3)
+    assert fired is False
+    fired, _ = holding.check_zero_state_streak("api-sentinel", 3)
+    assert fired is False
+    fired, evidence = holding.check_zero_state_streak("api-sentinel", 3)
+    assert fired is True
+    assert evidence["streak_cycles"] == 3
+
+
+def _current_zero_state_streak():
+    subs, idx = holding._get_subsidiary("api-sentinel")
+    return (subs[idx].get("fix_check_streaks") or {}).get("zero_state_streak", 0)
+
+
+def test_check_zero_state_streak_resets_when_state_changes():
+    reset_state()
+    holding.check_zero_state_streak("api-sentinel", 100)  # baseline snapshot
+    holding.check_zero_state_streak("api-sentinel", 100)  # unchanged -> streak 1
+    holding.check_zero_state_streak("api-sentinel", 100)  # unchanged -> streak 2
+    assert _current_zero_state_streak() == 2
+
+    tools.write_knowledge_entry.run(
+        topic="t", takeaway="k", confidence="low", source_hypothesis_ids=json.dumps(["hyp_x"]),
+    )
+    holding.check_zero_state_streak("api-sentinel", 100)
+    assert _current_zero_state_streak() == 0, "a real new knowledge_base entry must reset the streak to 0"
+
+
+def test_check_recurring_malformed_tool_calls_requires_same_signature():
+    reset_state()
+    fired, _ = holding.check_recurring_malformed_tool_calls("api-sentinel", ["write_channel:Field required"], 3)
+    assert fired is False
+    fired, _ = holding.check_recurring_malformed_tool_calls("api-sentinel", ["write_channel:Field required"], 3)
+    assert fired is False
+    fired, evidence = holding.check_recurring_malformed_tool_calls(
+        "api-sentinel", ["write_channel:Field required"], 3
+    )
+    assert fired is True
+    assert evidence["streak_cycles"] == 3
+
+    fired, _ = holding.check_recurring_malformed_tool_calls("api-sentinel", ["other_tool:different"], 3)
+    assert fired is False, "a different signature must reset the streak, not keep firing"
+
+
+def test_check_channel_bury_streak_fires_on_consecutive_buries():
+    reset_state()
+    for i in range(3):
+        hyp = {
+            "id": f"hyp_bury_{i}", "statement": "s", "category": "value", "landing_page_variant_id": "v1",
+            "failure_rate": 0.5, "success_rate": 0.5, "duration_days": 3, "channel": "reddit",
+            "hypothesis_type": "value", "impact_score": 3, "confidence_score": 3, "evidence_stage": "research",
+            "research_objective": "o", "research_confirming_criteria": "c", "research_disconfirming_criteria": "d",
+            "primary_variable_tested": "audience",
+        }
+        tools.write_hypothesis.run(hypothesis=json.dumps(hyp))
+        tools.write_hypothesis.run(hypothesis=json.dumps({
+            "id": f"hyp_bury_{i}", "status": "buried", "bury_reasoning": "no signal",
+        }))
+    fired, evidence = holding.check_channel_bury_streak("api-sentinel", 3)
+    assert fired is True
+    assert evidence["channel"] == "reddit"
+    assert len(evidence["hypothesis_ids"]) == 3
+
+
+def test_check_hypothesis_stuck_past_cap_requires_confirmed_policy():
+    reset_state()
+    old_created = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
+    tools._write_jsonl("hypotheses.jsonl", [{
+        "id": "hyp_stuck", "status": "active", "evidence_stage": "research",
+        "created_at": old_created, "channel": "reddit",
+    }])
+    fired, _ = holding.check_hypothesis_stuck_past_cap("api-sentinel", {"max_duration_days_by_stage": tools.DEFAULT_PROPOSED_DURATION_CAPS})
+    assert fired is False, "must not fire while the duration policy is still 'proposed'"
+
+    confirmed_policy = {
+        "max_duration_days_by_stage": {"status": "confirmed", "values": {"research": 3, "community_engagement": 5, "landing_page": 14, "build": None}}
+    }
+    fired, evidence = holding.check_hypothesis_stuck_past_cap("api-sentinel", confirmed_policy)
+    assert fired is True
+    assert evidence["hypothesis_id"] == "hyp_stuck"
+
+
+def test_check_repeated_pivot_streak_fires_on_consecutive_pivot_outcomes():
+    reset_state()
+    tools._write_jsonl("hypotheses.jsonl", [
+        {"id": "hyp_p1", "status": "evaluated", "outcome": "pivot", "channel": "reddit"},
+        {"id": "hyp_p2", "status": "evaluated", "outcome": "pivot", "channel": "reddit"},
+    ])
+    fired, evidence = holding.check_repeated_pivot_streak("api-sentinel", 2)
+    assert fired is True
+    assert evidence["hypothesis_ids"] == ["hyp_p1", "hyp_p2"]
+
+    tools._write_jsonl("hypotheses.jsonl", [
+        {"id": "hyp_p1", "status": "evaluated", "outcome": "pivot", "channel": "reddit"},
+        {"id": "hyp_p2", "status": "evaluated", "outcome": "build", "channel": "reddit"},
+    ])
+    fired, _ = holding.check_repeated_pivot_streak("api-sentinel", 2)
+    assert fired is False
+
+
+def test_check_stale_approvals_fires_after_threshold_hours():
+    reset_state()
+    stale_created = (datetime.now(timezone.utc) - timedelta(hours=72)).isoformat()
+    tools._write_global_jsonl("approval_queue.jsonl", [{
+        "id": "appr_stale01", "status": "pending", "category": "spend", "created_at": stale_created,
+    }])
+    fired, evidence = holding.check_stale_approvals(48)
+    assert fired is True
+    assert evidence["stale_approvals"][0]["id"] == "appr_stale01"
+
+    fired, _ = holding.check_stale_approvals(96)
+    assert fired is False
+
+
+def test_run_fix_checks_returns_only_fired_checks():
+    reset_state()
+    stale_created = (datetime.now(timezone.utc) - timedelta(hours=100)).isoformat()
+    tools._write_global_jsonl("approval_queue.jsonl", [{
+        "id": "appr_stale02", "status": "pending", "category": "spend", "created_at": stale_created,
+    }])
+    fired = holding.run_fix_checks("api-sentinel")
+    check_types = [f["check_type"] for f in fired]
+    assert "stale_approvals" in check_types
+    assert "zero_state_streak" not in check_types, "must not fire on the very first cycle"
+
+
+def test_append_fix_md_and_record_fix_entry_roundtrip():
+    reset_state()
+    holding.append_fix_md("fix_test0001", "technisch", "Test headline", "Body text here.")
+    fix_path = holding.HOLDING_DIR / "FIX.md"
+    assert fix_path.exists()
+    content = fix_path.read_text(encoding="utf-8")
+    assert "## [fix_test0001] technisch: Test headline" in content
+    assert "Body text here." in content
+
+    holding.record_fix_entry("fix_test0001", "technisch", "Test headline", "api-sentinel", "stale_approvals")
+    entries = holding._read("fix_entries.jsonl")
+    assert len(entries) == 1
+    assert entries[0]["id"] == "fix_test0001"
+    assert entries[0]["resolved"] is False
+
+    unnotified = holding.read_unnotified_fix_entries()
+    assert len(unnotified) == 1
+    holding.mark_fix_entries_notified(["fix_test0001"])
+    assert holding.read_unnotified_fix_entries() == []
+
+
+def test_resolve_fix_entry_archives_section():
+    reset_state()
+    holding.append_fix_md("fix_test0002", "inhaltlich", "Headline A", "Body A.")
+    holding.append_fix_md("fix_test0003", "technisch", "Headline B", "Body B.")
+    holding.record_fix_entry("fix_test0002", "inhaltlich", "Headline A", "api-sentinel", "channel_bury_streak")
+    holding.record_fix_entry("fix_test0003", "technisch", "Headline B", "api-sentinel", "stale_approvals")
+
+    ok, message = holding.resolve_fix_entry("fix_test0002")
+    assert ok is True
+    assert "fix_test0002" in message
+
+    remaining = holding.HOLDING_DIR.joinpath("FIX.md").read_text(encoding="utf-8")
+    assert "fix_test0002" not in remaining
+    assert "fix_test0003" in remaining
+
+    archives = list(holding.HOLDING_DIR.glob("FIX_resolved_*.md"))
+    assert len(archives) == 1
+    assert "fix_test0002" in archives[0].read_text(encoding="utf-8")
+
+    entries = {e["id"]: e for e in holding._read("fix_entries.jsonl")}
+    assert entries["fix_test0002"]["resolved"] is True
+
+    ok, message = holding.resolve_fix_entry("fix_test0002")
+    assert ok is False
+
+    ok, message = holding.resolve_fix_entry("fix_does_not_exist")
+    assert ok is False
+
+
+def test_classify_command_fix_resolved():
+    assert tools._classify_command("fix_resolved: fix_abc12345", "") == ("fix_resolved", "fix_abc12345")
+    assert tools._classify_command("fix_resolved:", "") is None
+
+
+def test_classify_command_fix_thresholds():
+    assert tools._classify_command("fix_thresholds: confirm", "") == ("fix_thresholds_confirm", None)
+    assert tools._classify_command("fix_thresholds: 3 3 3 2 48", "") == (
+        "fix_thresholds_set",
+        {
+            "zero_state_streak_cycles": 3, "malformed_tool_calls_cycles": 3, "channel_bury_streak": 3,
+            "repeated_pivot_streak": 2, "stale_approval_hours": 48,
+        },
+    )
+    assert tools._classify_command("fix_thresholds: not enough", "") is None
+
+
+def test_apply_telegram_commands_fix_resolved_clears_entry():
+    reset_state()
+    holding.read_subsidiaries.run()  # bootstrap the registry
+    holding.append_fix_md("fix_test0004", "technisch", "Headline", "Body.")
+    holding.record_fix_entry("fix_test0004", "technisch", "Headline", "api-sentinel", "stale_approvals")
+    had_token = os.environ.pop("TELEGRAM_BOT_TOKEN", None)
+    try:
+        log = tools._apply_telegram_commands([{"text": "fix_resolved: fix_test0004", "reply_to_text": ""}])
+        assert any("fix_test0004" in entry for entry in log)
+    finally:
+        if had_token is not None:
+            os.environ["TELEGRAM_BOT_TOKEN"] = had_token
+    entries = {e["id"]: e for e in holding._read("fix_entries.jsonl")}
+    assert entries["fix_test0004"]["resolved"] is True
+
+
+def test_apply_telegram_commands_fix_thresholds_confirm():
+    reset_state()
+    had_token = os.environ.pop("TELEGRAM_BOT_TOKEN", None)
+    try:
+        tools._apply_telegram_commands([{"text": "fix_thresholds: confirm", "reply_to_text": ""}])
+    finally:
+        if had_token is not None:
+            os.environ["TELEGRAM_BOT_TOKEN"] = had_token
+    stored = holding.read_fix_thresholds()
+    assert stored["status"] == "confirmed"
+    assert stored["values"] == holding.DEFAULT_PROPOSED_FIX_THRESHOLDS["values"]
+
+
+def test_generate_fix_diagnosis_parses_structured_response():
+    fake_response = (
+        "CATEGORY: inhaltlich\n"
+        "CONFIDENCE_CAVEAT: First-pass automated proposal, treat as a starting point.\n"
+        "PROBLEM: r/algotrading channel keeps burying hypotheses.\n"
+        "FIX_STEPS:\n1. Re-check channel fit.\n"
+        "TEST_COVERAGE: add a regression test.\n"
+    )
+    diagnosis = crew.generate_fix_diagnosis(
+        "channel_bury_streak", "api-sentinel", {"channel": "reddit"}, llm_call=lambda prompt: fake_response
+    )
+    assert diagnosis["category"] == "inhaltlich"
+    assert "keeps burying" in diagnosis["headline"]
+    assert "CONFIDENCE_CAVEAT" in diagnosis["body"]
+
+
+def test_generate_fix_diagnosis_falls_back_when_call_fails():
+    def _boom(prompt):
+        raise RuntimeError("api down")
+    diagnosis = crew.generate_fix_diagnosis("stale_approvals", "api-sentinel", {"n": 1}, llm_call=_boom)
+    assert diagnosis["category"] == "technisch"
+    assert "api down" in diagnosis["body"]
+
+
+def test_aufsichtsrat_lines_fix_md_new_entries():
+    entries = [{"id": "fix_abc12345", "category": "technisch", "headline": "Something broke"}]
+    lines = crew._aufsichtsrat_lines(0, None, 0, fix_md_new_entries=entries)
+    joined = "\n".join(lines)
+    assert "FIX.md aktualisiert" in joined
+    assert "Something broke" in joined
+    assert "fix_resolved: fix_abc12345" in joined
 
 
 def main():

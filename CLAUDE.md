@@ -24,6 +24,20 @@ anrichten oder den Scope stillschweigend erweitern können.
   eingerichtet haben). Werte selbst nie ungefragt in den Chat drucken.
 - **Kleinere, offensichtliche Eigenentscheidungen** bei mehrdeutigen
   Anweisungen treffen und im Nachhinein kurz begründen, statt vorher zu fragen.
+- **Wenn nach `FIX.md` gefragt wird:** zuerst den echten, aktuellen Inhalt
+  direkt vom Railway-Volume holen (`railway run -- python -c "import
+  pathlib,os; print(pathlib.Path(os.environ.get('STATE_DIR', '/data')) /
+  '_holding' / 'FIX.md')"` liefert den exakten Pfad; typischerweise
+  `railway run -- cat /data/_holding/FIX.md`) - nie eine lokale Kopie
+  annehmen, es gibt keine, `FIX.md` lebt ausschließlich auf dem Volume.
+  Jeden gefundenen Abschnitt als eigene Addendum-artige Aufgabe bearbeiten,
+  mit derselben Sorgfalt wie ein direkt von Jan eingefügtes Addendum. Nach
+  Umsetzung im Commit/Summary explizit nennen, welche `FIX.md`-Einträge
+  adressiert wurden, damit die nächste Zyklus-Archivierung
+  (`fix_resolved: <id>` per Telegram) etwas Konkretes zum Abgleichen hat.
+  Dieser Mechanismus selbst wendet nie etwas an - er schreibt nur nach
+  `FIX.md`; jede tatsächliche Umsetzung bleibt ein separater, bewusster
+  Schritt in einer eigenen Claude-Code-Session.
 
 ## Weiterhin Rückfrage nötig
 

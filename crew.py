@@ -1,5 +1,7 @@
 import json
 import os
+import re
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -131,6 +133,20 @@ growth_llm = LLM(max_tokens=AGENT_PROFILE["agents"]["growth"]["max_tokens"], **_
 dev_llm = LLM(max_tokens=AGENT_PROFILE["agents"]["dev"]["max_tokens"], **_ANTHROPIC_KWARGS)
 ceo_llm = LLM(max_tokens=AGENT_PROFILE["agents"]["sub_ceo"]["max_tokens"], **_ANTHROPIC_KWARGS)
 main_ceo_llm = LLM(max_tokens=AGENT_PROFILE["agents"]["main_ceo"]["max_tokens"], **_ANTHROPIC_KWARGS)
+
+# FIX.md addendum, Part 1.2: the one escalated diagnostic call, deliberately
+# on a stronger/different model than the routine per-cycle AGENT_PROFILE
+# model above - fires rarely (only when holding.run_fix_checks reports a
+# real threshold crossing), so the added cost of a stronger model for that
+# one call is bounded. claude-opus-5 (not the addendum's originally-named
+# claude-opus-4-8, a now-superseded legacy model at the identical price -
+# $5/$6.25/$10/$0.50/$25 per MTok base/5m-write/1h-write/hit/output for
+# both, confirmed against Anthropic's pricing docs 2026-08-11, see
+# pricing.py) - no reason to reach for the superseded one. Outside the
+# _ANTHROPIC_KWARGS profile mechanism on purpose: this call is not one of
+# the four routine agents and must never be swapped by an agent_profile.json
+# change meant for those.
+fix_llm = LLM(model="anthropic/claude-opus-5", api_key=ANTHROPIC_KEY, max_tokens=2000)
 
 # Agents mit dem Claude-LLM konfigurieren.
 # Pro Agent gesetzte Kappungen gegen Budget-Ausreisser in einem einzelnen
@@ -1483,6 +1499,92 @@ def _compute_cycle_usage() -> dict:
     return usage
 
 
+def generate_fix_diagnosis(check_type: str, subsidiary_id: str, evidence: dict, llm_call=None) -> dict:
+    """FIX.md addendum, Part 1.2: the one escalated call, made only when
+    holding.run_fix_checks reports a real threshold crossing for
+    (check_type, subsidiary_id). Uses ONLY the real evidence dict already
+    gathered mechanically by the check itself - never invents specifics.
+    Returns {"category": "technisch"|"inhaltlich", "headline": str,
+    "body": str} for the caller to hand to holding.append_fix_md/
+    record_fix_entry - this function has no file-write side effect of its
+    own (Part 1.6's guardrail: nothing here ever applies a fix, only
+    describes one).
+
+    llm_call defaults to fix_llm.call; overridable so the parsing/formatting
+    logic is unit-testable without a real Opus call.
+    """
+    call = llm_call or fix_llm.call
+    prompt = (
+        "You are generating one section for FIX.md, api-sentinel's autonomous "
+        "diagnostic log - a human will read this in a later Claude Code session "
+        "and decide whether/how to act on it, this mechanism itself never "
+        "applies anything. Use ONLY the real evidence below, gathered "
+        f"mechanically for subsidiary '{subsidiary_id}' by check '{check_type}' - "
+        "never invent or generalize specifics that weren't actually retrieved:\n\n"
+        f"{json.dumps(evidence, ensure_ascii=False, indent=2)}\n\n"
+        "Respond in exactly this structure (plain text, these literal labels):\n"
+        "CATEGORY: technisch OR inhaltlich (both matter equally here - this "
+        "covers crashes/code bugs as much as 'this isn't moving toward revenue' "
+        "findings)\n"
+        "CONFIDENCE_CAVEAT: one sentence, e.g. 'This is a first-pass automated "
+        "proposal based on the evidence below. Technical fixes are likely "
+        "straightforward; strategic recommendations should be treated as a "
+        "starting point for review, not a settled conclusion.'\n"
+        "PROBLEM: a concrete problem statement grounded in the evidence above, "
+        "one line\n"
+        "FIX_STEPS:\n1. ...\n2. ...\n(concrete, numbered)\n"
+        "TEST_COVERAGE: what checkup.py test coverage the fix should include\n\n"
+        "Do not soften or spin a negative/strategic finding positively - state "
+        "it plainly, the same ground-truth honesty this system already requires "
+        "of hypothesis reasoning."
+    )
+    try:
+        response = call(prompt)
+    except Exception as exc:
+        response = (
+            "CATEGORY: technisch\n"
+            f"CONFIDENCE_CAVEAT: the escalated diagnosis call itself failed ({exc}) "
+            "- the evidence below is real, this write-up is a mechanical fallback, "
+            "not model-generated.\n"
+            f"PROBLEM: check '{check_type}' fired for subsidiary '{subsidiary_id}'.\n"
+            "FIX_STEPS:\n1. Investigate the evidence below directly.\n"
+            "TEST_COVERAGE: add a regression test for this check_type once the "
+            "root cause is known.\n\n"
+            f"Evidence: {json.dumps(evidence, ensure_ascii=False)}"
+        )
+    category_match = re.search(r"CATEGORY:\s*(technisch|inhaltlich)", response, re.IGNORECASE)
+    category = category_match.group(1).lower() if category_match else "technisch"
+    problem_match = re.search(r"PROBLEM:\s*(.+)", response)
+    headline = problem_match.group(1).strip()[:120] if problem_match else f"{check_type} ({subsidiary_id})"
+    return {"category": category, "headline": headline, "body": response}
+
+
+def run_fix_checks_for_subsidiary(subsidiary_id: str) -> None:
+    """Wires holding.run_fix_checks (Part 1.1, no LLM, cheap) to
+    generate_fix_diagnosis (Part 1.2, one escalated call per fired check)
+    and holding.append_fix_md/record_fix_entry (Part 1.3, the only writes).
+    Called once per subsidiary per cycle from __main__, after kickoff() -
+    on both success and failure, since the checks work off already-
+    persisted state and _malformed_tool_calls either way. Never raises: a
+    bug here must not block the cycle's own Telegram report.
+    """
+    try:
+        signatures = [
+            f"{e.get('tool_name')}:{str(e.get('error') or '')[:80]}"
+            for e in _malformed_tool_calls
+        ]
+        fired = holding.run_fix_checks(subsidiary_id, cycle_malformed_signatures=signatures)
+        for finding in fired:
+            diagnosis = generate_fix_diagnosis(finding["check_type"], subsidiary_id, finding["evidence"])
+            entry_id = f"fix_{uuid.uuid4().hex[:8]}"
+            holding.append_fix_md(entry_id, diagnosis["category"], diagnosis["headline"], diagnosis["body"])
+            holding.record_fix_entry(
+                entry_id, diagnosis["category"], diagnosis["headline"], subsidiary_id, finding["check_type"]
+            )
+    except Exception as exc:
+        print(f"[api-sentinel] FIX.md check run failed for '{subsidiary_id}': {exc}")
+
+
 def _usage_headline(usage: dict) -> str:
     """The most-glanced-at numbers in the whole report - kept as their own
     standalone line at the very top (see send_cycle_summary), not folded
@@ -1535,16 +1637,19 @@ def _format_hypothesis_overview(overview: list) -> list:
 
 def _aufsichtsrat_lines(
     pending_approvals, duration_policy: dict, pending_stage_skips: int,
-    stagnation_escalations: list = None,
+    stagnation_escalations: list = None, fix_md_new_entries: list = None,
+    kaizen_new_count: int = 0,
 ) -> list:
     """"Fuer den Aufsichtsrat" only appears when something genuinely needs
-    a human decision (section 8) - never printed out of habit. Four
-    concrete triggers: open approvals, the section-6 duration-policy
-    confirmation still pending, an open stage-skip escalation, or a
-    persistent stagnation escalation (section 3) - the last one is
-    deliberately worded to STAY, cycle after cycle, until a human
-    acknowledges it ('stagnation_ack: <subsidiary_id>') or a real build
-    clears it - not a note that appears once and gets buried.
+    a human decision (section 8) - never printed out of habit. Triggers:
+    open approvals, the section-6 duration-policy confirmation still
+    pending, an open stage-skip escalation, a persistent stagnation
+    escalation (section 3, stays until 'stagnation_ack: <id>' or a real
+    build clears it), new unread FIX.md entries (FIX.md addendum Part 1.4 -
+    short pointer only, never the full addendum text, resolve via
+    'fix_resolved: <id>'), and new unread Kaizen board suggestions (Part
+    2.3 - same short-pointer/dedup pattern, full text lives in
+    kaizen_suggestions.jsonl only).
     """
     items = []
     if isinstance(pending_approvals, int) and pending_approvals > 0:
@@ -1564,6 +1669,15 @@ def _aufsichtsrat_lines(
             f"kein 'build', trotz {holding.STALL_RESOLVED_THRESHOLD}+ aufgeloester Hypothesen - "
             "bleibt hier stehen, bis 'stagnation_ack: " + sub_id + "' bestaetigt wird oder ein echter "
             "Build den Trend durchbricht."
+        )
+    if fix_md_new_entries:
+        items.append(f"- FIX.md aktualisiert ({len(fix_md_new_entries)} neue Eintraege):")
+        for e in fix_md_new_entries:
+            items.append(f"  - [{e.get('category')}] {e.get('headline')} (fix_resolved: {e.get('id')})")
+    if kaizen_new_count:
+        items.append(
+            f"- {kaizen_new_count} neue Kaizen-Vorschlaege fuers Board seit letztem Report, "
+            "siehe kaizen_suggestions.jsonl."
         )
     if not items:
         return []
@@ -1604,6 +1718,9 @@ def send_cycle_summary(
         stagnation_escalations = [
             s["id"] for s in json.loads(read_subsidiaries.run()) if s.get("stagnation_escalated")
         ]
+        fix_md_new_entries = holding.read_unnotified_fix_entries()
+        if fix_md_new_entries:
+            holding.mark_fix_entries_notified([e["id"] for e in fix_md_new_entries])
         # Total tokens is the single most-glanced-at number in this report -
         # kept as its own standalone line right at the top, ahead of even
         # the profile/model detail line below, so it's unmissable rather
@@ -1656,7 +1773,10 @@ def send_cycle_summary(
             "--- Dev ---",
             _task_summary(task_dev)[:400],
         ]
-        lines += _aufsichtsrat_lines(pending, duration_policy, pending_stage_skips, stagnation_escalations)
+        lines += _aufsichtsrat_lines(
+            pending, duration_policy, pending_stage_skips, stagnation_escalations,
+            fix_md_new_entries=fix_md_new_entries,
+        )
         full_summary = "\n".join(lines)
         send_telegram_message(full_summary)
         save_cycle_note(full_summary[:3000])
@@ -1711,12 +1831,14 @@ if __name__ == "__main__":
             try:
                 crew.kickoff(inputs={"subsidiary_id": sub_id})
                 print(f"[api-sentinel] Execution finished for '{sub_id}'.")
+                run_fix_checks_for_subsidiary(sub_id)
                 send_cycle_summary(
                     subsidiary_id=sub_id, telegram_action_log=telegram_action_log,
                     persistence_warning=persistence["warning"],
                 )
             except Exception as exc:
                 print(f"[api-sentinel] crew.kickoff() failed for '{sub_id}': {exc}")
+                run_fix_checks_for_subsidiary(sub_id)
                 send_cycle_summary(
                     subsidiary_id=sub_id, kickoff_error=exc, telegram_action_log=telegram_action_log,
                     persistence_warning=persistence["warning"],

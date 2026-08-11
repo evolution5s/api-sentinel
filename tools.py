@@ -2409,6 +2409,10 @@ _START_WORDS = {"start", "resume", "weiter"}
 _APPROVE_WORDS = {"approve", "ja", "yes"}
 _REJECT_WORDS = {"reject", "nein", "no"}
 _DURATION_POLICY_STAGE_ORDER = ("research", "community_engagement", "landing_page", "build")
+_FIX_THRESHOLD_ORDER = (
+    "zero_state_streak_cycles", "malformed_tool_calls_cycles", "channel_bury_streak",
+    "repeated_pivot_streak", "stale_approval_hours",
+)
 
 
 def is_system_paused() -> tuple[bool, str]:
@@ -2601,6 +2605,25 @@ def _classify_command(text: str, reply_to_text: str):
         subsidiary_id = text.split(":", 1)[1].strip()
         return ("stagnation_ack", subsidiary_id) if subsidiary_id else None
 
+    if normalized.startswith("fix_resolved:"):
+        entry_id = text.split(":", 1)[1].strip()
+        return ("fix_resolved", entry_id) if entry_id else None
+
+    if normalized.startswith("fix_thresholds:"):
+        rest = text.split(":", 1)[1].strip()
+        if rest.lower() == "confirm":
+            return ("fix_thresholds_confirm", None)
+        parts = rest.split()
+        if len(parts) == len(_FIX_THRESHOLD_ORDER):
+            values = {}
+            for key, raw in zip(_FIX_THRESHOLD_ORDER, parts):
+                try:
+                    values[key] = int(raw)
+                except ValueError:
+                    return None
+            return ("fix_thresholds_set", values)
+        return None
+
     return None
 
 
@@ -2745,6 +2768,31 @@ def _apply_telegram_commands(messages: list) -> list:
             write_jsonl(STATE_DIR / "_holding", "subsidiaries.jsonl", subs)
             log.append(f"{ack_subsidiary_id} Stagnation-Eskalation bestaetigt (Telegram)")
             send_telegram_message(f"{ack_subsidiary_id}: Stagnation-Eskalation quittiert.")
+            continue
+
+        if action == "fix_resolved":
+            import holding  # local import: avoids a circular import (holding.py imports from tools)
+            ok, message = holding.resolve_fix_entry(target_id)
+            if ok:
+                log.append(f"{target_id} FIX.md-Eintrag geloest (Telegram)")
+            send_telegram_message(message)
+            continue
+
+        if action == "fix_thresholds_confirm":
+            import holding  # local import: avoids a circular import (holding.py imports from tools)
+            confirmed = {**holding.read_fix_thresholds(), "status": "confirmed"}
+            holding.write_fix_thresholds(confirmed)
+            log.append("FIX-Thresholds bestaetigt (Telegram)")
+            send_telegram_message(f"FIX-Thresholds bestaetigt: {confirmed['values']}")
+            continue
+
+        if action == "fix_thresholds_set":
+            import holding  # local import: avoids a circular import (holding.py imports from tools)
+            values = target_id
+            confirmed = {"status": "confirmed", "values": values, "note": "Gesetzt und bestaetigt via Telegram."}
+            holding.write_fix_thresholds(confirmed)
+            log.append("FIX-Thresholds gesetzt und bestaetigt (Telegram)")
+            send_telegram_message(f"FIX-Thresholds gesetzt und bestaetigt: {values}")
             continue
 
         if records is None:

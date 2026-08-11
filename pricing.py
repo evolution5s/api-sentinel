@@ -27,6 +27,15 @@ PRICING_TABLE = {
             "cache_hit": 0.30, "output": 15.0,
         },
     },
+    # Confirmed 2026-08-11 against Anthropic's own pricing docs
+    # (platform.claude.com/docs/en/about-claude/pricing) - used only for the
+    # FIX.md addendum's escalated diagnostic call (holding.py's
+    # run_fix_checks -> crew.py's generate_fix_diagnosis), never the routine
+    # per-cycle agent calls, which stay on the AGENT_PROFILE model.
+    "claude-opus-5": {
+        "base_input": 5.0, "cache_write_5m": 6.25, "cache_write_1h": 10.0,
+        "cache_hit": 0.50, "output": 25.0,
+    },
 }
 
 
@@ -44,6 +53,8 @@ def get_pricing(model: str, as_of: date) -> dict:
     if model == "claude-sonnet-5":
         tier = "from_step" if as_of >= SONNET_5_PRICE_STEP_DATE else "before_step"
         return dict(PRICING_TABLE["claude-sonnet-5"][tier])
+    if model == "claude-opus-5":
+        return dict(PRICING_TABLE["claude-opus-5"])
     raise ValueError(f"no pricing known for model '{model}'")
 
 

@@ -792,6 +792,317 @@ def assess_subsidiary_trajectory(subsidiary_id: str) -> str:
         ),
     })
 
+# --------------------------------------------------------------------------
+# FIX.md mechanism (FIX.md/Kaizen/payment-propensity addendum, Part 1).
+# Cheap, mechanical, no-LLM checks that catch a subsidiary quietly stuck or
+# repeatedly failing the same way - assess_subsidiary_trajectory above only
+# catches "resolved hypotheses with zero builds"; these catch a broader set
+# of real patterns (dead cycles, a recurring crash, a channel-fit failure,
+# a hypothesis stuck past its own duration cap, non-converging pivots, a
+# stale approval queue). Every check here is a small, pure function - no
+# LLM call, testable in isolation. Only when run_fix_checks reports a fire
+# does crew.py's escalated call (this module deliberately has no LLM/model
+# dependency of its own - that lives in crew.py alongside the other LLM
+# instances) write the result to FIX.md via append_fix_md/record_fix_entry
+# below. This module never applies a fix itself - see append_fix_md's
+# docstring for the guardrail.
+# --------------------------------------------------------------------------
+
+DEFAULT_PROPOSED_FIX_THRESHOLDS = {
+    "status": "proposed",
+    "values": {
+        "zero_state_streak_cycles": 3,
+        "malformed_tool_calls_cycles": 3,
+        "channel_bury_streak": 3,
+        "repeated_pivot_streak": 2,
+        "stale_approval_hours": 48,
+    },
+    "note": (
+        "Starting thresholds for FIX.md's mechanical trigger checks. Unlike "
+        "duration caps, these gate a diagnostic write only (never a block), "
+        "so they're already active against these defaults - 'proposed' means "
+        "'confirm or adjust', not 'inert until confirmed'. Adjust via Telegram "
+        "('fix_thresholds: confirm', or 'fix_thresholds: <zero_state_streak_cycles> "
+        "<malformed_tool_calls_cycles> <channel_bury_streak> <repeated_pivot_streak> "
+        "<stale_approval_hours>')."
+    ),
+}
+
+
+def read_fix_thresholds() -> dict:
+    """Holding-level, not per-subsidiary - FIX.md's diagnostic sensitivity is
+    a system-wide dial. A single confirmed override record in
+    fix_thresholds.jsonl replaces the proposed defaults wholesale once set
+    via Telegram (tools.py's _apply_telegram_commands).
+    """
+    records = _read("fix_thresholds.jsonl")
+    return records[0] if records else dict(DEFAULT_PROPOSED_FIX_THRESHOLDS)
+
+
+def write_fix_thresholds(record: dict) -> None:
+    """Public wrapper (tools.py's Telegram command handlers call this
+    directly via a local `import holding`, the same locally-scoped-import
+    pattern already used there for `approve`, to avoid a circular import at
+    module-load time) - replaces the whole fix_thresholds.jsonl record.
+    """
+    _write("fix_thresholds.jsonl", [record])
+
+
+def _subsidiary_state_dir(sub: dict, subsidiary_id: str) -> Path:
+    state_dir_value = sub.get("state_dir") if sub else None
+    return Path(state_dir_value) if state_dir_value else SUBSIDIARY_STATE_DIR / subsidiary_id
+
+
+def _get_subsidiary(subsidiary_id: str):
+    subs = _all_subsidiaries()
+    idx = next((i for i, s in enumerate(subs) if s.get("id") == subsidiary_id), None)
+    return subs, idx
+
+
+def _persist_fix_streak(subsidiary_id: str, check_name: str, streak: int, extra: dict = None) -> None:
+    subs, idx = _get_subsidiary(subsidiary_id)
+    if idx is None:
+        return
+    streaks = subs[idx].get("fix_check_streaks") or {}
+    streaks[check_name] = streak
+    subs[idx]["fix_check_streaks"] = streaks
+    if extra:
+        subs[idx].update(extra)
+    _write("subsidiaries.jsonl", subs)
+
+
+def check_zero_state_streak(subsidiary_id: str, threshold: int) -> tuple:
+    """Fires when a subsidiary has produced no new persisted state (no new
+    hypothesis, knowledge_base entry, content draft, or task-order progress)
+    across `threshold` consecutive cycles - directly motivated by a real
+    observed case, not a hypothetical.
+    """
+    subs, idx = _get_subsidiary(subsidiary_id)
+    if idx is None:
+        return False, {}
+    sub = subs[idx]
+    state_dir = _subsidiary_state_dir(sub, subsidiary_id)
+    counts = {
+        "hypotheses": len(read_jsonl(state_dir, "hypotheses.jsonl")),
+        "knowledge_base": len(read_jsonl(state_dir, "knowledge_base.jsonl")),
+        "content_drafts": len(read_jsonl(state_dir, "content_drafts.jsonl")),
+        "task_orders": len(read_jsonl(state_dir, "task_orders.jsonl")),
+    }
+    last_counts = sub.get("_fix_last_state_counts")
+    prior_streak = (sub.get("fix_check_streaks") or {}).get("zero_state_streak", 0)
+    streak = prior_streak + 1 if last_counts == counts else 0
+    _persist_fix_streak(subsidiary_id, "zero_state_streak", streak, {"_fix_last_state_counts": counts})
+    if streak >= threshold:
+        return True, {"streak_cycles": streak, "counts": counts}
+    return False, {}
+
+
+def check_recurring_malformed_tool_calls(subsidiary_id: str, cycle_signatures: list, threshold: int) -> tuple:
+    """cycle_signatures: short strings (exception type + truncated message)
+    for this cycle's malformed tool calls, passed in by crew.py since that
+    list is cleared every cycle (crew.py's _malformed_tool_calls) - only a
+    signature repeating cycle-over-cycle counts as "recurring", not two
+    unrelated one-off errors.
+    """
+    subs, idx = _get_subsidiary(subsidiary_id)
+    if idx is None:
+        return False, {}
+    sub = subs[idx]
+    this_signature = cycle_signatures[0] if cycle_signatures else None
+    last_signature = sub.get("_fix_last_malformed_signature")
+    prior_streak = (sub.get("fix_check_streaks") or {}).get("malformed_tool_calls_streak", 0)
+    streak = prior_streak + 1 if (this_signature and this_signature == last_signature) else (1 if this_signature else 0)
+    _persist_fix_streak(
+        subsidiary_id, "malformed_tool_calls_streak", streak, {"_fix_last_malformed_signature": this_signature}
+    )
+    if this_signature and streak >= threshold:
+        return True, {"signature": this_signature, "streak_cycles": streak}
+    return False, {}
+
+
+def check_channel_bury_streak(subsidiary_id: str, threshold: int) -> tuple:
+    subs, idx = _get_subsidiary(subsidiary_id)
+    state_dir = _subsidiary_state_dir(subs[idx] if idx is not None else None, subsidiary_id)
+    hyps = read_jsonl(state_dir, "hypotheses.jsonl")
+    by_channel: dict = {}
+    for h in hyps:
+        channel = h.get("channel")
+        if channel:
+            by_channel.setdefault(channel, []).append(h)
+    for channel, channel_hyps in by_channel.items():
+        recent = channel_hyps[-threshold:]
+        if len(recent) >= threshold and all(h.get("status") == "buried" for h in recent):
+            return True, {
+                "channel": channel, "bury_streak": threshold,
+                "hypothesis_ids": [h.get("id") for h in recent],
+            }
+    return False, {}
+
+
+def check_hypothesis_stuck_past_cap(subsidiary_id: str, subsidiary_policies: dict) -> tuple:
+    """Only meaningful once max_duration_days_by_stage.status=='confirmed'
+    (tools.py's own duration-cap enforcement follows the same rule) - while
+    still 'proposed', there's no confirmed ceiling to be stuck past.
+    """
+    duration_policy = (subsidiary_policies or {}).get("max_duration_days_by_stage") or {}
+    if duration_policy.get("status") != "confirmed":
+        return False, {}
+    caps = duration_policy.get("values") or {}
+    subs, idx = _get_subsidiary(subsidiary_id)
+    state_dir = _subsidiary_state_dir(subs[idx] if idx is not None else None, subsidiary_id)
+    hyps = read_jsonl(state_dir, "hypotheses.jsonl")
+    now = datetime.now(timezone.utc)
+    for h in hyps:
+        if h.get("status") != "active":
+            continue
+        cap = caps.get(h.get("evidence_stage"))
+        created_at = h.get("created_at")
+        if cap is None or not created_at:
+            continue
+        elapsed_days = (now - datetime.fromisoformat(created_at)).days
+        if elapsed_days > cap and not h.get("duration_extension_approval_id"):
+            return True, {
+                "hypothesis_id": h.get("id"), "evidence_stage": h.get("evidence_stage"),
+                "elapsed_days": elapsed_days, "cap_days": cap,
+            }
+    return False, {}
+
+
+def check_repeated_pivot_streak(subsidiary_id: str, threshold: int) -> tuple:
+    """The addendum calls this "repeated pivot-cap exhaustion" - this
+    codebase has no literal pivot-cap counter, only the one-variable rule
+    (tools.py write_hypothesis: every pivot names exactly one changed
+    variable via pivot_variable_changed). The faithful real-data proxy: the
+    last `threshold` resolved hypotheses (creation order) all resolving to
+    outcome='pivot' - a subsidiary that keeps pivoting without ever reaching
+    build/test_further/bury, the actual systemic non-convergence signal.
+    """
+    subs, idx = _get_subsidiary(subsidiary_id)
+    state_dir = _subsidiary_state_dir(subs[idx] if idx is not None else None, subsidiary_id)
+    hyps = read_jsonl(state_dir, "hypotheses.jsonl")
+    resolved = [h for h in hyps if h.get("outcome")]
+    recent = resolved[-threshold:]
+    if len(recent) >= threshold and all(h.get("outcome") == "pivot" for h in recent):
+        return True, {"hypothesis_ids": [h.get("id") for h in recent], "pivot_streak": threshold}
+    return False, {}
+
+
+def check_stale_approvals(threshold_hours: int) -> tuple:
+    approvals = read_jsonl(SUBSIDIARY_STATE_DIR, "approval_queue.jsonl")
+    now = datetime.now(timezone.utc)
+    stale = []
+    for a in approvals:
+        if a.get("status") != "pending":
+            continue
+        created_at = a.get("created_at")
+        if not created_at:
+            continue
+        age_hours = (now - datetime.fromisoformat(created_at)).total_seconds() / 3600
+        if age_hours > threshold_hours:
+            stale.append({"id": a.get("id"), "category": a.get("category"), "age_hours": round(age_hours, 1)})
+    return (True, {"stale_approvals": stale}) if stale else (False, {})
+
+
+def run_fix_checks(subsidiary_id: str, cycle_malformed_signatures: list = None) -> list:
+    """Runs every Part-1.1 deterministic check for one subsidiary and
+    returns the fired ones as [{"check_type": ..., "evidence": {...}}, ...].
+    Pure/cheap, no LLM call - crew.py's cron loop calls this once per
+    subsidiary per cycle, then escalates only the fired checks.
+    """
+    thresholds = read_fix_thresholds().get("values", {})
+    subs, idx = _get_subsidiary(subsidiary_id)
+    policies = (subs[idx].get("policies") if idx is not None else None) or {}
+
+    checks = [
+        ("zero_state_streak", check_zero_state_streak(subsidiary_id, thresholds.get("zero_state_streak_cycles", 3))),
+        ("recurring_malformed_tool_calls", check_recurring_malformed_tool_calls(
+            subsidiary_id, cycle_malformed_signatures or [], thresholds.get("malformed_tool_calls_cycles", 3)
+        )),
+        ("channel_bury_streak", check_channel_bury_streak(subsidiary_id, thresholds.get("channel_bury_streak", 3))),
+        ("hypothesis_stuck_past_cap", check_hypothesis_stuck_past_cap(subsidiary_id, policies)),
+        ("repeated_pivot_streak", check_repeated_pivot_streak(subsidiary_id, thresholds.get("repeated_pivot_streak", 2))),
+        ("stale_approvals", check_stale_approvals(thresholds.get("stale_approval_hours", 48))),
+    ]
+    return [
+        {"check_type": check_type, "evidence": evidence}
+        for check_type, (did_fire, evidence) in checks
+        if did_fire
+    ]
+
+
+def append_fix_md(entry_id: str, category: str, headline: str, body: str) -> None:
+    """Append a new, dated section to the single, fixed STATE_DIR/_holding/
+    FIX.md file - never a timestamped filename, never overwritten, never
+    rewritten from scratch. This function's only side effects are this
+    write and record_fix_entry below; there is no code path from here to
+    any actual system/code change - a human must explicitly act on FIX.md
+    in a separate Claude Code session (see this repo's CLAUDE.md for the
+    retrieval instruction).
+    """
+    HOLDING_DIR.mkdir(parents=True, exist_ok=True)
+    path = HOLDING_DIR / "FIX.md"
+    dated = datetime.now(timezone.utc).isoformat()
+    section = f"## [{entry_id}] {category}: {headline}\n{dated}\n\n{body}\n\n"
+    with path.open("a", encoding="utf-8") as f:
+        f.write(section)
+
+
+def record_fix_entry(entry_id: str, category: str, headline: str, subsidiary_id: str, check_type: str) -> None:
+    _append("fix_entries.jsonl", {
+        "id": entry_id, "created_at": datetime.now(timezone.utc).isoformat(),
+        "category": category, "headline": headline, "subsidiary_id": subsidiary_id,
+        "check_type": check_type, "resolved": False, "resolved_at": None,
+        "telegram_notified_at": None,
+    })
+
+
+def read_unnotified_fix_entries() -> list:
+    return [e for e in _read("fix_entries.jsonl") if not e.get("resolved") and not e.get("telegram_notified_at")]
+
+
+def mark_fix_entries_notified(entry_ids: list) -> None:
+    if not entry_ids:
+        return
+    entries = _read("fix_entries.jsonl")
+    now = datetime.now(timezone.utc).isoformat()
+    for e in entries:
+        if e.get("id") in entry_ids:
+            e["telegram_notified_at"] = now
+    _write("fix_entries.jsonl", entries)
+
+
+def resolve_fix_entry(entry_id: str) -> tuple:
+    """Marks the sidecar record resolved and moves that entry's markdown
+    section out of the live FIX.md into a dated archive file, so FIX.md
+    stays lean and current instead of growing forever. Returns (ok, message)
+    for the Telegram confirmation.
+    """
+    entries = _read("fix_entries.jsonl")
+    idx = next((i for i, e in enumerate(entries) if e.get("id") == entry_id), None)
+    if idx is None:
+        return False, f"Kein FIX.md-Eintrag mit id '{entry_id}' gefunden."
+    if entries[idx].get("resolved"):
+        return False, f"{entry_id} ist bereits als geloest markiert."
+
+    fix_path = HOLDING_DIR / "FIX.md"
+    if fix_path.exists():
+        text = fix_path.read_text(encoding="utf-8")
+        header = f"## [{entry_id}]"
+        start = text.find(header)
+        if start != -1:
+            next_header = text.find("\n## [", start + 1)
+            section = text[start:] if next_header == -1 else text[start:next_header]
+            remainder = text[:start] + (text[next_header:] if next_header != -1 else "")
+            archive_path = HOLDING_DIR / f"FIX_resolved_{datetime.now(timezone.utc).date().isoformat()}.md"
+            with archive_path.open("a", encoding="utf-8") as f:
+                f.write(section)
+            fix_path.write_text(remainder, encoding="utf-8")
+
+    entries[idx]["resolved"] = True
+    entries[idx]["resolved_at"] = datetime.now(timezone.utc).isoformat()
+    _write("fix_entries.jsonl", entries)
+    return True, f"{entry_id}: als geloest markiert und archiviert."
+
 
 # --------------------------------------------------------------------------
 # Structured handoff: Sub-CEO -> Main-CEO (status report). Generalizes the
