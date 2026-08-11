@@ -42,6 +42,35 @@ anrichten oder den Scope stillschweigend erweitern können.
 - **Alles außerhalb dieses Repos** (andere Projekte, andere Railway-Services,
   E-Mails/Nachrichten an Dritte).
 
+## Regel-Wachstum bei Freigaben
+
+**Regel-Wachstum bei Freigaben.** Immer wenn eine Aktion eine
+Freigabe-Abfrage auslöst, die noch nicht durch eine `allow`-Regel in
+`.claude/settings.json` abgedeckt ist, und Jan sie genehmigt: nach der
+Genehmigung explizit fragen, ob diese Art von Aktion künftig dauerhaft
+erlaubt werden soll (z.B. "Soll ich `Bash(railway up:*)` dauerhaft
+erlauben?"). Bei Ja: die konkrete Regel sofort zu `.claude/settings.json`
+hinzufügen - als präzises Muster, das genau dem gerade genehmigten Fall
+entspricht, kein zu breiter Auffangposten (z.B. `Bash(railway up:*)`,
+nicht `Bash(*)`) - und diese Änderung committen, damit sie über Sessions
+hinweg bestehen bleibt, ohne dass Jan die Datei selbst manuell pflegen
+muss. Bei Nein: nicht hinzufügen, und beim nächsten Mal erneut fragen -
+ein "Nein" ist keine dauerhafte Ablehnung, nur ein "noch nicht".
+
+**Nie über diesen Weg eine `deny`-Regel aufweichen.** Wenn etwas, das Jan
+genehmigt, nur durch das Umgehen eines bestehenden `deny`-Eintrags möglich
+gewesen wäre, nicht anbieten, das als neue `allow`-Regel dauerhaft zu
+machen - das ist eine bewusste Grenze (Force-Push, Secrets,
+Ressourcen-Löschung) und braucht ein eigenes, explizites Gespräch über die
+Grenze selbst, keine beiläufige "soll ich mir das merken"-Nachfrage.
+
+**Präzise Muster statt breiter Kategorien bevorzugen.** Eine Regel sollte
+genau das abdecken, was tatsächlich gemacht wurde, nicht "gleich mal" eine
+größere Kategorie öffnen - die Allow-Liste wächst einen echten,
+beobachteten Bedarf nach dem anderen, dieselbe Disziplin, die an anderer
+Stelle in diesem Repo schon für `stage_justification`/Reasoning-Feld-
+Durchsetzung gilt: verdiente Spezifität, keine spekulative Breite.
+
 ## Warum diese Grenze so gezogen ist
 
 Reversible, lokale oder rein-lesende Aktionen kosten im schlimmsten Fall
