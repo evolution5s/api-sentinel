@@ -1087,7 +1087,33 @@ def write_hypothesis(hypothesis: str) -> str:
         hyps[existing_index] = merged
 
     _write_jsonl("hypotheses.jsonl", hyps)
-    return json.dumps({"ok": True, "id": patch["id"]})
+
+    # 2026-08-11 fix: closing orphaned task orders tied to a buried
+    # hypothesis used to depend entirely on an LLM instruction (task_ceo's
+    # bury step telling the Sub-CEO to call complete_task_order per open
+    # order) - which was never actually reliable (ceo_agent doesn't even
+    # have complete_task_order in its tool list, so that instruction was
+    # unexecutable as written) and would have needed to be followed
+    # correctly on every future bury, not just this one. Now mechanical:
+    # burying a hypothesis always closes its own open orders as part of
+    # the same write, regardless of which agent/instruction triggered it.
+    final_status = (record if existing_index is None else merged).get("status")
+    orders_auto_closed = 0
+    if final_status == "buried":
+        orders = _read_jsonl("task_orders.jsonl")
+        for o in orders:
+            if o.get("hypothesis_id") == patch["id"] and o.get("status") == "open":
+                o["status"] = "done"
+                o["result"] = f"auto-cancelled - hypothesis '{patch['id']}' was buried"
+                o["completed_at"] = datetime.now(timezone.utc).isoformat()
+                orders_auto_closed += 1
+        if orders_auto_closed:
+            _write_jsonl("task_orders.jsonl", orders)
+
+    response = {"ok": True, "id": patch["id"]}
+    if orders_auto_closed:
+        response["orders_auto_closed"] = orders_auto_closed
+    return json.dumps(response)
 
 
 def _count_pivot_attempts(hyps_by_id: dict, hypothesis_id: str) -> int:

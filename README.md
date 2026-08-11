@@ -1791,7 +1791,7 @@ Wichtige Eigenschaften:
   ausgeführt (lokal `1.15.9`, produktiv gepinnt `1.15.11`), da mehrere
   crewai-Verhaltensweisen (siehe Kapitel 10.6/10.7) versionsabhängig direkt
   im Quellcode verifiziert wurden statt angenommen.
-- Stand zuletzt: **298 Tests, 298/298 bestanden** auf beiden Versionen.
+- Stand zuletzt: **303 Tests, 303/303 bestanden** auf beiden Versionen.
   Zwei davon (`test_search_web_live_real_key_returns_real_results`,
   `test_search_web_then_read_webpage_live_pipeline`) sind echte Live-Smoke-
   Tests gegen die reale Serper.dev-API - sie überspringen sich selbst
@@ -2054,12 +2054,47 @@ eine Zusammenfassung; Exit-Code `0` nur wenn wirklich alles bestanden hat.
   an, statt sie stillschweigend zu verstecken - eine Anhäufung wird damit
   selbst zum sichtbaren Signal. 15 neue `checkup.py`-Tests (289 -> 298: 1
   Templating-Regressionstest, 2 für die Next-Action-Logik, 6 für die
-  Evidence-Stage-Migration, plus die bereits gezählten). Noch offen zum
-  Zeitpunkt dieses Commits: ob `hyp_bootstrap_001` im nächsten echten
-  Zyklus tatsächlich begraben und `order_ee8905ab` tatsächlich geschlossen
-  wird, ist erst nach dem nächsten realen Cron-Lauf mit diesem Fix live
-  bestätigbar (kein manuelles Sofort-Auslösen möglich, Kapitel 12.4) -
-  wird nachverfolgt, nicht hier vorweggenommen.
+  Evidence-Stage-Migration, plus die bereits gezählten). Zwei
+  Nachfolge-Fragen (siehe unten) waren zum Zeitpunkt dieses Commits noch
+  offen: warum der Absturz erst jetzt auftrat statt schon während der
+  ganzen bisherigen Session, und ob das Begraben einer Hypothese ihre
+  offenen Task-Orders wirklich in den Daten schließt oder sie nur aus der
+  Anzeige verschwinden lässt.
+- **Crash-Fix-Verifikations-Addendum (2026-08-11, direkte Fortsetzung):**
+  zwei Nachfolge-Fragen zum obigen Fix, mit echter Evidenz beantwortet,
+  nicht angenommen. **(1) Warum jetzt erst?** `git log -S` zeigt: die
+  Zeichenkette `lp_v{n}_{label}.html` existiert unverändert seit dem
+  allerersten substanziellen Commit dieses Projekts
+  (`1d73638`, 2026-08-05) - nicht neu. Aber `crew.kickoff(inputs=...)`
+  mit einem tatsächlich befüllten Inputs-Dict (`{"subsidiary_id": ...}`)
+  wurde erst mit `8c623ae` (2026-08-10, 09:30 UTC, das Multi-Subsidiary-
+  Addendum aus derselben Session) eingeführt - davor lief
+  `crew.kickoff()` ganz ohne `inputs`, und crewais eigener
+  Interpolationscode bricht früh ab, wenn `inputs` leer ist
+  (`if not inputs: return`) - Interpolation lief also in dieser ganzen
+  Session vorher **nie**, der Platzhalter lag die ganze Zeit inert im
+  Text. `8c623ae` aktivierte Interpolation zum ersten Mal überhaupt im
+  Leben dieses Projekts, und genau die beiden nächsten geplanten
+  Cron-Läufe danach (18:04, 20:02 UTC, beide nach dem 09:30-Uhr-Deploy)
+  waren die ersten beiden, die abstürzten - lückenlos konsistente
+  Zeitlinie, kein Widerspruch offen. **(2) Schließt Bury die Orders
+  wirklich, oder versteckt es sie nur?** Direkt im Code geprüft: nein,
+  vorher nicht wirklich - die einzige Kopplung war eine Freitext-
+  Anweisung in `task_ceo`s Bury-Schritt an den Sub-CEO, selbst
+  `complete_task_order` für jede offene Order aufzurufen; `ceo_agent`
+  hatte `complete_task_order` aber nie in seiner eigenen Tool-Liste
+  (`crew.py`, gegen `test_ceo_agent_tools_match_spec` verifiziert) - die
+  Anweisung war so, wie geschrieben, gar nicht ausführbar. Jetzt
+  mechanisch behoben: `write_hypothesis` schließt beim Setzen von
+  `status='buried'` selbst jede noch offene, an diese Hypothese gebundene
+  Task-Order (`status='done'`, `result` nennt den Grund) - unabhängig
+  davon, welcher Agent oder welche Anweisung das Bury ausgelöst hat, und
+  für jedes künftige Bury-Ereignis, nicht nur `hyp_bootstrap_001`. Echt
+  mit einem Vorher/Nachher-Check verifiziert (nicht angenommen): eine
+  offene Order vor dem Bury-Aufruf, `status='done'` mit einem `hyp_id`-
+  und `'buried'`-haltigen `result` danach, bereits erledigte Orders
+  bleiben unangetastet, Orders anderer Hypothesen bleiben unangetastet.
+  5 neue `checkup.py`-Tests (298 -> 303).
 - **Structural-Rebuild-Addendum (Entscheidungs-Framework, Bury Bootstrap,
   Research-Rigor, Reporting, Approvals):** der vollständige, konsolidierte
   Nachfolger der obigen Audit-Addendum-Punkte. Kernbefund:

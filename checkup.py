@@ -815,6 +815,105 @@ def test_write_hypothesis_bury_requires_reasoning():
     assert stored["status"] == "buried"
 
 
+# --- tools.py: burying a hypothesis auto-closes its own open task orders ---
+# 2026-08-11 fix: this used to depend entirely on an LLM instruction
+# (task_ceo's bury step telling the Sub-CEO to call complete_task_order per
+# open order) - and ceo_agent never actually had complete_task_order in its
+# tool list, so that instruction was unexecutable as written. Real
+# before/after checks on task_orders.jsonl, not an assumption that a fixed
+# display line means the underlying data is also fixed.
+
+def test_write_hypothesis_bury_auto_closes_its_own_open_orders():
+    reset_state()
+    tools.write_hypothesis.run(hypothesis=json.dumps(SAMPLE_HYP))
+    hyp_id = SAMPLE_HYP["id"]
+    filed = json.loads(tools.file_task_order.run(
+        to_role="growth", task_description="build landing page", context="ctx", hypothesis_id=hyp_id,
+    ))
+    order_id = filed["filed"]
+
+    before = next(o for o in json.loads(tools.read_task_orders.run(to_role="growth")) if o["id"] == order_id)
+    assert before["status"] == "open"
+
+    result = json.loads(tools.write_hypothesis.run(hypothesis=json.dumps({
+        "id": hyp_id, "status": "buried", "outcome": "bury", "bury_reasoning": "real reason",
+    })))
+    assert result.get("ok") is True
+    assert result.get("orders_auto_closed") == 1
+
+    after = next(o for o in json.loads(tools.read_task_orders.run(to_role="growth")) if o["id"] == order_id)
+    assert after["status"] == "done"
+    assert hyp_id in after["result"] and "buried" in after["result"]
+    assert after.get("completed_at")
+
+
+def test_write_hypothesis_bury_closes_multiple_open_orders_across_roles():
+    reset_state()
+    tools.write_hypothesis.run(hypothesis=json.dumps(SAMPLE_HYP))
+    hyp_id = SAMPLE_HYP["id"]
+    tools.file_task_order.run(to_role="growth", task_description="a", context="ctx", hypothesis_id=hyp_id)
+    tools.file_task_order.run(to_role="growth", task_description="b", context="ctx", hypothesis_id=hyp_id)
+
+    result = json.loads(tools.write_hypothesis.run(hypothesis=json.dumps({
+        "id": hyp_id, "status": "buried", "outcome": "bury", "bury_reasoning": "real reason",
+    })))
+    assert result.get("orders_auto_closed") == 2
+    orders = [o for o in json.loads(tools.read_task_orders.run(to_role="growth")) if o["hypothesis_id"] == hyp_id]
+    assert all(o["status"] == "done" for o in orders)
+
+
+def test_write_hypothesis_bury_does_not_touch_other_hypotheses_orders():
+    reset_state()
+    tools.write_hypothesis.run(hypothesis=json.dumps(SAMPLE_HYP))
+    other = {**SAMPLE_HYP, "id": "hyp_other", "prior_hypothesis_id": None}
+    tools.write_hypothesis.run(hypothesis=json.dumps(other))
+    other_order = json.loads(tools.file_task_order.run(
+        to_role="growth", task_description="unrelated order", context="ctx", hypothesis_id="hyp_other",
+    ))["filed"]
+
+    tools.write_hypothesis.run(hypothesis=json.dumps({
+        "id": SAMPLE_HYP["id"], "status": "buried", "outcome": "bury", "bury_reasoning": "real reason",
+    }))
+
+    untouched = next(o for o in json.loads(tools.read_task_orders.run(to_role="growth")) if o["id"] == other_order)
+    assert untouched["status"] == "open"
+
+
+def test_write_hypothesis_bury_does_not_overwrite_already_done_orders():
+    reset_state()
+    tools.write_hypothesis.run(hypothesis=json.dumps(SAMPLE_HYP))
+    hyp_id = SAMPLE_HYP["id"]
+    order_id = json.loads(tools.file_task_order.run(
+        to_role="growth", task_description="already handled", context="ctx", hypothesis_id=hyp_id,
+    ))["filed"]
+    tools.complete_task_order.run(order_id=order_id, result="real PR merged")
+
+    result = json.loads(tools.write_hypothesis.run(hypothesis=json.dumps({
+        "id": hyp_id, "status": "buried", "outcome": "bury", "bury_reasoning": "real reason",
+    })))
+    assert result.get("orders_auto_closed") is None  # nothing was open to close
+
+    order = next(o for o in json.loads(tools.read_task_orders.run(to_role="growth")) if o["id"] == order_id)
+    assert order["result"] == "real PR merged"  # untouched, not overwritten
+
+
+def test_write_hypothesis_non_bury_update_does_not_close_orders():
+    reset_state()
+    tools.write_hypothesis.run(hypothesis=json.dumps(SAMPLE_HYP))
+    hyp_id = SAMPLE_HYP["id"]
+    order_id = json.loads(tools.file_task_order.run(
+        to_role="growth", task_description="still relevant", context="ctx", hypothesis_id=hyp_id,
+    ))["filed"]
+
+    result = json.loads(tools.write_hypothesis.run(hypothesis=json.dumps({
+        "id": hyp_id, "evidence_stage": "community_engagement",
+    })))
+    assert result.get("orders_auto_closed") is None
+
+    order = next(o for o in json.loads(tools.read_task_orders.run(to_role="growth")) if o["id"] == order_id)
+    assert order["status"] == "open"
+
+
 def test_write_hypothesis_pivot_followup_requires_variable_and_reasoning():
     reset_state()
     _seed_testing_channel("reddit")
