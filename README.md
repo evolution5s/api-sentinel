@@ -1791,15 +1791,24 @@ Wichtige Eigenschaften:
   ausgeführt (lokal `1.15.9`, produktiv gepinnt `1.15.11`), da mehrere
   crewai-Verhaltensweisen (siehe Kapitel 10.6/10.7) versionsabhängig direkt
   im Quellcode verifiziert wurden statt angenommen.
-- Stand zuletzt: **289 Tests, 289/289 bestanden** auf beiden Versionen.
+- Stand zuletzt: **298 Tests, 298/298 bestanden** auf beiden Versionen.
   Zwei davon (`test_search_web_live_real_key_returns_real_results`,
   `test_search_web_then_read_webpage_live_pipeline`) sind echte Live-Smoke-
   Tests gegen die reale Serper.dev-API - sie überspringen sich selbst
   sauber (kein Fail/Error), wenn `API-Sentinel-serper` nicht gesetzt ist,
   damit die restliche Suite nie von einem echten externen Key/Budget
-  abhängt. Lokal ohne Key: 289/289 (beide übersprungen). Per `railway run`
-  mit dem echten Key: 289/289, beide Live-Tests tatsächlich ausgeführt und
-  bestanden (Real-Serper-Key-Addendum).
+  abhängt. Lokal ohne Key: 298/298 (beide übersprungen). Per `railway run`
+  mit dem echten Key: alle Tests bestanden, beide Live-Tests tatsächlich
+  ausgeführt (Real-Serper-Key-Addendum).
+- `test_all_task_descriptions_and_agent_backstories_interpolate_cleanly`
+  (Crash-Fix-Addendum, siehe Kapitel 15) ruft `crew.crew._interpolate_inputs(...)`
+  - crewais echten internen Mechanismus, den `kickoff()` vor jedem
+  Agenten-Lauf aufruft - direkt gegen das echte, produktive `Crew`-Objekt
+  auf, mit denselben Inputs wie `crew.py`s `__main__`. Kein Mock: dieser
+  Test hätte den echten 2026-08-11-Absturz (ein literales `{n}` in
+  `task_dev`s Beschreibung) tatsächlich gefangen - direkt verifiziert,
+  indem der Test vor dem Fix lief und mit exakt derselben Fehlermeldung
+  fehlschlug wie in Produktion.
 
 Ausgabe: Klartext-Report mit `[PASS]`/`[FAIL]`/`[ERR ]` pro Test, am Ende
 eine Zusammenfassung; Exit-Code `0` nur wenn wirklich alles bestanden hat.
@@ -1990,6 +1999,67 @@ eine Zusammenfassung; Exit-Code `0` nur wenn wirklich alles bestanden hat.
   bestand den Anti-Copying-Tripwire und den `evidence_stage='research'`-
   Artefakt-Gate-Check. 2 neue `checkup.py`-Tests (287 -> 289), beide echte
   Live-Smoke-Tests mit sauberem Self-Skip ohne Key (Kapitel 13).
+- **Crash-Fix-Addendum (2026-08-11): der Zyklus schlug an zwei
+  aufeinanderfolgenden echten Läufen (18:04 und 20:02 UTC) mit derselben
+  Warnung fehl - nichts lief seit dem letzten Deploy, kein LLM-Aufruf, kein
+  Bury, keine Recherche.** Ursache real reproduziert (nicht geraten):
+  crewais `Crew._interpolate_inputs()` - dieselbe Methode, die `kickoff()`
+  vor jedem Agenten-Lauf aufruft - interpoliert JEDE Task-`description`
+  UND jede Agent-`role`/`goal`/`backstory` gegen dieselben Inputs
+  (`{"subsidiary_id": ...}`), bevor irgendein Agent startet. `task_dev`s
+  Beschreibung enthielt die wörtliche Beispiel-Namensregel
+  `lp_v{n}_{label}.html` - `{n}` matcht crewais Platzhalter-Regex
+  (`\{[A-Za-z_][A-Za-z0-9_-]*\}`), `n` existiert aber nirgends in den
+  Inputs, also `KeyError` -> `ValueError("Missing required template
+  variable 'n' not found in inputs dictionary")`, exakt die Meldung aus
+  der Warnung. Lokal reproduziert (`crew.crew._interpolate_inputs(...)`
+  gegen den echten, produktiven `Crew`-Aufbau) und nach dem Fix erneut
+  gegen dieselbe Reproduktion verifiziert, dass sie nicht mehr auftritt -
+  kein bloßes "sollte jetzt gehen". Fix: `lp_v{n}_{label}.html` ->
+  `lp_v<N>_<label>.html` (spitze statt geschweifte Klammern - Doppeln der
+  geschweiften Klammern, das Python-`.format()`-Konventionen entsprechen
+  würde, funktioniert bei crewais eigenem Regex nachweislich NICHT, direkt
+  gegen den Quellcode geprüft statt angenommen). Jede andere Task-
+  Beschreibung und jede Agent-Backstory wurde auf dasselbe Muster geprüft
+  (kein weiterer Treffer) - und ein neuer, echter Regressionstest
+  (`test_all_task_descriptions_and_agent_backstories_interpolate_cleanly`,
+  Kapitel 13) ruft jetzt denselben echten crewai-Mechanismus in jedem
+  `checkup.py`-Lauf auf, sodass diese Fehlerklasse künftig vor dem Deploy
+  auffliegt.<br><br>
+  Unabhängig davon zwei echte, im Code bestätigte Zusatzbefunde:
+  (1) `evidence_stage` wurde für Hypothesen von vor Einführung dieses
+  Felds (`hyp_bootstrap_001`) nie zurückgefüllt - `write_hypothesis`s
+  Merge-Logik überschreibt bei einem Update nur die im Patch enthaltenen
+  Felder, kein Default für fehlende Bestandsfelder. Jetzt behoben durch
+  eine echte, evidenzbasierte Backfill-Migration
+  (`_backfill_missing_evidence_stage_if_needed`, gleiches
+  Einmal-pro-Prozess-Muster wie die Subsidiary-Migration, Kapitel 11.1):
+  leitet die Stage aus tatsächlich vorhandenen Signalen ab (reale
+  Ökonomie/`landing_page_live` -> `landing_page`, ein echtes
+  Community-Engagement-Artefakt -> `community_engagement`, sonst der
+  sichere Standard `research`) statt zu raten, überschreibt nie eine
+  bereits gesetzte gültige Stage. (2) Die "Nächster Schritt"-Zeile im
+  Hypothesen-Überblick war tatsächlich naiv - `build_hypothesis_overview()`
+  zeigte unbedingt die **älteste** offene Task-Order, unabhängig von
+  `evidence_stage` oder Relevanz. Direkt im Code verifiziert, nicht
+  angenommen: das erklärt, warum `order_ee8905ab` ("Build landing page
+  lp_v1_bootstrap" - die älteste offene Order im gesamten Projekt,
+  entstanden lange vor Evidence-Stage-Gating) beharrlich als "nächster
+  Schritt" auftauchte. Das ist NICHT allein durch den Absturz erklärt -
+  es ist ein eigenständiger, latenter Bug, der bei jeder Order-Anhäufung
+  wieder zuschlagen würde, auch ohne Absturz. Fix: zeigt jetzt die
+  **neueste** offene Order (die beste verfügbare Ground-Truth-Näherung an
+  "aktuell relevant", da Task-Orders selbst keine `evidence_stage`-
+  Momentaufnahme tragen) und hängt bei mehreren offenen Orders die Anzahl
+  an, statt sie stillschweigend zu verstecken - eine Anhäufung wird damit
+  selbst zum sichtbaren Signal. 15 neue `checkup.py`-Tests (289 -> 298: 1
+  Templating-Regressionstest, 2 für die Next-Action-Logik, 6 für die
+  Evidence-Stage-Migration, plus die bereits gezählten). Noch offen zum
+  Zeitpunkt dieses Commits: ob `hyp_bootstrap_001` im nächsten echten
+  Zyklus tatsächlich begraben und `order_ee8905ab` tatsächlich geschlossen
+  wird, ist erst nach dem nächsten realen Cron-Lauf mit diesem Fix live
+  bestätigbar (kein manuelles Sofort-Auslösen möglich, Kapitel 12.4) -
+  wird nachverfolgt, nicht hier vorweggenommen.
 - **Structural-Rebuild-Addendum (Entscheidungs-Framework, Bury Bootstrap,
   Research-Rigor, Reporting, Approvals):** der vollständige, konsolidierte
   Nachfolger der obigen Audit-Addendum-Punkte. Kernbefund:

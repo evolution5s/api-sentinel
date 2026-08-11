@@ -1808,6 +1808,115 @@ def test_write_hypothesis_evidence_stage_rejects_invalid_value():
     assert "error" in result
 
 
+# --- tools.py: evidence_stage backfill for pre-existing hypotheses ---------
+# 2026-08-11 fix: a hypothesis written before evidence_stage existed as a
+# field (hyp_bootstrap_001) just has it missing, which the rest of the
+# gating logic isn't designed to handle. Each test uses its own never-
+# before-touched subsidiary_id so tools._MIGRATED_EVIDENCE_STAGE's
+# per-process cache can't mask the backfill not running.
+
+def _write_raw_legacy_hypothesis(sub_id, record):
+    tools.set_active_subsidiary(sub_id)
+    tools.write_jsonl(tools._subsidiary_dir(), "hypotheses.jsonl", [record])
+
+
+def test_backfill_evidence_stage_infers_landing_page_from_real_economics():
+    reset_state()
+    try:
+        legacy = {
+            **SAMPLE_HYP, "id": "hyp_legacy_econ", "status": "active",
+            "estimated_build_cost": 5.0,
+            "build_cost_reasoning": "real, hypothesis-specific cost breakdown",
+        }
+        legacy.pop("evidence_stage", None)
+        _write_raw_legacy_hypothesis("legacy_test_econ", legacy)
+        hyps = json.loads(tools.read_hypotheses.run())
+        entry = next(h for h in hyps if h["id"] == "hyp_legacy_econ")
+        assert entry["evidence_stage"] == "landing_page"
+    finally:
+        tools.set_active_subsidiary("api-sentinel")
+
+
+def test_backfill_evidence_stage_infers_landing_page_from_live_flag():
+    reset_state()
+    try:
+        legacy = {**SAMPLE_HYP, "id": "hyp_legacy_live", "status": "active", "landing_page_live": True}
+        legacy.pop("evidence_stage", None)
+        _write_raw_legacy_hypothesis("legacy_test_live", legacy)
+        hyps = json.loads(tools.read_hypotheses.run())
+        entry = next(h for h in hyps if h["id"] == "hyp_legacy_live")
+        assert entry["evidence_stage"] == "landing_page"
+    finally:
+        tools.set_active_subsidiary("api-sentinel")
+
+
+def test_backfill_evidence_stage_infers_community_engagement_from_real_artifact():
+    reset_state()
+    try:
+        sub_id = "legacy_test_community"
+        tools.set_active_subsidiary(sub_id)
+        legacy = {
+            **SAMPLE_HYP, "id": "hyp_legacy_community", "status": "active",
+            "estimated_build_cost": None, "build_cost_reasoning": None,
+        }
+        legacy.pop("evidence_stage", None)
+        tools.write_jsonl(tools._subsidiary_dir(), "hypotheses.jsonl", [legacy])
+        tools.write_jsonl(tools._subsidiary_dir(), "content_drafts.jsonl", [{
+            "id": "draft_legacy_1", "hypothesis_id": "hyp_legacy_community",
+            "post_type": "thread_reply", "status": "posted",
+        }])
+        hyps = json.loads(tools.read_hypotheses.run())
+        entry = next(h for h in hyps if h["id"] == "hyp_legacy_community")
+        assert entry["evidence_stage"] == "community_engagement"
+    finally:
+        tools.set_active_subsidiary("api-sentinel")
+
+
+def test_backfill_evidence_stage_falls_back_to_research_with_no_signal():
+    reset_state()
+    try:
+        legacy = {
+            **SAMPLE_HYP, "id": "hyp_legacy_none", "status": "active",
+            "estimated_build_cost": None, "build_cost_reasoning": None,
+        }
+        legacy.pop("evidence_stage", None)
+        _write_raw_legacy_hypothesis("legacy_test_none", legacy)
+        hyps = json.loads(tools.read_hypotheses.run())
+        entry = next(h for h in hyps if h["id"] == "hyp_legacy_none")
+        assert entry["evidence_stage"] == "research"
+    finally:
+        tools.set_active_subsidiary("api-sentinel")
+
+
+def test_backfill_evidence_stage_never_overwrites_an_existing_valid_stage():
+    reset_state()
+    try:
+        legacy = {**SAMPLE_HYP, "id": "hyp_legacy_already_set", "status": "active", "evidence_stage": "build"}
+        _write_raw_legacy_hypothesis("legacy_test_already_set", legacy)
+        hyps = json.loads(tools.read_hypotheses.run())
+        entry = next(h for h in hyps if h["id"] == "hyp_legacy_already_set")
+        assert entry["evidence_stage"] == "build"
+    finally:
+        tools.set_active_subsidiary("api-sentinel")
+
+
+def test_backfill_evidence_stage_persists_after_backfill():
+    # Confirms the inferred stage is actually written back to disk, not
+    # just computed transiently for one read.
+    reset_state()
+    try:
+        legacy = {**SAMPLE_HYP, "id": "hyp_legacy_persist", "status": "active", "landing_page_live": True}
+        legacy.pop("evidence_stage", None)
+        sub_id = "legacy_test_persist"
+        _write_raw_legacy_hypothesis(sub_id, legacy)
+        tools.read_hypotheses.run()  # triggers the backfill
+        raw = tools.read_jsonl(tools._subsidiary_dir(), "hypotheses.jsonl")
+        entry = next(h for h in raw if h["id"] == "hyp_legacy_persist")
+        assert entry["evidence_stage"] == "landing_page"
+    finally:
+        tools.set_active_subsidiary("api-sentinel")
+
+
 def test_write_hypothesis_evidence_stage_full_progression_with_real_artifacts():
     # The real end-to-end path (structural-rebuild addendum, sections 3-4):
     # research (with plan fields) -> a substantive research artifact ->
@@ -1998,6 +2107,38 @@ def test_build_hypothesis_overview_no_findings_yet():
     tools.write_hypothesis.run(hypothesis=json.dumps(SAMPLE_HYP))
     entry = tools.build_hypothesis_overview()[0]
     assert entry["latest_finding"] == "keine Erkenntnis geloggt"
+
+
+def test_build_hypothesis_overview_next_action_prefers_newest_open_order():
+    # 2026-08-11 regression: next_action used to surface the OLDEST open
+    # order regardless of relevance (exactly how a stale, pre-evidence-
+    # stage-gating order like order_ee8905ab kept showing up as "next
+    # step" for a hypothesis whose actual state had long since moved on).
+    # A genuinely new, more-relevant order must win over an old one.
+    reset_state()
+    tools.write_hypothesis.run(hypothesis=json.dumps(SAMPLE_HYP))
+    tools.file_task_order.run(
+        to_role="growth", task_description="OLD stale order", context="ctx",
+        hypothesis_id=SAMPLE_HYP["id"],
+    )
+    tools.file_task_order.run(
+        to_role="growth", task_description="NEW real next step", context="ctx",
+        hypothesis_id=SAMPLE_HYP["id"],
+    )
+    entry = tools.build_hypothesis_overview()[0]
+    assert entry["next_action"].startswith("NEW real next step")
+
+
+def test_build_hypothesis_overview_next_action_surfaces_pileup_count():
+    reset_state()
+    tools.write_hypothesis.run(hypothesis=json.dumps(SAMPLE_HYP))
+    for i in range(3):
+        tools.file_task_order.run(
+            to_role="growth", task_description=f"order {i}", context="ctx",
+            hypothesis_id=SAMPLE_HYP["id"],
+        )
+    entry = tools.build_hypothesis_overview()[0]
+    assert "+2 weitere offene Order" in entry["next_action"]
 
 
 # --- tools.py: cross-cycle continuity + usage log ---------------------------
@@ -3336,6 +3477,36 @@ def test_only_first_task_is_unconditional():
     for task in (crew.task_growth, crew.task_ceo, crew.task_main_ceo_review, crew.task_dev):
         assert isinstance(task, ConditionalTask)
         assert task.condition is crew._within_cycle_budget
+
+
+def test_all_task_descriptions_and_agent_backstories_interpolate_cleanly():
+    # Real-world regression for the 2026-08-11 crash: crewai's own
+    # kickoff() calls exactly this method (crew._interpolate_inputs) on the
+    # real Crew before running any agent - it interpolates every task's
+    # description/expected_output/output_file AND every agent's
+    # role/goal/backstory against the same inputs dict crew.py passes
+    # (only {"subsidiary_id": ...}). A literal, unintended {word} anywhere
+    # in any of those strings (e.g. the "lp_v{n}_{label}.html" naming-
+    # pattern example that actually crashed production) crashes the entire
+    # cycle before a single LLM call - no mock, this exercises the real
+    # crewai interpolation path against the real production Crew object
+    # built by crew.py.
+    tasks = list(crew.crew.tasks)
+    agents = list(crew.crew.agents)
+    task_originals = [(t, t.description, t.expected_output, t.output_file) for t in tasks]
+    agent_originals = [(a, a.role, a.goal, a.backstory) for a in agents]
+    try:
+        crew.crew._interpolate_inputs({"subsidiary_id": "api-sentinel"})
+    except Exception as exc:
+        raise AssertionError(
+            "a task description or agent backstory contains a literal "
+            f"{{placeholder}} crewai tried to interpolate and failed: {exc}"
+        )
+    finally:
+        for t, description, expected_output, output_file in task_originals:
+            t.description, t.expected_output, t.output_file = description, expected_output, output_file
+        for a, role, goal, backstory in agent_originals:
+            a.role, a.goal, a.backstory = role, goal, backstory
 
 
 def test_cycle_token_budget_gate_allows_under_budget():

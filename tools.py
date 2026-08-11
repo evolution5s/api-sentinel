@@ -269,6 +269,8 @@ def _append_jsonl(filename: str, record: dict) -> None:
 
 def _read_jsonl(filename: str) -> list:
     _migrate_legacy_file_if_needed(filename)
+    if filename == "hypotheses.jsonl":
+        _backfill_missing_evidence_stage_if_needed()
     return read_jsonl(_subsidiary_dir(), filename)
 
 
@@ -326,6 +328,61 @@ def _has_approved_stage_skip(hypothesis_id: str, target_stage: str) -> bool:
         and r.get("status") == "approved"
         for r in requests
     )
+
+
+# --------------------------------------------------------------------------
+# evidence_stage backfill for pre-existing hypotheses (2026-08-11 fix).
+# evidence_stage became a required field in the structural-rebuild
+# addendum, but that only enforces it going forward on write_hypothesis -
+# a hypothesis written before the field existed (hyp_bootstrap_001) just
+# has it missing/None on the record itself, which the rest of the gating
+# logic (EVIDENCE_STAGES membership checks throughout this file) isn't
+# designed to handle. Same one-time-per-process pattern as
+# _migrate_legacy_file_if_needed above: infer a real stage from actual
+# signals already on/around the record - never a blind guess - and
+# persist it, rather than leaving it unset indefinitely.
+# --------------------------------------------------------------------------
+
+_MIGRATED_EVIDENCE_STAGE: set = set()
+
+
+def _infer_legacy_evidence_stage(hypothesis: dict) -> str:
+    """Ground-truth inference, not a guess: a hypothesis with real
+    economics already computed (estimated_build_cost + build_cost_
+    reasoning) or a live landing page was clearly already operating past
+    community_engagement under the old, pre-evidence-stage flat model -
+    exactly hyp_bootstrap_001's actual history. Otherwise fall back
+    through whatever real artifacts exist, and 'research' (the earliest
+    stage, unlocking no later-stage gate it hasn't earned) if none do.
+    """
+    if hypothesis.get("landing_page_live") or (
+        hypothesis.get("estimated_build_cost") is not None
+        and (hypothesis.get("build_cost_reasoning") or "").strip()
+    ):
+        return "landing_page"
+    if _has_real_community_engagement_artifact(hypothesis.get("id")):
+        return "community_engagement"
+    return "research"
+
+
+def _backfill_missing_evidence_stage_if_needed() -> None:
+    key = _active_subsidiary_id
+    if key in _MIGRATED_EVIDENCE_STAGE:
+        return
+    _MIGRATED_EVIDENCE_STAGE.add(key)
+    hyps = read_jsonl(_subsidiary_dir(), "hypotheses.jsonl")
+    changed = False
+    for h in hyps:
+        if h.get("evidence_stage") in EVIDENCE_STAGES:
+            continue
+        h["evidence_stage"] = _infer_legacy_evidence_stage(h)
+        changed = True
+    if changed:
+        write_jsonl(_subsidiary_dir(), "hypotheses.jsonl", hyps)
+        print(
+            f"[api-sentinel] backfilled evidence_stage on legacy hypothesis "
+            f"record(s) for '{_active_subsidiary_id}'"
+        )
 
 
 # --------------------------------------------------------------------------
@@ -2202,10 +2259,21 @@ def send_telegram_message(text: str, parse_mode: str = None) -> None:
 def build_hypothesis_overview() -> list:
     """One entry per active hypothesis: id, evidence_stage, a one-line
     status, the most recent logged research finding (or an honest "none
-    yet"), and the next concrete action (its oldest open task order, or
-    "none open"). Never fabricates - every field traces to an actual
-    record, same ground-truth discipline as everything else this system
-    reports.
+    yet"), and the next concrete action. Never fabricates - every field
+    traces to an actual record, same ground-truth discipline as everything
+    else this system reports.
+
+    next_action is the MOST RECENTLY filed open task order, not the
+    oldest (2026-08-11 fix: task orders have no evidence_stage snapshot on
+    them, so there's no reliable way to tell whether an old open order is
+    still valid for a hypothesis's current stage - but an order's own
+    recency is at least a real, ground-truth signal, and is a strictly
+    better default than surfacing whatever happens to have been open
+    longest, which can be an order from a stage the hypothesis has since
+    moved past, or from before evidence-stage gating existed at all. If
+    more than one order is open, the count is appended rather than
+    silently hidden - orders piling up unclosed is itself a real signal,
+    not something this function should paper over.
     """
     findings = _read_jsonl("research_findings.jsonl")
     orders = _read_jsonl("task_orders.jsonl")
@@ -2223,7 +2291,12 @@ def build_hypothesis_overview() -> list:
             (o for o in orders if o.get("hypothesis_id") == hyp_id and o.get("status") == "open"),
             key=lambda o: o.get("created_at") or "",
         )
-        next_action = open_orders[0]["task_description"][:140] if open_orders else "keine offene Task-Order"
+        if open_orders:
+            next_action = open_orders[-1]["task_description"][:140]
+            if len(open_orders) > 1:
+                next_action += f" (+{len(open_orders) - 1} weitere offene Order(n))"
+        else:
+            next_action = "keine offene Task-Order"
         overview.append({
             "id": hyp_id,
             "evidence_stage": h.get("evidence_stage") or "(nicht gesetzt)",
