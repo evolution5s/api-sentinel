@@ -4046,6 +4046,22 @@ def test_generate_fix_diagnosis_parses_structured_response():
     assert "CONFIDENCE_CAVEAT" in diagnosis["body"]
 
 
+def test_fix_llm_uses_opus_5_and_is_independent_of_agent_profile():
+    # Structural check, not a real API call: checkup.py deliberately never
+    # spends real Anthropic credits (see this file's own module docstring),
+    # so this confirms crew.fix_llm is genuinely wired to claude-opus-5 and
+    # is a distinct LLM instance from the four AGENT_PROFILE-driven agents,
+    # without actually calling it. generate_fix_diagnosis's own logic is
+    # covered separately (test_generate_fix_diagnosis_*) via an injected
+    # llm_call fake, so the real call path is real but never charged in
+    # this suite.
+    assert crew.fix_llm.model == "claude-opus-5"
+    assert crew.fix_llm is not crew.ceo_llm
+    assert crew.fix_llm is not crew.main_ceo_llm
+    rates = pricing.get_pricing("claude-opus-5", date(2026, 8, 11))
+    assert rates["output"] == 25.0
+
+
 def test_generate_fix_diagnosis_falls_back_when_call_fails():
     def _boom(prompt):
         raise RuntimeError("api down")
@@ -4181,6 +4197,73 @@ def test_aufsichtsrat_lines_kaizen_new_count():
     joined = "\n".join(lines)
     assert "2 neue Kaizen-Vorschlaege" in joined
     assert "kaizen_suggestions.jsonl" in joined
+
+
+# --------------------------------------------------------------------------
+# Payment-propensity-and-size research (addendum Part 3).
+# --------------------------------------------------------------------------
+
+def test_payment_propensity_staleness_constant_is_defined():
+    assert tools.PAYMENT_PROPENSITY_STALENESS_DAYS == 90
+
+
+def test_write_knowledge_entry_payment_propensity_channel_roundtrip():
+    reset_state()
+    result = json.loads(tools.write_knowledge_entry.run(
+        topic="payment propensity scan", channel="reddit_quantfinance", confidence="moderate",
+        source_hypothesis_ids=json.dumps(["hyp_pp_test"]),
+        takeaway="~1200 members, real evidence some pay ~$50/mo for a signal Discord - worth testing.",
+    ))
+    assert result["ok"] is True
+
+    stored = json.loads(tools.read_knowledge_base.run(channel="reddit_quantfinance"))
+    assert len(stored) == 1
+    assert stored[0]["topic"] == "payment propensity scan"
+    assert "$50/mo" in stored[0]["takeaway"]
+
+    other_channel = json.loads(tools.read_knowledge_base.run(channel="reddit_algotrading"))
+    assert other_channel == [], "must be scoped per channel, not shared across channels"
+
+    by_topic = json.loads(tools.read_knowledge_base.run(topic="payment propensity"))
+    assert len(by_topic) == 1
+
+
+def test_payment_propensity_scan_live_reddit_algotrading():
+    # Live smoke test - self-skips gracefully without a real Serper key,
+    # same convention as test_search_web_then_read_webpage_live_pipeline.
+    # Demonstrates the actual Part 3 flow end to end: a real search_web
+    # scan of r/algotrading's payment culture, written as a real
+    # knowledge_base entry in THIS TEST'S OWN scratch STATE_DIR (never
+    # production state - checkup.py's SCRATCH_DIR override applies
+    # regardless of how this script is invoked, including via `railway
+    # run -- python checkup.py`).
+    reset_state()
+    if not os.environ.get("API-Sentinel-serper"):
+        print("    (skipped - API-Sentinel-serper not set in this environment)")
+        return
+    search_result = json.loads(tools.search_web.run(
+        query="r/algotrading reddit paid trading bot signals subscription price", num_results=10
+    ))
+    assert "results" in search_result, search_result
+    snippets = " | ".join(
+        f"{r.get('title', '')}: {r.get('snippet', '')}" for r in search_result["results"]
+    )
+    takeaway = (
+        "Live payment-propensity scan of r/algotrading via search_web "
+        f"(reddit.com pages return an anti-bot block in this environment, "
+        "so full-page reads aren't available here - this is based on real "
+        "search snippets only). Raw snippets: "
+        f"{snippets[:600] if snippets else '(no results returned for this query)'}"
+    )
+    result = json.loads(tools.write_knowledge_entry.run(
+        topic="payment propensity scan", channel="reddit_algotrading", confidence="low",
+        source_hypothesis_ids=json.dumps(["hyp_live_payment_propensity_scan"]), takeaway=takeaway,
+    ))
+    assert result["ok"] is True
+
+    stored = json.loads(tools.read_knowledge_base.run(channel="reddit_algotrading"))
+    assert len(stored) == 1
+    print(f"    r/algotrading payment-propensity live scan: {takeaway[:400]}")
 
 
 def main():

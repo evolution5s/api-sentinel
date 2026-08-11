@@ -111,6 +111,13 @@ EVIDENCE_LATER_STAGES = {"landing_page", "build"}
 # BUILD_COST_JUSTIFICATION_MIN_LENGTH below: a one-liner doesn't qualify as
 # "here's what was actually found."
 RESEARCH_FINDING_MIN_LENGTH = 80
+# Payment-propensity-and-size addendum (Part 3): how long a channel's
+# knowledge_base payment-propensity verdict (topic="payment propensity
+# scan") stays reusable before a fresh scan is worth the tokens. A cache-
+# freshness knob, not a decision with real consequences the way duration
+# caps/FIX thresholds are - deliberately a plain constant, not a third
+# parallel Telegram-confirmable governance parameter.
+PAYMENT_PROPENSITY_STALENESS_DAYS = 90
 # A community_engagement-stage artifact must be one of these post_types
 # (section 4) - an actual thread reply or a genuine question post, not
 # passive lurking.
