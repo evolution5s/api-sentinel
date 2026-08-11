@@ -917,6 +917,111 @@ Obergrenze-Zahl kommt. Solange die Bestätigung noch aussteht, taucht sie
 im Zyklus-Report unter "Für den Aufsichtsrat" auf (Kapitel 9.6), bis sie
 entschieden ist.
 
+### 5.14 Zahlungsbereitschafts-und-Größe-Scan (Payment-Propensity)
+
+**Die Lücke, die dieser Scan schließt:** Jede bisherige Recherche
+validiert, ob *ein konkretes Problem* real ist - nie die vorgelagerte,
+allgemeinere Frage, ob diese Nische/Community überhaupt ein echtes Muster
+zeigt, für Tools/Services zu bezahlen, unabhängig von der konkreten
+Hypothese. Direkt motiviert durch Jans eigene Einschätzung zu
+r/algotrading: starker Open-Source-/DIY-Kultur-Eindruck, kein sichtbares
+Zahlungsmuster für Add-ons - ein Marktsignal, das bisher nie systematisch
+erhoben wurde. Größe allein ist **nicht** das Signal - eine kleine
+Audience mit starker, hochpreisiger Zahlungsbereitschaft kann genauso
+attraktiv sein wie eine große mit schwacher, weil ein hoher genug
+Preispunkt den Break-even schon mit einer Handvoll Kunden erreicht. Erst
+Größe **kombiniert mit** tatsächlich beobachteter Zahlungsbereitschaft ist
+das eigentliche Signal.
+
+**Wann er läuft:** Einmal pro Channel (nicht pro Hypothese), bevor die
+hypothesenspezifische Recherche aus Kapitel 5.11 beginnt, sobald eine
+Hypothese `evidence_stage='research'` für einen Channel erreicht, der noch
+keinen aktuellen Scan hat. `read_knowledge_base(channel=..., topic='payment
+propensity')` prüft zuerst die Wissensbasis - existiert bereits ein
+Eintrag, der nicht älter als `tools.PAYMENT_PROPENSITY_STALENESS_DAYS` (90
+Tage, bewusst ein einfacher Konstantenwert statt eines dritten,
+Telegram-bestätigten Governance-Parameters neben Zeitbox-Policy/
+FIX-Thresholds - eine Cache-Frische-Einstellung, keine Entscheidung mit
+echten Konsequenzen) ist, wird er wiederverwendet statt erneut zu scannen.
+
+**Was gesucht wird:** Eine breite Suche über die **gesamte** Community
+(bewusst nicht auf die konkrete Hypothesenfrage verengt), über `search_web`/
+`read_webpage` (Kapitel 5.11), nach realen, konkreten Signalen in beide
+Richtungen:
+
+- **Bestätigend:** echte Belege, dass Leute für Trading-Bot-as-a-Service,
+  bezahlte Signal-/Discord-Gruppen, bezahlte Datenfeeds, Premium-Exchange-
+  Stufen, bezahlte Indikatoren/Marktplätze oder bezahlte Backtesting-
+  Plattformen tatsächlich zahlen - inklusive grober Preispunkte, wo
+  auffindbar (z.B. "$30/Monat Signal-Gruppe").
+- **Widerlegend:** eine wiederkehrende Präferenz für kostenlose/Open-Source-
+  Tools als Standard, explizite Zahlungsunwilligkeit, DIY-Eigenbau als
+  beschriebene Norm selbst bei mehr Aufwand, erwähnte aber unpopuläre/
+  gemiedene bezahlte Optionen.
+- **Grobe Größe/Reichweite** desselben Channels - wiederverwendet aus dem
+  bereits für dessen `impact_score`/`confidence_score` erhobenen Signal
+  (Kapitel 6.1), nicht neu hergeleitet.
+
+**Wie das Ergebnis geloggt wird:** Über `write_knowledge_entry(topic=
+'payment propensity scan', channel=..., confidence=..., takeaway=...,
+source_hypothesis_ids=[...])` - derselbe wiederverwendbare Speicher aus
+Kapitel 5.7, nur jetzt konsequent mit `channel` getaggt. Der `takeaway`
+muss eine echte Größe-versus-Preis-Einschätzung sein, **nie** ein flaches
+Ja/Nein: grobe Audience-Größe, ob überhaupt reale Zahlungs-Evidenz
+existiert, und - wo sie existiert - die grobe Preisspanne. Ein schwacher/
+negativer Befund ist bei **jeder** Audience-Größe ein vollständiges,
+wertvolles Ergebnis für sich - das System darf ihn nie positiv umdeuten
+oder unter optimistischer Formulierung begraben, dieselbe
+Ehrlichkeitspflicht wie überall sonst in diesem System (z.B.
+`bury_reasoning`, Kapitel 5.4).
+
+**Einfluss auf die Kanal-Bewertung (Kapitel 6.1):** Der gespeicherte
+Befund fließt als **Kombination mit** der Audience-Größe in `impact_score`
+ein, nie als Override, der Größe einfach übergeht - ein großer, aktiver
+Channel mit starker widerlegender Zahlungs-Evidenz soll einen kleineren
+Channel mit echter Evidenz für hochpreisige Zahlungsbereitschaft nicht
+automatisch überholen. Die kombinierte Größe-und-Preis-Begründung landet
+im Channel-eigenen `notes`-Feld (`write_channel`) - sichtbar am
+Channel-Record selbst, nicht in einer einzelnen Hypothesen-Ökonomie
+versteckt.
+
+**Kein mechanisches Gate.** Der Befund blockiert `evidence_stage`-
+Fortschritt nicht automatisch - die Sub-CEO-eigene, evidenzbasierte
+Begründung für die Weiterinvestition in einen Channel muss ihn explizit
+adressieren (Kapitel 4.3), keine starre Regel entscheidet vorab.
+
+**Kein Formel-Code für `impact_score` existiert.** `scoring.py` wurde
+vollständig geprüft: es gibt keine numerische Formel, die `impact_score`/
+`confidence_score`/Reichweite zu einem Ranking kombiniert - das war schon
+vor diesem Addendum reines Sub-CEO-Urteil in Freitext, und bleibt es. Die
+Payment-Propensity-Gewichtung ist entsprechend reiner Task-Text
+(`task_ceo`), keine Code-Formel - konsistent damit, wie `impact_score`
+überall sonst in diesem System funktioniert.
+
+**Echter Scan gegen r/algotrading, live durchgeführt (nicht simuliert).**
+Über `search_web` mit dem echten `API-Sentinel-serper`-Key (`railway run`,
+Kapitel 5.11): drei Suchdurchläufe fanden reale, gemischte Signale in
+beide Richtungen - bestätigend ein Thread, der explizit
+Preisbereitschaft abfragt ("What would you pay for a bot trading
+platform?"), ein Vorschlag für ein $20/Monat-Signal-Abo in einem anderen
+Thread, echte erwähnte Datenkosten in der Größenordnung ~$25/Monat für
+Backtesting- bzw. Live-Datenzugriff, und ein Drittanbieterprodukt
+(SpeedBot) mit gestaffelter Preisstruktur, das explizit dieselbe Audience
+adressiert. Gleichzeitig widerlegend: **Freqtrade** - genau die
+Open-Source-Plattform, die diese Subsidiary selbst als Zielgruppe hat -
+taucht wiederholt als kostenloser Standard auf, dazu mehrere "I built and
+open-sourced my own X"-Posts, ein sichtbares Wiederkehr-Muster von
+Eigenbau statt Kauf. Ehrliches Gesamtbild: **gemischt** - reale, wenn auch
+moderate Zahlungsbereitschaft existiert (~$20-25/Monat-Größenordnung),
+konkurriert aber direkt mit einer echten, sichtbaren Free-/Open-Source-
+Alternativkultur - weder eine klare Bestätigung noch die von Jan erwartete
+klare Ablehnung. Die tatsächliche Subscriber-Zahl von r/algotrading wurde
+in diesem Scan **nicht** verifiziert (Reddits eigene API blockiert diese
+Umgebung, dasselbe bekannte Problem wie in Kapitel 6.2/5.11) - bewusst
+nicht geraten, sondern als offene Lücke benannt. Live-Smoke-Test:
+`test_payment_propensity_scan_live_reddit_algotrading` (`checkup.py`,
+Kapitel 13), überspringt sich selbst ohne gesetzten Key.
+
 ---
 
 ## 6. Channel-Auswahl und Content-Erstellung
@@ -938,6 +1043,15 @@ Ein bezahlter Kanal (`is_paid=true`) braucht **beides**: die Policy
 `paid_channels_allowed=true` (Kapitel 4.2) **und** eine freigegebene
 `spend`-Anfrage - `write_channel` erzwingt beide Gates in dieser
 Reihenfolge.
+
+**Payment-Propensity fließt in `impact_score` ein (Kapitel 5.14).** Vor
+dem Setzen/Aktualisieren von `impact_score` liest `task_channel_strategy`
+`read_knowledge_base(channel=..., topic='payment propensity')` - existiert
+ein Befund, wird er zusammen mit der Audience-Größe gewichtet, nie als
+Override, der Größe übergeht. Ein neuer Channel ohne Scan (noch keine
+Hypothese hat ihn erreicht) wird vorerst allein nach Größe/Fit bewertet -
+kein Blockieren der Channel-Anlage, während auf den ersten Scan gewartet
+wird.
 
 **Namens-Duplikat-Schutz:** Ein neuer Kanal, dessen Name (Groß-/
 Kleinschreibung und Leerzeichen egal) bereits in der Roster existiert, wird
@@ -1211,6 +1325,137 @@ Eine genehmigte Anfrage erlaubt genau einen `write_hypothesis`-Aufruf, der
 ohne Artefakte setzt (Kapitel 5.9) - keine allgemeine Ausnahme für die
 Hypothese insgesamt.
 
+### 7.4 FIX.md - Autonome Diagnose
+
+Bisher konnte eine Subsidiary unbemerkt feststecken oder wiederholt am
+gleichen Problem scheitern, ohne dass irgendetwas das automatisch
+aufschreibt - der Trajektorie-Check (Kapitel 7.1) erfasst nur das
+"Zero-Builds"-Muster. `FIX.md` ist ein zweistufiger Mechanismus: billige,
+deterministische Zyklus-Checks ohne LLM-Aufruf, die bei Auslösung genau
+einen eskalierten Diagnose-Aufruf auf einem stärkeren Modell nach sich
+ziehen.
+
+**Stufe 1 - sechs deterministische Checks, jeden Zyklus, kein LLM
+(`holding.run_fix_checks`, aufgerufen aus `crew.py`s Cron-Loop nach
+`crew.kickoff()`, nicht innerhalb eines CrewAI-Tasks):**
+
+| Check | Erkennt | Vorgeschlagene Schwelle |
+|---|---|---|
+| `zero_state_streak` | keine neue Hypothese/kein neuer `knowledge_base`-Eintrag/Content-Draft/Task-Order-Fortschritt über N aufeinanderfolgende Zyklen | 3 Zyklen (braucht real 4 Aufrufe, da der erste nur die Baseline setzt) |
+| `recurring_malformed_tool_calls` | dieselbe `_malformed_tool_calls`-Signatur (Kapitel 9.6) über mehrere Zyklen hinweg, nicht ein Einzelfall | 3 Zyklen |
+| `channel_bury_streak` | N aufeinanderfolgende `bury`-Outcomes auf demselben Channel - echtes Channel-Fit-Problem statt Pech | 3 in Folge |
+| `hypothesis_stuck_past_cap` | eine `status='active'`-Hypothese über der bestätigten Zeitbox-Obergrenze (Kapitel 5.13), nur relevant sobald `status='confirmed'` | - |
+| `repeated_pivot_streak` | die letzten N aufgelösten Hypothesen resolven allesamt zu `outcome='pivot'` - dieses Repo hat keinen echten "Pivot-Cap"-Zähler, das ist der treue Real-Daten-Proxy für das, was das Addendum "wiederholte Pivot-Cap-Erschöpfung" nennt | 2 in Folge |
+| `stale_approvals` | eine `status='pending'`-Freigabe, die ungewöhnlich lange unbeantwortet in `approval_queue.jsonl` liegt | 48 Stunden |
+
+`holding.DEFAULT_PROPOSED_FIX_THRESHOLDS` markiert diese Werte als
+`status='proposed'` - anders als die Zeitbox-Policy (Kapitel 5.13) gilt
+hier aber **kein** "inaktiv bis bestätigt": die Checks laufen sofort gegen
+die vorgeschlagenen Standardwerte, weil sie nur einen diagnostischen
+Eintrag auslösen, nie eine Aktion blockieren - "proposed" bedeutet hier
+"bitte bestätigen/anpassen", nicht "noch nicht scharf". Anpassbar per
+Telegram: `fix_thresholds: confirm` oder `fix_thresholds: <zero_state_
+streak_cycles> <malformed_tool_calls_cycles> <channel_bury_streak>
+<repeated_pivot_streak> <stale_approval_hours>`.
+
+**Stufe 2 - genau ein eskalierter Diagnose-Aufruf, nur wenn ein Check
+tatsächlich auslöst (`crew.generate_fix_diagnosis`):** läuft auf
+`claude-opus-5` statt dem laufenden `AGENT_PROFILE`-Modell (Kapitel 9.8) -
+ein eigenständiger `crewai.LLM(...)`-Aufruf **außerhalb** der CrewAI-Task-
+/Agent-Maschinerie, da dieser Mechanismus im plain-Python-Cron-Loop läuft,
+nicht in einem Task. Der Prompt verlangt ausschließlich die real vom
+Check-1-Aufruf gesammelte Evidenz (nie erfundene Details), eine
+Kategorisierung als `technisch` oder `inhaltlich` (beide gleich wichtig -
+das deckt Crashes/Code-Bugs genauso ab wie "das bewegt sich nicht Richtung
+Umsatz"-Befunde), einen ehrlichen Confidence-Hinweis als erste Zeile, eine
+konkrete Problem-Beschreibung, nummerierte Fix-Schritte und einen Hinweis
+zur nötigen Test-Abdeckung - dieselbe Ehrlichkeitspflicht wie bei jedem
+anderen Befund in diesem System, nie eine strategische Empfehlung
+optimistischer darstellen, als die Evidenz hergibt.
+
+**Ablage - eine feste Datei, Append-only, mit Archivierung:**
+`STATE_DIR/_holding/FIX.md` (reiner Markdown-Text, nie JSONL) bekommt pro
+Fund einen neuen, datierten Abschnitt angehängt (`## [<entry_id>]
+<kategorie>: <headline>`), nie überschrieben. Ein strukturiertes
+Sidecar-Log (`fix_entries.jsonl`, Kapitel 11.2) trägt dieselben Einträge
+maschinenlesbar für Dedup/Archivierung. `fix_resolved: <entry_id>` per
+Telegram markiert einen Eintrag als gelöst, verschiebt seinen Abschnitt
+aus dem lebenden `FIX.md` in eine datierte `FIX_resolved_<datum>.md` und
+hält `FIX.md` so schlank statt endlos wachsend.
+
+**Abruf durch Claude Code selbst.** `FIX.md` liegt auf dem Railway-Volume,
+nicht im lokalen Git-Repo - dieses Repos eigene `CLAUDE.md` (Abschnitt
+"Ohne Rückfrage erlaubt") enthält jetzt eine Standing-Instruction: bei
+einer Bitte, an `FIX.md` zu arbeiten, zuerst den echten, aktuellen Inhalt
+per `railway run -- cat /data/_holding/FIX.md` (bzw. per `STATE_DIR`-
+Umgebungsvariable aufgelöst) live holen, nie eine lokale Kopie annehmen -
+es gibt keine. Jeder gefundene Abschnitt wird als eigene, addendum-artige
+Aufgabe bearbeitet.
+
+**Harte Leitplanke:** Dieser gesamte Mechanismus schreibt ausschließlich
+nach `FIX.md`, `fix_entries.jsonl` und einem kurzen Telegram-Hinweis
+(Kapitel 8.2) - es gibt keinen Codepfad von einem generierten Befund zu
+einer tatsächlichen System-/Code-Änderung. Ein Mensch muss `FIX.md`
+explizit in einer separaten Claude-Code-Session umsetzen lassen; der
+Mechanismus selbst wendet nie etwas an.
+
+### 7.5 Kaizen - Konsolidierter Selbstverbesserungs-Report
+
+Eine laufende, kleinteiligere Reflexion, unabhängig davon, ob technisch
+etwas kaputt ist - `FIX.md` (Kapitel 7.4) bleibt für "etwas steckt
+tatsächlich fest oder scheitert wiederholt"; Kaizen läuft **jeden** echten
+Zyklus. Überschneidet sich ein Kaizen-Punkt tatsächlich mit einer der
+`FIX.md`-Schwellen, gehört der Befund dorthin, nicht doppelt in beide
+Kanäle.
+
+**Ein einziger, konsolidierter Report pro Zyklus - nicht einer pro
+Agent.** `task_ceo` sammelt subsidiary-eigene Beobachtungen, jede
+verankert in echten Zyklusdaten (eine konkrete Hypothesen-ID mit ihrem
+realen Outcome, ein konkreter Channel mit realen Zahlen, eine konkret
+abgelehnte oder unbeantwortete Freigabe) und legt sie als `kaizen_points`
+auf `file_status_report` (Kapitel 7) ab - nie als eigenen, separaten
+Kaizen-Report. `task_main_ceo_review` liest diese pro aktiver Subsidiary
+und ruft genau **ein** `holding.file_kaizen_report(subsidiary_id=...,
+kaizen_report=...)` auf, das sie mit den eigenen holdingweiten
+Beobachtungen zu einem kombinierten Report verschmilzt - der einzige Ort
+im gesamten Zyklus-Report, an dem Kaizen-Inhalt erscheint.
+
+**Zwei Buckets:**
+
+- **`selbst_umsetzbar`** - klein genug, um noch im selben Zyklus mit
+  vorhandenen Tools umgesetzt zu werden (`status='acted'`), oder explizit
+  zurückgestellt mit echtem Grund (`status='deferred'` +
+  `deferred_reason`) - nie ein stiller No-op.
+- **`fuer_aufsichtsrat`** - braucht Jan/Board (Policy-Änderung,
+  Budget-/Spend-/Publish-/Deploy-/Pricing-/Legal-Entscheidung, alles über
+  die bestehende Tier-1/2-Grenze hinaus). Persistiert in
+  `kaizen_suggestions.jsonl` (Kapitel 11.2) **jeden** Zyklus, in dem
+  solche Einträge auftreten - unabhängig davon, was per Telegram gezeigt
+  wird.
+
+**Zwei Leitplanken, im Code erzwungen, nicht nur per Instruktion:**
+
+1. **Grounding-Pflicht.** Jeder Punkt, beide Buckets, muss ein `grounding`-
+   Feld mitbringen, das tatsächlich als echte ID in dieser Subsidiary's
+   aktuellen `hypotheses.jsonl`/`channels.jsonl` oder der globalen
+   `approval_queue.jsonl` existiert - `holding._kaizen_grounding_exists`
+   prüft das direkt gegen den echten Datenbestand, nicht nur auf
+   Nicht-Leerheit. Generische Startup-Ratschläge ohne zitierten Fakt werden
+   mechanisch abgelehnt, dieselbe Disziplin wie der Anti-Copying-Tripwire
+   (Kapitel 5.12), nur gegen echten Zustand statt eine feste Phrasenliste
+   geprüft.
+2. **Tier-0-Grenze.** Ein `selbst_umsetzbar`-Eintrag wird abgelehnt, sobald
+   sein `action`-Text spend/publish/deploy/pricing/legal in irgendeiner
+   Form erwähnt (`holding._kaizen_tier_violation`, Stichwortliste
+   angelehnt an `tools.APPROVAL_CATEGORIES`) - alles, was diese Kategorien
+   berührt, gehört ausschließlich in `fuer_aufsichtsrat` und muss regulär
+   durch `request_approval`. Kaizen darf nie zur Hintertür um die
+   bestehende Freigabe-Grenze werden.
+
+**Telegram-Dedup** folgt exakt demselben Kurzhinweis-Muster wie `FIX.md`
+(Kapitel 7.4/8.2): nur die Anzahl neuer, noch nicht angezeigter
+`fuer_aufsichtsrat`-Einträge, nie der volle Text jeden Zyklus erneut.
+
 ---
 
 ## 8. Mensch im Loop: Freigabe-Queue und Telegram-Fernsteuerung
@@ -1274,6 +1519,9 @@ verarbeiteten Update (`telegram_update_offset.txt`) und wertet sie aus
 | `duration_policy: confirm` | Vorgeschlagene `max_duration_days_by_stage`-Werte unverändert bestätigen (Kapitel 5.13) |
 | `duration_policy: <research> <community_engagement> <landing_page> <build>` | Eigene Werte setzen und in einem Schritt bestätigen (Tage, `none` für kein Limit, Kapitel 5.13) |
 | `stagnation_ack: <subsidiary_id>` | Offene Stagnation-Eskalation quittieren (Kapitel 7.1) - setzt `stagnation_escalated=false` und den Zähler zurück; kein Effekt, wenn gerade keine offene Eskalation für diese Subsidiary existiert |
+| `fix_resolved: <entry_id>` | `FIX.md`-Eintrag als gelöst markieren, Abschnitt in `FIX_resolved_<datum>.md` archivieren (Kapitel 7.4) |
+| `fix_thresholds: confirm` | Vorgeschlagene FIX.md-Check-Schwellen unverändert bestätigen (Kapitel 7.4) |
+| `fix_thresholds: <zero_state> <malformed> <bury_streak> <pivot_streak> <stale_hours>` | Eigene Schwellenwerte setzen und in einem Schritt bestätigen (Kapitel 7.4) |
 
 Alle anderen Nachrichten werden stillschweigend ignoriert (der Operator darf
 einfach chatten, das ist kein Fehler). Ein Telegram-/Netzwerkfehler darf nie
@@ -1469,6 +1717,32 @@ MOUNT_PATH` - eine echte, von Railway dokumentierte Laufzeit-Env-Var, die
   mit konkreter Warnung, gleiche Sichtbarkeitsstufe wie die bestehenden
   Budget-/`max_iter`-Warnungen im Telegram-Report (Kapitel 15 zur
   Entstehungsgeschichte dieses Checks).
+
+### 9.8 Modell-Eskalation für FIX.md (`claude-opus-5`)
+
+Einzige Ausnahme vom `AGENT_PROFILE`-Modell (Kapitel 9.1): `crew.fix_llm`
+ist eine eigene, fünfte `crewai.LLM(model="anthropic/claude-opus-5", ...)`-
+Instanz, ausschließlich für `crew.generate_fix_diagnosis` (Kapitel 7.4) -
+nie über `_ANTHROPIC_KWARGS` geroutet, damit ein `agent_profile.json`-
+Wechsel für die vier Routine-Agenten diesen Aufruf nie versehentlich
+mitverändert. Feuert selten (nur wenn ein FIX.md-Check tatsächlich
+auslöst), daher ist der Mehrpreis eines stärkeren Modells für diesen einen
+Aufruf begrenzt und lohnt sich für die Qualität des Befunds.
+
+**Korrektur gegenüber dem ursprünglichen Addendum-Text:** Das Addendum
+nannte `claude-opus-4-8` - ein echtes, aber laut Anthropics eigener
+Modell-Dokumentation inzwischen als "Legacy" geführtes Modell, zum
+**identischen** Preis wie das aktuelle `claude-opus-5` ($5 Input / $6.25
+5-Min-Cache-Write / $10 1-Std-Cache-Write / $0.50 Cache-Hit / $25 Output,
+je MTok - gegen Anthropics eigene Preis-Dokumentation bestätigt am
+2026-08-11, `pricing.py`). Da beide Modelle gleich viel kosten und
+`claude-opus-5` das aktuelle, nicht-superseded Modell ist, wurde
+`claude-opus-5` verwendet statt des im Addendum-Text genannten Legacy-
+Modells.
+
+`pricing.PRICING_TABLE["claude-opus-5"]` trägt diese Rate ein, damit der
+Zyklus-Kosten-Report (Kapitel 9.6) einen FIX.md-Diagnose-Aufruf sichtbar
+mitrechnet statt ihn als versteckte Ausgabe zu behandeln.
 
 ---
 
@@ -1680,6 +1954,14 @@ Datenisolation selbst) - siehe Kapitel 15.
 | `strategic_directions.jsonl` | Main-CEO → Sub-CEO Ausrichtungen |
 | `ideas.jsonl` | Idee-Intake, jeder Agent schreibt, Main-CEO routet (Kapitel 7.2) |
 | `stage_skip_requests.jsonl` | Evidence-Stage-Skip-Anfragen, Sub-CEO reicht ein, Main-CEO entscheidet (Kapitel 7.3) |
+| `fix_entries.jsonl` | Strukturiertes Sidecar-Log zu `FIX.md` (id/category/headline/subsidiary_id/check_type/resolved/telegram_notified_at, Kapitel 7.4) |
+| `fix_thresholds.jsonl` | Ein einzelner, bestätigter Override-Record für die FIX.md-Check-Schwellen, ersetzt `holding.DEFAULT_PROPOSED_FIX_THRESHOLDS` vollständig sobald per Telegram gesetzt (Kapitel 7.4) |
+| `kaizen_suggestions.jsonl` | `fuer_aufsichtsrat`-Einträge aus dem konsolidierten Kaizen-Report (Kapitel 7.5) |
+
+**`FIX.md` / `FIX_resolved_<datum>.md`** liegen ebenfalls unter
+`STATE_DIR/_holding/`, sind aber bewusst **reiner Markdown-Text**, keine
+JSONL-Datei - append-only, nie überschrieben (Kapitel 7.4). Abruf per
+`railway run -- cat /data/_holding/FIX.md` (Kapitel 12.4, `CLAUDE.md`).
 
 ### 11.3 Repo-lokal, versioniert (kein `STATE_DIR`)
 
@@ -1760,6 +2042,12 @@ gesetzt testen (siehe `checkup.py`). Der persistente Zustand
 (`/data`) ist ausschließlich über einen laufenden Container einsehbar, nicht
 direkt über das Railway-Dashboard als Dateibrowser.
 
+Live-Zugriff auf einzelne Dateien: `railway run -- cat /data/_holding/
+FIX.md` (bzw. der jeweilige Pfad) - genau der Mechanismus, den `CLAUDE.md`
+für `FIX.md` (Kapitel 7.4) als Standing-Instruction für zukünftige
+Claude-Code-Sessions festhält, hier nochmal referenziert statt nur dort
+dokumentiert.
+
 ---
 
 ## 13. Tests
@@ -1791,15 +2079,27 @@ Wichtige Eigenschaften:
   ausgeführt (lokal `1.15.9`, produktiv gepinnt `1.15.11`), da mehrere
   crewai-Verhaltensweisen (siehe Kapitel 10.6/10.7) versionsabhängig direkt
   im Quellcode verifiziert wurden statt angenommen.
-- Stand zuletzt: **303 Tests, 303/303 bestanden** auf beiden Versionen.
-  Zwei davon (`test_search_web_live_real_key_returns_real_results`,
-  `test_search_web_then_read_webpage_live_pipeline`) sind echte Live-Smoke-
-  Tests gegen die reale Serper.dev-API - sie überspringen sich selbst
-  sauber (kein Fail/Error), wenn `API-Sentinel-serper` nicht gesetzt ist,
-  damit die restliche Suite nie von einem echten externen Key/Budget
-  abhängt. Lokal ohne Key: 298/298 (beide übersprungen). Per `railway run`
-  mit dem echten Key: alle Tests bestanden, beide Live-Tests tatsächlich
-  ausgeführt (Real-Serper-Key-Addendum).
+- Stand zuletzt: **334 Tests, 334/334 bestanden.** Drei davon
+  (`test_search_web_live_real_key_returns_real_results`,
+  `test_search_web_then_read_webpage_live_pipeline`,
+  `test_payment_propensity_scan_live_reddit_algotrading`) sind echte
+  Live-Smoke-Tests gegen die reale Serper.dev-API - sie überspringen sich
+  selbst sauber (kein Fail/Error), wenn `API-Sentinel-serper` nicht gesetzt
+  ist, damit die restliche Suite nie von einem echten externen Key/Budget
+  abhängt. Lokal ohne Key: alle drei übersprungen. Per `railway run` mit
+  dem echten Key: alle 334 Tests bestanden, alle drei Live-Tests
+  tatsächlich ausgeführt (Real-Serper-Key-Addendum, zuletzt erneut bestätigt
+  im FIX.md/Kaizen/Payment-Propensity-Addendum mit dem echten
+  r/algotrading-Scan aus Kapitel 5.14). Der eskalierte `claude-opus-5`-
+  Aufruf (Kapitel 9.8) selbst wird **nie** in `checkup.py` real ausgeführt
+  - dieselbe Disziplin wie beim Verzicht auf `crew.kickoff()` oben, echte
+  Anthropic-Kosten werden hier nie automatisch verursacht; stattdessen prüft
+  `test_fix_llm_uses_opus_5_and_is_independent_of_agent_profile` die reale
+  Verdrahtung strukturell (Modell-String, Objekt-Identität, Pricing-Tabelle)
+  ohne den Aufruf selbst zu tätigen, und
+  `test_generate_fix_diagnosis_parses_structured_response`/`_falls_back_
+  when_call_fails` decken die Parsing-/Fallback-Logik über einen
+  injizierten `llm_call`-Fake ab.
 - `test_all_task_descriptions_and_agent_backstories_interpolate_cleanly`
   (Crash-Fix-Addendum, siehe Kapitel 15) ruft `crew.crew._interpolate_inputs(...)`
   - crewais echten internen Mechanismus, den `kickoff()` vor jedem
@@ -2125,3 +2425,43 @@ eine Zusammenfassung; Exit-Code `0` nur wenn wirklich alles bestanden hat.
   Railway-Volume-Instanz - der Bury-Schritt und alle neuen Gates greifen
   erst, wenn der Sub-CEO tatsächlich einen echten Zyklus durchläuft
   (System war während dieser Session per Telegram `stop` pausiert).
+- **FIX.md/Kaizen/Payment-Propensity-Addendum:** drei zusammenhängende, aber
+  eigenständige Ergänzungen. **FIX.md** (Kapitel 7.4): sechs
+  deterministische, LLM-freie Zyklus-Checks (`holding.run_fix_checks`)
+  erkennen eine still feststeckende oder wiederholt scheiternde Subsidiary
+  - bei Auslösung genau ein eskalierter Diagnose-Aufruf auf `claude-opus-5`
+  (Kapitel 9.8, Korrektur gegenüber dem ursprünglich genannten, inzwischen
+  als Legacy geführten `claude-opus-4-8` - identischer Preis, aktuelles statt
+  superseded Modell), geschrieben als datierter Abschnitt in eine feste,
+  append-only `STATE_DIR/_holding/FIX.md` mit strukturiertem Sidecar-Log
+  (`fix_entries.jsonl`) für Dedup/Archivierung (`fix_resolved: <id>` per
+  Telegram). Harte Leitplanke, mechanisch durch Konstruktion: der Mechanismus
+  schreibt ausschließlich nach `FIX.md`/`fix_entries.jsonl`, kein Codepfad zu
+  einer tatsächlichen Anwendung führt von dort weiter - `CLAUDE.md` bekam
+  eine Standing-Instruction zum Live-Abruf per `railway run -- cat
+  /data/_holding/FIX.md`, da die Datei nur auf dem Volume existiert, nie im
+  lokalen Repo. **Kaizen** (Kapitel 7.5): ein einziger, konsolidierter
+  Selbstverbesserungs-Report pro Zyklus (`holding.file_kaizen_report`,
+  aufgerufen von `task_main_ceo_review`, nie separat von `task_ceo`), zwei
+  Buckets (`selbst_umsetzbar`/`fuer_aufsichtsrat`) mit zwei im Code
+  erzwungenen Leitplanken: jeder Punkt muss eine real existierende
+  Hypothesen-/Channel-/Freigabe-ID zitieren (`_kaizen_grounding_exists`
+  prüft das gegen den echten Datenbestand, nicht nur Nicht-Leerheit), und
+  `selbst_umsetzbar` wird abgelehnt, sobald der Text spend/publish/deploy/
+  pricing/legal in irgendeiner Form erwähnt - Kaizen darf nie zur Hintertür
+  um die bestehende Freigabe-Grenze werden. **Payment-Propensity** (Kapitel
+  5.14, verankert in der Bullseye-Kanalbewertung aus Kapitel 6.1): ein
+  Zahlungsbereitschafts-und-Größe-Scan pro Channel (nicht pro Hypothese),
+  motiviert durch Jans Beobachtung, dass r/algotrading trotz aktiver
+  Nutzung keine sichtbare Zahlungskultur zeigen könnte - Größe allein ist
+  nicht das Signal, Größe kombiniert mit tatsächlicher Zahlungsbereitschaft
+  (und bei welchem Preis) ist es. Echt gegen r/algotrading getestet (nicht
+  nur implementiert): gemischter, ehrlich berichteter Befund - reale, wenn
+  auch moderate Zahlungsbereitschaft (~$20-25/Monat-Größenordnung, ein
+  Drittanbieter mit gestaffelter Preisstruktur direkt für diese Audience),
+  aber eine ebenso reale, sichtbare Open-Source-/DIY-Gegenkultur
+  (Freqtrade selbst, mehrere "I built and open-sourced my own X"-Posts) -
+  weder klare Bestätigung noch klare Ablehnung, absichtlich nicht in eine
+  Richtung schöngeredet. Alle drei Teile: 31 neue `checkup.py`-Tests
+  (303 -> 334), in drei separaten Commits umgesetzt, jeder eigenständig
+  grün getestet.
