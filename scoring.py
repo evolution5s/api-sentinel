@@ -156,6 +156,43 @@ def estimate_reach(channel: str, metrics: dict, estimators: dict = None) -> tupl
     raise ValueError(f"unknown channel '{channel}'")
 
 
+ICE_SCALE_MIN = 1
+ICE_SCALE_MAX = 10
+
+
+def compute_ice_score(impact: float, confidence: float, ease: float) -> float:
+    """Impact x Confidence x Ease (Part 2, backlog-ranking addendum) - the
+    standard ICE-framework convention (a product, not a weighted sum), each
+    input a 1-10 self-assessed score. Range 1-1000, higher is better. This
+    is the ONE formula used both for backlog ranking (tools.read_backlog)
+    and Part 1.3's cycle-report top-4 block - never a second, parallel
+    scoring path.
+    """
+    for name, value in (("impact", impact), ("confidence", confidence), ("ease", ease)):
+        if not (ICE_SCALE_MIN <= value <= ICE_SCALE_MAX):
+            raise ValueError(f"{name} must be between {ICE_SCALE_MIN} and {ICE_SCALE_MAX}, got {value}")
+    return impact * confidence * ease
+
+
+def spare_capacity_produced_nothing(
+    active_hypotheses_count: int, max_active_hypotheses: int, start_counts: dict, end_counts: dict,
+) -> bool:
+    """Anti-stagnation trigger (Part 2, section 2.4): true when a cycle both
+    HAD unused active-testing capacity (fewer active hypotheses than the WIP
+    cap at the start of the cycle) AND produced no new persisted state at
+    all across the cycle (every tracked count identical start-to-end).
+    Deliberately immediate/single-cycle - not the same signal as holding.
+    check_zero_state_streak, which only fires after several consecutive
+    cycles; this is meant to catch it the same cycle it happens, so it can
+    be flagged in that cycle's own business report rather than waiting.
+    start_counts/end_counts are whatever tools.snapshot_state_counts()
+    returned at the two points - compared as plain dict equality, so any
+    single count moving (a new hypothesis, backlog candidate, research
+    finding, etc.) is enough to count as "produced something".
+    """
+    return active_hypotheses_count < max_active_hypotheses and start_counts == end_counts
+
+
 def update_reach_multiplier(channel_key: str, multiplier_key: str, new_value: float, reason: str) -> dict:
     """Recalibrate a fallback multiplier once enough real data points exist
     for a channel, logging date and old/new value so the change stays

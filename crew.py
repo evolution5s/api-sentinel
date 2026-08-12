@@ -13,6 +13,7 @@ from crewai.tasks.conditional_task import ConditionalTask
 import crewai_patches
 import holding
 import pricing
+import scoring
 import tools
 
 # Muss vor jeder Agent/Task-Konstruktion passieren, insbesondere vor dem
@@ -25,6 +26,7 @@ crewai_patches.apply_patches()
 
 from tools import (
     build_hypothesis_overview,
+    build_top_hypotheses_block,
     check_approval_status,
     check_community_risk,
     check_escalation,
@@ -36,27 +38,35 @@ from tools import (
     evaluate_hypothesis,
     file_task_order,
     get_account_stats,
+    get_and_clear_pending_next_step,
     is_system_paused,
+    list_pending_approval_ids,
     log_cycle_usage,
     log_research_finding,
     notify_new_pending_approvals,
     open_pull_request,
     process_telegram_commands,
+    read_backlog,
     read_channel_metrics,
     read_channels,
     read_content_drafts,
     read_due_hypotheses,
     read_hypotheses,
     read_knowledge_base,
+    read_last_business_report,
     read_last_cycle_note,
     read_research_findings,
     read_state,
     read_task_orders,
     read_webpage,
     request_approval,
+    save_business_report,
     save_cycle_note,
     search_web,
     send_telegram_message,
+    set_next_step,
+    snapshot_state_counts,
+    write_backlog_candidate,
     write_channel,
     write_hypothesis,
     write_knowledge_entry,
@@ -74,6 +84,8 @@ from holding import (
     propose_idea,
     read_cross_subsidiary_requests,
     read_ideas,
+    read_kaizen_actions,
+    read_kaizen_suggestions,
     read_pivot_proposals,
     read_stage_skip_requests,
     read_status_reports,
@@ -90,6 +102,13 @@ from holding import (
 )
 
 _previous_cycle_note = read_last_cycle_note()
+# cycle-reporting/backlog addendum, Part 1.2: same read-once-at-module-load
+# interpolation pattern as _previous_cycle_note above, just for the prior
+# business report's structured next-step commitment specifically (the
+# comparison task_ceo's own report opens with) instead of the whole prior
+# free-text digest.
+_previous_business_report = read_last_business_report()
+_previous_next_step = (_previous_business_report or {}).get("next_step") or ""
 
 # Anthropic API Key aus den Umgebungsvariablen prüfen
 ANTHROPIC_KEY = os.getenv("ANTHROPIC_API_KEY")
@@ -218,14 +237,21 @@ growth_agent = Agent(
         "use up. If community engagement surfaces a genuine market gap "
         "outside this hypothesis's own scope - not just a variation on it - "
         "call propose_idea to hand it to the Main-CEO rather than folding it "
-        "into work here unasked."
+        "into work here unasked. For something smaller than a full market "
+        "gap - an adjacent pain point mentioned in passing, a different "
+        "audience segment noticed while scanning a channel - write_backlog_"
+        "candidate instead (backlog addendum, Part 2): the backlog is "
+        "deliberately broader and messier than propose_idea's bar, don't "
+        "self-censor to only what's narrowly on-topic for the current "
+        "hypothesis."
     ),
     llm=growth_llm,
     tools=[
         request_approval, read_channel_metrics, read_channels, read_state, read_hypotheses,
         read_task_orders, complete_task_order, draft_content, read_content_drafts,
         check_community_risk, get_account_stats, log_research_finding, read_research_findings,
-        read_subsidiary_policies, read_knowledge_base, propose_idea, search_web, read_webpage,
+        read_subsidiary_policies, read_knowledge_base, propose_idea, write_backlog_candidate,
+        search_web, read_webpage,
     ],
     max_iter=AGENT_PROFILE["agents"]["growth"]["max_iter"],
     max_execution_time=AGENT_PROFILE["agents"]["growth"]["max_execution_time"],
@@ -251,10 +277,14 @@ dev_agent = Agent(
         "resource - finishing correctly in as few tool calls as the task "
         "genuinely needs is the actual goal; max_iter/max_rpm/the cycle "
         "budget are a hard ceiling against runaway cost, not a target to "
-        "use up."
+        "use up. If something opportunity-shaped surfaces while building - "
+        "a different technical angle, a simpler variant worth testing "
+        "separately - write_backlog_candidate logs it for the Sub-CEO to "
+        "weigh later (backlog addendum, Part 2), rather than letting it go "
+        "unrecorded just because it's outside this order's own scope."
     ),
     llm=dev_llm,
-    tools=[open_pull_request, read_task_orders, complete_task_order, check_approval_status],
+    tools=[open_pull_request, read_task_orders, complete_task_order, check_approval_status, write_backlog_candidate],
     max_iter=AGENT_PROFILE["agents"]["dev"]["max_iter"],
     max_execution_time=AGENT_PROFILE["agents"]["dev"]["max_execution_time"],
     max_rpm=20,
@@ -431,7 +461,68 @@ ceo_agent = Agent(
         "indefinitely. If something surfaces that's a genuine market gap "
         "outside this subsidiary's own focus - not a variation on the "
         "current hypothesis - propose_idea hands it to the Main-CEO instead "
-        "of chasing it here unasked."
+        "of chasing it here unasked.\n\n"
+        "Hypothesis backlog + ICE scoring (backlog addendum, Part 2): "
+        "MAX_ACTIVE_HYPOTHESES is a genuine work-in-progress limit on how "
+        "many hypotheses are being actively TESTED at once - it is not a "
+        "limit on how many ideas this role is allowed to think about. "
+        "write_backlog_candidate logs a candidate into a separate, "
+        "deliberately never-capped pool, broader and messier than the "
+        "active hypothesis line on purpose: an adjacent pain point from a "
+        "research finding, a different audience segment, an alternative "
+        "pricing angle from a payment-propensity scan, even something "
+        "tangential from researching a different topic entirely - don't "
+        "self-censor to only what's narrowly on-topic for whatever is "
+        "currently active. Score every candidate's impact/confidence/ease "
+        "(1-10 each, scoring.compute_ice_score multiplies them into one "
+        "comparable number) with a real grounding id for each sub-score - "
+        "a research finding, a knowledge-base/payment-propensity verdict, a "
+        "channel signal - never an unsupported number. impact is scored "
+        "relative to THIS subsidiary's current strategic direction, not a "
+        "fixed property of the idea - the same idea can score very "
+        "differently under a different audience/pricing lens; read_backlog's "
+        "impact_stale flag means the direction has since moved on and this "
+        "entry's impact is worth re-scoring before trusting it for ranking "
+        "or promotion, not something to silently keep reusing. Backlog "
+        "grooming (new candidates, re-scoring stale entries, promoting one) "
+        "isn't mandatory every cycle - it belongs where there's real spare "
+        "capacity, either because MAX_ACTIVE_HYPOTHESES isn't full and a new "
+        "slot could genuinely be filled, or because of the anti-stagnation "
+        "rule directly below. Promotion is two steps: write_hypothesis to "
+        "actually create the new active hypothesis (citing "
+        "backlog_candidate_id on it), then write_backlog_candidate again "
+        "with status='promoted' and promoted_to_hypothesis_id set. A "
+        "candidate flagged fits_subsidiary_scope='no'/'unclear' isn't this "
+        "role's call - propose_idea it to the Main-CEO (reference the "
+        "backlog candidate's id in the summary/reasoning) instead of "
+        "ranking/promoting it here.\n\n"
+        "Anti-stagnation (Part 2, section 2.4): a blocked primary "
+        "hypothesis is never, by itself, a reason to report 'waiting' as "
+        "the whole cycle's output whenever real spare capacity or budget "
+        "remains. Blocked means a real, checkable state - an approval "
+        "pending past a real threshold, a research call that hasn't "
+        "returned, or a hypothesis genuinely idle inside its own duration-"
+        "policy window with nothing left to do until it elapses - not "
+        "just 'nothing new came up'. If it's genuinely blocked AND a slot "
+        "is free or budget remains this cycle, do ONE of, in order of "
+        "preference: pull the next-highest-ice_score backlog candidate "
+        "into active testing if a slot is free; advance backlog grooming/"
+        "re-scoring if no slot is free; or, only once both of those are "
+        "genuinely exhausted, propose_idea to escalate for the Main-CEO to "
+        "consider a new direction. This is checked mechanically, not just "
+        "by instruction - a cycle that had spare capacity and persisted "
+        "nothing new at all (no hypothesis, backlog entry, research "
+        "finding, content draft, or task order) gets flagged as its own "
+        "finding in the business report whether or not this role mentions "
+        "it, so 'we're waiting on X' as the entire cycle output should be "
+        "the rare, last-resort, explicitly-justified exception, never the "
+        "default.\n\n"
+        "Business-report continuity (Part 1.2): near the end of this "
+        "task's own work, call set_next_step with one concrete, real "
+        "next planned step - this becomes the closing line of THIS cycle's "
+        "business report and what NEXT cycle's report opens by checking "
+        "against (met/partially met/not met, and why), so state something "
+        "genuinely checkable, not a vague aspiration."
     ),
     llm=ceo_llm,
     tools=[
@@ -443,6 +534,7 @@ ceo_agent = Agent(
         file_pivot_proposal, file_cross_subsidiary_request, search_research_archive,
         read_subsidiary_policies, read_content_drafts, log_research_finding, read_research_findings,
         read_knowledge_base, write_knowledge_entry, propose_idea, file_stage_skip_request,
+        write_backlog_candidate, read_backlog, set_next_step,
         search_web, read_webpage,
     ],
     max_iter=AGENT_PROFILE["agents"]["sub_ceo"]["max_iter"],
@@ -570,7 +662,25 @@ main_ceo_agent = Agent(
         "read_subsidiary_policies) surfaces in the cycle report's 'Fuer "
         "den Aufsichtsrat' section until the board actually confirms or "
         "adjusts it via Telegram - this role doesn't confirm it itself, "
-        "that decision belongs to the board, not this role or the Sub-CEO."
+        "that decision belongs to the board, not this role or the Sub-CEO.\n\n"
+        "Backlog fit review (backlog addendum, Part 2, section 2.5): "
+        "distinct from the Sub-CEO's own per-subsidiary ICE ranking - this "
+        "is specifically for a backlog candidate the Sub-CEO flagged "
+        "fits_subsidiary_scope='no'/'unclear' and routed here via "
+        "propose_idea, referencing the candidate's own id and reasoning. "
+        "Evaluate it fresh for whichever destination actually makes sense "
+        "(read_backlog to see the real candidate, its statement, and its "
+        "reasoning) - never reuse its Impact score as computed under the "
+        "original subsidiary's business model, that lens doesn't transfer. "
+        "The real decision space via route_idea: existing_subsidiary (it "
+        "actually does fit, tell the Sub-CEO so via set_strategic_"
+        "direction), new_subsidiary (needs its own spin-off - still gated "
+        "by the same request_approval + register_subsidiary discipline as "
+        "any other, route_idea only records the decision), or rejected "
+        "with reasoning. Any agent can also write_backlog_candidate "
+        "directly when something opportunity-shaped surfaces during this "
+        "role's own review work, same broadened-intake principle as the "
+        "Sub-CEO's."
     ),
     llm=main_ceo_llm,
     tools=[
@@ -583,6 +693,7 @@ main_ceo_agent = Agent(
         read_subsidiary_policies, update_subsidiary_policies,
         propose_idea, read_ideas, route_idea,
         read_stage_skip_requests, decide_stage_skip_request,
+        write_backlog_candidate, read_backlog,
         search_web, read_webpage, file_kaizen_report,
     ],
     max_iter=AGENT_PROFILE["agents"]["main_ceo"]["max_iter"],
@@ -1405,18 +1516,51 @@ task_ceo = ConditionalTask(
         "publish/deploy/pricing/legal - those always need request_approval "
         "regardless of how small they seem), you may act on it this same "
         "cycle and say so in the observation itself; otherwise just flag "
-        "it, the Main-CEO decides what's selbst_umsetzbar vs needs Jan."
+        "it, the Main-CEO decides what's selbst_umsetzbar vs needs Jan.\n"
+        "10) Business report (cycle-reporting addendum, Part 1): your FINAL "
+        "ANSWER for this task is used directly as the narrative body of "
+        "this cycle's business progress report to Telegram - write it in "
+        "the voice of a Sub-CEO reporting to a board, not a log of which "
+        "tools you called. Structure: one opening sentence stating the "
+        "current state plainly (which hypothesis is being validated, with "
+        "which audience, how many new substantive findings arrived since "
+        "the last report); key figures woven into normal sentences, not a "
+        "table (active hypotheses and their evidence_stage, what research "
+        "has actually found as pain-point evidence, the payment-propensity "
+        "read for the relevant niche); a dedicated 'what changed since the "
+        "last report' section - the most important part, only what's "
+        "genuinely new, not a repeat of the full current state." + (
+            f"\n\nThe previous report's committed next step was: "
+            f"\"{_previous_next_step}\" - state plainly in your final answer "
+            "whether this cycle met it, partially met it, or didn't, and "
+            "why. This is a real lookup, not something to guess at."
+            if _previous_next_step else
+            "\n\n(No previous business report yet - this is either the "
+            "first cycle ever, or this reporting mechanism was just added; "
+            "say so plainly instead of inventing a prior commitment to "
+            "compare against.)"
+        )
     ),
     agent=ceo_agent,
     expected_output=(
-        "Status report: for each evaluated hypothesis, its score/outcome "
-        "(build/test_further/pivot/bury) and the economics behind it, what "
-        "happened next, and the new retest started for any pivot. Any "
-        "knowledge_base entries written for a resolved hypothesis. Any "
-        "pending approval, escalation, or status report filed for the "
-        "Main-CEO. Pending Dev work stated as task orders filed, not just "
-        "narrated. 1-3 grounded Kaizen observations passed as kaizen_points "
-        "on the status report, each citing a real id from this cycle."
+        "A Sub-CEO-to-board business narrative (not a tool-call log): "
+        "opening sentence on current state, key figures woven into prose, "
+        "a 'what changed since the last report' section, and an explicit "
+        "met/partially-met/not-met read on the previous report's committed "
+        "next step and why. For each evaluated hypothesis this cycle, its "
+        "score/outcome (build/test_further/pivot/bury) and the economics "
+        "behind it, what happened next, and the new retest started for any "
+        "pivot. Any knowledge_base entries written for a resolved "
+        "hypothesis. Any backlog grooming done this cycle (new candidates "
+        "logged, stale entries re-scored, a candidate promoted) and, if the "
+        "primary hypothesis was genuinely blocked with spare capacity "
+        "available, which anti-stagnation action was taken instead of just "
+        "reporting 'waiting'. Any pending approval, escalation, or status "
+        "report filed for the Main-CEO. Pending Dev work stated as task "
+        "orders filed, not just narrated. 1-3 grounded Kaizen observations "
+        "passed as kaizen_points on the status report, each citing a real "
+        "id from this cycle. Ends with the one concrete next step passed "
+        "to set_next_step."
     ),
     callback=_make_iteration_watchdog(ceo_agent, "Sub-CEO (Build-Measure-Learn)"),
 )
@@ -1848,33 +1992,142 @@ def _aufsichtsrat_lines(
     return ["", "--- Fuer den Aufsichtsrat ---"] + items
 
 
+def _technical_status_message(
+    subsidiary_id: str, usage: dict, kickoff_error: Exception, persistence_warning: str,
+    telegram_action_log: list, fix_md_new_entries: list,
+) -> str:
+    """Message A (cycle-reporting/backlog addendum, Part 1.1): short by
+    default, grows only when something is actually wrong - on a clean
+    cycle this is exactly 3 lines (header, usage headline, health
+    confirmation), nothing more. Everything else here is conditional on a
+    real triggered problem, never printed out of habit.
+    """
+    lines = [
+        f"{subsidiary_id} Zyklus - {datetime.now(timezone.utc).isoformat()}",
+        _usage_headline(usage),
+    ]
+    problem = False
+    if kickoff_error is not None:
+        lines.append(f"WARNUNG: Der Crew-Lauf ist fehlgeschlagen: {kickoff_error}")
+        lines.append("Nachfolgende Tasks haben moeglicherweise nicht mehr gelaufen.")
+        problem = True
+    if persistence_warning:
+        lines.append(f"WARNUNG: Zustand vermutlich nicht persistent: {persistence_warning}")
+        problem = True
+    if _limit_hits:
+        lines.append("WARNUNG: Sicherheitslimits diesen Zyklus ausgeloest:")
+        lines.extend(f"- {hit}" for hit in _limit_hits)
+        problem = True
+    if _malformed_tool_calls:
+        lines.append(
+            f"Hinweis: {len(_malformed_tool_calls)}x fehlerhafter Tool-Aufruf diesen Zyklus "
+            "(siehe usage_history.jsonl fuer Details)."
+        )
+        problem = True
+    if fix_md_new_entries:
+        lines.append(f"Hinweis: FIX.md aktualisiert ({len(fix_md_new_entries)} neue Eintraege).")
+    if telegram_action_log:
+        lines.append("Telegram-Kommandos diesen Zyklus verarbeitet:")
+        lines.extend(f"- {entry}" for entry in telegram_action_log)
+    if not problem:
+        lines.append("System gesund: kein Crash, Zustand persistent, keine Sicherheitslimits ausgeloest.")
+    return "\n".join(lines)
+
+
+def _kaizen_business_lines(subsidiary_id: str, since_iso: str) -> list:
+    """Part 1.1: self-improvement items, acted vs deferred (both mechanical
+    - holding.read_kaizen_actions, not trusted to the agent's own prose)
+    separated from what's proposed to the board (holding.read_kaizen_
+    suggestions - the existing fuer_aufsichtsrat bucket).
+    """
+    actions = holding.read_kaizen_actions(subsidiary_id, since_iso)
+    acted = [a for a in actions if a.get("status") == "acted"]
+    deferred = [a for a in actions if a.get("status") == "deferred"]
+    proposed = holding.read_kaizen_suggestions(subsidiary_id, since_iso)
+    if not (acted or deferred or proposed):
+        return []
+    lines = ["", "--- Selbstverbesserung (Kaizen) ---"]
+    if acted:
+        lines.append(f"Direkt umgesetzt ({len(acted)}):")
+        lines.extend(f"- {a['action']}" for a in acted)
+    if deferred:
+        lines.append(f"Zurueckgestellt ({len(deferred)}):")
+        lines.extend(f"- {a['action']} ({a.get('deferred_reason')})" for a in deferred)
+    if proposed:
+        lines.append(
+            f"Dem Board vorgeschlagen ({len(proposed)}): siehe 'Fuer den Aufsichtsrat' unten."
+        )
+    return lines
+
+
+def _approvals_business_lines(subsidiary_id: str, previously_reported_ids: list) -> tuple:
+    """Part 1.1: open approval requests, explicitly split into genuinely
+    new since the last report vs. already-known-and-still-pending -
+    mechanical (list_pending_approval_ids vs. the prior business report's
+    own reported_approval_ids), never re-presented as new when it isn't.
+    Returns (lines, current_pending_ids) - the ids are what gets persisted
+    via save_business_report for the NEXT cycle's comparison.
+    """
+    current_ids = list_pending_approval_ids(subsidiary_id)
+    previously_reported = set(previously_reported_ids or [])
+    new_ids = [i for i in current_ids if i not in previously_reported]
+    known_ids = [i for i in current_ids if i in previously_reported]
+    lines = []
+    if current_ids:
+        lines = ["", "--- Offene Freigaben ---"]
+        if new_ids:
+            lines.append(f"Neu seit letztem Report ({len(new_ids)}): {', '.join(new_ids)}")
+        if known_ids:
+            lines.append(f"Bereits bekannt, weiter offen ({len(known_ids)}): {', '.join(known_ids)}")
+    return lines, current_ids
+
+
+def _top_hypotheses_lines(block: dict) -> list:
+    """Part 1.3: the top-4 block plus every genuinely new-this-cycle entry
+    not already in it - real, current ice_score/status from build_top_
+    hypotheses_block, never restated stale figures.
+    """
+    if not block["top"] and not block["new_this_cycle"]:
+        return []
+    lines = ["", "--- Top-Hypothesen ---"]
+    for i, c in enumerate(block["top"], 1):
+        marker = " (neu)" if c.get("is_new") else ""
+        score = f"{c['score']:.1f}" if c.get("score") is not None else "n/a"
+        lines.append(f"{i}. {c['id']}{marker} [{c['status']}, score={score}]: {c['one_liner']}")
+    if block["new_this_cycle"]:
+        lines.append("Weitere, neu diesen Zyklus (noch nicht in den Top 4):")
+        for c in block["new_this_cycle"]:
+            score = f"{c['score']:.1f}" if c.get("score") is not None else "n/a"
+            lines.append(f"- {c['id']} [{c['status']}, score={score}]: {c['one_liner']}")
+    return lines
+
+
 def send_cycle_summary(
     subsidiary_id: str, kickoff_error: Exception = None, telegram_action_log: list = None,
-    persistence_warning: str = None,
+    persistence_warning: str = None, spare_capacity_produced_nothing: bool = False,
 ) -> None:
-    """Post a what-happened/what's-next digest of this cycle to Telegram as
-    a single message (structural-rebuild addendum, section 8 - the prior
-    second "formatted cost table" message was fully redundant with
-    _usage_headline()/_usage_detail_line() already below, same numbers
-    re-tabulated, so dropping it loses no information and removes a real
-    Markdown-parse-failure risk rather than trading one risk for another),
-    and saves a condensed version as next cycle's continuity note. Called
-    once after kickoff() finishes (or fails) - never raises itself, so a
-    broken notification never masks whatever kickoff() already did or
-    didn't do. If kickoff_error is set, that's reported up front instead of
-    being silently swallowed - a hard crew failure must still reach
-    Telegram, not just Railway's logs, since that's the only place a human
-    reliably sees it. persistence_warning (from check_state_persistence(),
-    computed once at the very start of the cycle in __main__) gets the same
-    visibility tier as the existing budget/max_iter warnings below - state
-    silently not surviving the next redeploy is exactly the kind of thing
-    that must never go unnoticed again (see README chapter 15).
+    """Post two sequential Telegram messages for this cycle (cycle-
+    reporting/backlog addendum, Part 1.1): Message A, a short technical
+    status (this replaces the prior single combined message's cost/
+    warnings preamble), and Message B, a Sub-CEO-to-board business
+    narrative. Saves a condensed version of Message B as next cycle's
+    channel-strategy continuity note, and persists a structured business-
+    report record (next step, reported approval ids) for the NEXT cycle's
+    own comparison. Called once after kickoff() finishes (or fails) -
+    never raises itself, so a broken notification never masks whatever
+    kickoff() already did or didn't do. If kickoff_error is set, that's
+    reported up front instead of being silently swallowed. persistence_
+    warning (from check_state_persistence(), computed once at the very
+    start of the cycle in __main__) gets the same visibility tier as the
+    existing safety-limit warnings. spare_capacity_produced_nothing (Part
+    2, section 2.4 - computed in __main__ via scoring.spare_capacity_
+    produced_nothing) is flagged plainly in Message B as its own finding
+    when true, a stronger and more immediate signal than the existing
+    3-cycle zero_state_streak check.
     """
     try:
         notify_new_pending_approvals()
-        pending = json.loads(read_state.run()).get("pending_approvals", "?")
         usage = _compute_cycle_usage()
-        hypothesis_overview = build_hypothesis_overview()
         duration_policy = json.loads(
             read_subsidiary_policies.run(subsidiary_id=subsidiary_id)
         ).get("max_duration_days_by_stage")
@@ -1888,51 +2141,38 @@ def send_cycle_summary(
         kaizen_new_entries = holding.read_unnotified_kaizen_suggestions()
         if kaizen_new_entries:
             holding.mark_kaizen_suggestions_notified([e["id"] for e in kaizen_new_entries])
-        # Total tokens is the single most-glanced-at number in this report -
-        # kept as its own standalone line right at the top, ahead of even
-        # the profile/model detail line below, so it's unmissable rather
-        # than folded mid-sentence into a longer paragraph.
-        lines = [
-            f"{subsidiary_id} Zyklus - {datetime.now(timezone.utc).isoformat()}",
-            _usage_headline(usage),
+
+        message_a = _technical_status_message(
+            subsidiary_id, usage, kickoff_error, persistence_warning, telegram_action_log, fix_md_new_entries,
+        )
+
+        since_iso = (_previous_business_report or {}).get("at") or ""
+        next_step = get_and_clear_pending_next_step(default="(kein naechster Schritt gemeldet)")
+        approvals_lines, current_approval_ids = _approvals_business_lines(
+            subsidiary_id, (_previous_business_report or {}).get("reported_approval_ids")
+        )
+
+        lines_b = [
+            f"{subsidiary_id} Business Update - {datetime.now(timezone.utc).isoformat()}",
             "",
             "--- Hypothesen-Uebersicht ---",
         ]
-        lines += _format_hypothesis_overview(hypothesis_overview)
-        if kickoff_error is not None:
-            lines.append(f"WARNUNG: Der Crew-Lauf ist fehlgeschlagen: {kickoff_error}")
-            lines.append("Nachfolgende Tasks haben moeglicherweise nicht mehr gelaufen.")
-        if telegram_action_log:
-            lines.append("Telegram-Kommandos diesen Zyklus verarbeitet:")
-            lines.extend(f"- {entry}" for entry in telegram_action_log)
-        lines += [
-            _usage_detail_line(usage),
-            f"Offene Freigaben (approve.py / Telegram-Reply): {pending}",
-        ]
-        if persistence_warning:
-            lines.append(f"WARNUNG: Zustand vermutlich nicht persistent: {persistence_warning}")
-        if _limit_hits:
-            lines.append("WARNUNG: Sicherheitslimits diesen Zyklus ausgeloest:")
-            lines.extend(f"- {hit}" for hit in _limit_hits)
-        if _malformed_tool_calls:
-            lines.append(
-                f"Hinweis: {len(_malformed_tool_calls)}x fehlerhafter Tool-Aufruf diesen Zyklus "
-                "(leeres/unvollstaendiges Argument-Dict vor der eigenen Validierung, vermuteter "
-                "Zusammenhang mit dem strict-tools-Patch - siehe usage_history.jsonl fuer Details)."
-            )
-        if _task_usage_log:
-            per_task = ", ".join(f"{e['task']}={e['tokens']}" for e in _task_usage_log)
-            lines.append(f"Tokens pro Task: {per_task}")
-        lines += [
-            "",
-            "--- Channel-Strategie ---",
-            _task_summary(task_channel_strategy)[:1200],
-            "",
-            "--- Wachstum ---",
-            _task_summary(task_growth)[:800],
-            "",
-            "--- Sub-CEO (API Sentinel): Ergebnis & naechste Schritte ---",
-            _task_summary(task_ceo)[:1800],
+        lines_b += _format_hypothesis_overview(build_hypothesis_overview())
+        lines_b += ["", _task_summary(task_ceo)[:2500]]
+        lines_b += _top_hypotheses_lines(build_top_hypotheses_block())
+        lines_b += _kaizen_business_lines(subsidiary_id, since_iso)
+        lines_b += approvals_lines
+        if spare_capacity_produced_nothing:
+            lines_b += [
+                "",
+                "--- Anti-Stagnation-Hinweis ---",
+                "Dieser Zyklus hatte freie aktive-Test-Kapazitaet (aktive Hypothesen < "
+                f"{tools.MAX_ACTIVE_HYPOTHESES}) und hat keinen neuen persistenten Zustand erzeugt "
+                "(keine neue/aktualisierte Hypothese, kein Backlog-Eintrag, kein Research-Fund, kein "
+                "Content-Draft, keine Task-Order) - das ist selbst ein Befund, siehe Backlog-Addendum "
+                "Abschnitt 2.4.",
+            ]
+        lines_b += [
             "",
             "--- Main-CEO: Holding-Review ---",
             _task_summary(task_main_ceo_review)[:1000],
@@ -1940,13 +2180,17 @@ def send_cycle_summary(
             "--- Dev ---",
             _task_summary(task_dev)[:400],
         ]
-        lines += _aufsichtsrat_lines(
-            pending, duration_policy, pending_stage_skips, stagnation_escalations,
+        lines_b += _aufsichtsrat_lines(
+            len(current_approval_ids), duration_policy, pending_stage_skips, stagnation_escalations,
             fix_md_new_entries=fix_md_new_entries, kaizen_new_count=len(kaizen_new_entries),
         )
-        full_summary = "\n".join(lines)
-        send_telegram_message(full_summary)
-        save_cycle_note(full_summary[:3000])
+        lines_b += ["", f"Naechster Schritt: {next_step}"]
+        message_b = "\n".join(lines_b)
+
+        send_telegram_message(message_a)
+        send_telegram_message(message_b)
+        save_cycle_note(message_b[:3000])
+        save_business_report(next_step=next_step, reported_approval_ids=current_approval_ids)
     except Exception as exc:
         print(f"[api-sentinel] cycle summary failed (crew run itself was unaffected): {exc}")
 
@@ -1995,18 +2239,33 @@ if __name__ == "__main__":
             _limit_hits.clear()
             _task_usage_log.clear()
             _malformed_tool_calls.clear()
+            # Anti-stagnation addendum, Part 2 section 2.4: snapshot BEFORE
+            # kickoff() so send_cycle_summary can tell whether this cycle had
+            # unused active-testing capacity at the start AND produced no
+            # new persisted state by the end - immediate, single-cycle,
+            # unlike holding.check_zero_state_streak's 3-cycle window.
+            pre_active_count = len(json.loads(read_hypotheses.run(status="active")))
+            cycle_start_counts = snapshot_state_counts()
             try:
                 crew.kickoff(inputs={"subsidiary_id": sub_id})
                 print(f"[api-sentinel] Execution finished for '{sub_id}'.")
                 run_fix_checks_for_subsidiary(sub_id)
+                spare_capacity_produced_nothing = scoring.spare_capacity_produced_nothing(
+                    pre_active_count, tools.MAX_ACTIVE_HYPOTHESES, cycle_start_counts, snapshot_state_counts(),
+                )
                 send_cycle_summary(
                     subsidiary_id=sub_id, telegram_action_log=telegram_action_log,
                     persistence_warning=persistence["warning"],
+                    spare_capacity_produced_nothing=spare_capacity_produced_nothing,
                 )
             except Exception as exc:
                 print(f"[api-sentinel] crew.kickoff() failed for '{sub_id}': {exc}")
                 run_fix_checks_for_subsidiary(sub_id)
+                spare_capacity_produced_nothing = scoring.spare_capacity_produced_nothing(
+                    pre_active_count, tools.MAX_ACTIVE_HYPOTHESES, cycle_start_counts, snapshot_state_counts(),
+                )
                 send_cycle_summary(
                     subsidiary_id=sub_id, kickoff_error=exc, telegram_action_log=telegram_action_log,
                     persistence_warning=persistence["warning"],
+                    spare_capacity_produced_nothing=spare_capacity_produced_nothing,
                 )

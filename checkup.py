@@ -3551,6 +3551,7 @@ def test_ceo_agent_tools_match_spec():
         "file_pivot_proposal", "file_cross_subsidiary_request", "search_research_archive",
         "read_subsidiary_policies", "read_content_drafts", "log_research_finding", "read_research_findings",
         "read_knowledge_base", "write_knowledge_entry", "propose_idea", "file_stage_skip_request",
+        "write_backlog_candidate", "read_backlog", "set_next_step",
         "search_web", "read_webpage",
     }, tool_names
 
@@ -3567,6 +3568,7 @@ def test_main_ceo_agent_tools_match_spec():
         "read_subsidiary_policies", "update_subsidiary_policies",
         "propose_idea", "read_ideas", "route_idea",
         "read_stage_skip_requests", "decide_stage_skip_request",
+        "write_backlog_candidate", "read_backlog",
         "search_web", "read_webpage", "file_kaizen_report",
     }, tool_names
 
@@ -3576,10 +3578,12 @@ def test_growth_dev_tools():
         "request_approval", "read_channel_metrics", "read_channels", "read_state", "read_hypotheses",
         "read_task_orders", "complete_task_order", "draft_content", "read_content_drafts",
         "check_community_risk", "get_account_stats", "log_research_finding", "read_research_findings",
-        "read_subsidiary_policies", "read_knowledge_base", "propose_idea", "search_web", "read_webpage",
+        "read_subsidiary_policies", "read_knowledge_base", "propose_idea", "write_backlog_candidate",
+        "search_web", "read_webpage",
     }
     assert {t.name for t in crew.dev_agent.tools} == {
         "open_pull_request", "read_task_orders", "complete_task_order", "check_approval_status",
+        "write_backlog_candidate",
     }
 
 
@@ -3807,15 +3811,21 @@ def test_usage_headline_is_first_line_in_cycle_summary():
         })()
         crew.send_cycle_summary(subsidiary_id="api-sentinel")
         assert captured, "expected send_telegram_message to be called"
-        # Structural-rebuild addendum, section 8: single message now, no
-        # separate formatted-table follow-up.
-        assert len(captured) == 1
-        main_report = captured[0][0]
-        lines = main_report.split("\n")
-        assert lines[0].startswith("api-sentinel Zyklus - ")
-        assert lines[1].startswith("Gesamt-Tokens diesen Zyklus: 999")
-        assert "$" in lines[1]  # cost figure present (model is priced in the active testing profile)
-        assert "--- Hypothesen-Uebersicht ---" in main_report
+        # cycle-reporting/backlog addendum, Part 1.1: two sequential
+        # messages now - Message A (technical status) then Message B
+        # (business report) - not one combined message anymore.
+        assert len(captured) == 2
+        message_a, message_b = captured[0][0], captured[1][0]
+        lines_a = message_a.split("\n")
+        assert lines_a[0].startswith("api-sentinel Zyklus - ")
+        assert lines_a[1].startswith("Gesamt-Tokens diesen Zyklus: 999")
+        assert "$" in lines_a[1]  # cost figure present (model is priced in the active testing profile)
+        # Clean run (no kickoff_error, no persistence_warning, no limit
+        # hits/malformed calls): Message A stays short - header, usage
+        # headline, health confirmation, nothing more.
+        assert lines_a[-1] == "System gesund: kein Crash, Zustand persistent, keine Sicherheitslimits ausgeloest."
+        assert message_b.startswith("api-sentinel Business Update - ")
+        assert "--- Hypothesen-Uebersicht ---" in message_b
     finally:
         crew.send_telegram_message = original_send
         crew.crew.usage_metrics = original_metrics
@@ -4257,6 +4267,480 @@ def test_aufsichtsrat_lines_kaizen_new_count():
     joined = "\n".join(lines)
     assert "2 neue Kaizen-Vorschlaege" in joined
     assert "kaizen_suggestions.jsonl" in joined
+
+
+# --------------------------------------------------------------------------
+# Cycle-reporting/backlog addendum: Part 1 (report splitting, next-step
+# tracking, top-hypotheses block) and Part 2 (hypothesis backlog, ICE
+# scoring, staleness, anti-stagnation).
+# --------------------------------------------------------------------------
+
+# --- scoring.py: ICE score + anti-stagnation pure functions ---------------
+
+def test_compute_ice_score_multiplies_sub_scores():
+    assert scoring.compute_ice_score(8, 5, 5) == 200
+    assert scoring.compute_ice_score(1, 1, 1) == 1
+    assert scoring.compute_ice_score(10, 10, 10) == 1000
+
+
+def test_compute_ice_score_rejects_out_of_range():
+    for bad_args in ((0, 5, 5), (11, 5, 5), (5, 0, 5), (5, 5, 11)):
+        try:
+            scoring.compute_ice_score(*bad_args)
+            assert False, f"expected ValueError for {bad_args}"
+        except ValueError:
+            pass
+
+
+def test_spare_capacity_produced_nothing_true_when_capacity_and_no_change():
+    counts = {"hypotheses": 1, "hypothesis_backlog": 2, "research_findings": 0, "content_drafts": 0, "task_orders": 0}
+    assert scoring.spare_capacity_produced_nothing(1, 3, counts, dict(counts)) is True
+
+
+def test_spare_capacity_produced_nothing_false_when_no_spare_capacity():
+    counts = {"hypotheses": 3, "hypothesis_backlog": 0, "research_findings": 0, "content_drafts": 0, "task_orders": 0}
+    assert scoring.spare_capacity_produced_nothing(3, 3, counts, dict(counts)) is False
+
+
+def test_spare_capacity_produced_nothing_false_when_state_changed():
+    start = {"hypotheses": 1, "hypothesis_backlog": 2, "research_findings": 0, "content_drafts": 0, "task_orders": 0}
+    end = {**start, "hypothesis_backlog": 3}
+    assert scoring.spare_capacity_produced_nothing(1, 3, start, end) is False
+
+
+# --- tools.py: hypothesis backlog + ICE grounding + staleness -------------
+
+def _real_research_finding_id(hypothesis_id="hyp_backlog_ground"):
+    result = json.loads(tools.log_research_finding.run(
+        hypothesis_id=hypothesis_id, finding_type="forum_discussion", source="reddit",
+        summary=_SUBSTANTIVE_SUMMARY,
+    ))
+    return result["id"]
+
+BACKLOG_STATEMENT = (
+    "Several r/algotrading threads this month mention wanting a simple webhook-based alert for "
+    "unexplained order-book depth drops - adjacent to the current hypothesis's audience but a distinct angle."
+)
+
+
+def test_write_backlog_candidate_requires_fields():
+    reset_state()
+    result = json.loads(tools.write_backlog_candidate.run(candidate=json.dumps({"id": "bl_1"})))
+    assert "error" in result
+
+
+def test_write_backlog_candidate_rejects_short_statement():
+    reset_state()
+    finding_id = _real_research_finding_id()
+    result = json.loads(tools.write_backlog_candidate.run(candidate=json.dumps({
+        "id": "bl_short", "statement": "too short", "source": "growth", "fits_subsidiary_scope": "yes",
+        "impact": 5, "impact_grounding": finding_id,
+        "confidence": 5, "confidence_grounding": finding_id,
+        "ease": 5, "ease_grounding": finding_id,
+    })))
+    assert "error" in result and "characters" in result["error"]
+
+
+def test_write_backlog_candidate_rejects_echoed_instruction():
+    reset_state()
+    finding_id = _real_research_finding_id()
+    echoed = "This is a plausible price for a human dev team but not what this system actually pays, padded to length."
+    result = json.loads(tools.write_backlog_candidate.run(candidate=json.dumps({
+        "id": "bl_echo", "statement": echoed, "source": "growth", "fits_subsidiary_scope": "yes",
+        "impact": 5, "impact_grounding": finding_id,
+        "confidence": 5, "confidence_grounding": finding_id,
+        "ease": 5, "ease_grounding": finding_id,
+    })))
+    assert "error" in result and "echoes" in result["error"]
+
+
+def test_write_backlog_candidate_rejects_unsupported_grounding():
+    reset_state()
+    result = json.loads(tools.write_backlog_candidate.run(candidate=json.dumps({
+        "id": "bl_ungrounded", "statement": BACKLOG_STATEMENT, "source": "growth", "fits_subsidiary_scope": "yes",
+        "impact": 5, "impact_grounding": "research_doesnotexist",
+        "confidence": 5, "confidence_grounding": "research_doesnotexist",
+        "ease": 5, "ease_grounding": "research_doesnotexist",
+    })))
+    assert "error" in result and "not a real" in result["error"]
+
+
+def test_write_backlog_candidate_rejects_out_of_range_ice_score():
+    reset_state()
+    finding_id = _real_research_finding_id()
+    result = json.loads(tools.write_backlog_candidate.run(candidate=json.dumps({
+        "id": "bl_range", "statement": BACKLOG_STATEMENT, "source": "growth", "fits_subsidiary_scope": "yes",
+        "impact": 11, "impact_grounding": finding_id,
+        "confidence": 5, "confidence_grounding": finding_id,
+        "ease": 5, "ease_grounding": finding_id,
+    })))
+    assert "error" in result and "between 1 and 10" in result["error"]
+
+
+def test_write_backlog_candidate_fit_no_requires_reasoning():
+    reset_state()
+    finding_id = _real_research_finding_id()
+    result = json.loads(tools.write_backlog_candidate.run(candidate=json.dumps({
+        "id": "bl_fit_no", "statement": BACKLOG_STATEMENT, "source": "growth", "fits_subsidiary_scope": "no",
+        "impact": 5, "impact_grounding": finding_id,
+        "confidence": 5, "confidence_grounding": finding_id,
+        "ease": 5, "ease_grounding": finding_id,
+    })))
+    assert "error" in result and "fits_subsidiary_scope_reasoning" in result["error"]
+
+
+def test_write_backlog_candidate_create_and_read_roundtrip():
+    reset_state()
+    finding_id = _real_research_finding_id()
+    result = json.loads(tools.write_backlog_candidate.run(candidate=json.dumps({
+        "id": "bl_roundtrip", "statement": BACKLOG_STATEMENT, "source": "growth: r/algotrading",
+        "fits_subsidiary_scope": "yes",
+        "impact": 8, "impact_grounding": finding_id,
+        "confidence": 6, "confidence_grounding": finding_id,
+        "ease": 7, "ease_grounding": finding_id, "ease_target_stage": "research",
+    })))
+    assert result == {"ok": True, "id": "bl_roundtrip"}
+
+    backlog = json.loads(tools.read_backlog.run())
+    assert len(backlog) == 1
+    entry = backlog[0]
+    assert entry["status"] == "candidate"
+    assert entry["ice_score"] == 8 * 6 * 7
+    assert entry["impact_stale"] is False  # no strategic direction ever set -> nothing to be stale against
+
+
+def test_write_backlog_candidate_shelved_requires_reasoning():
+    reset_state()
+    finding_id = _real_research_finding_id()
+    tools.write_backlog_candidate.run(candidate=json.dumps({
+        "id": "bl_shelve", "statement": BACKLOG_STATEMENT, "source": "growth", "fits_subsidiary_scope": "yes",
+        "impact": 5, "impact_grounding": finding_id,
+        "confidence": 5, "confidence_grounding": finding_id,
+        "ease": 5, "ease_grounding": finding_id,
+    }))
+    result = json.loads(tools.write_backlog_candidate.run(candidate=json.dumps({
+        "id": "bl_shelve", "status": "shelved",
+    })))
+    assert "error" in result and "shelved_reasoning" in result["error"]
+
+    ok = json.loads(tools.write_backlog_candidate.run(candidate=json.dumps({
+        "id": "bl_shelve", "status": "shelved", "shelved_reasoning": "duplicate of an already-active hypothesis",
+    })))
+    assert ok == {"ok": True, "id": "bl_shelve"}
+
+
+def test_read_backlog_filters_by_status_and_sorts_descending():
+    reset_state()
+    finding_id = _real_research_finding_id()
+    for cid, impact in (("bl_low", 2), ("bl_high", 9)):
+        tools.write_backlog_candidate.run(candidate=json.dumps({
+            "id": cid, "statement": BACKLOG_STATEMENT, "source": "growth", "fits_subsidiary_scope": "yes",
+            "impact": impact, "impact_grounding": finding_id,
+            "confidence": 5, "confidence_grounding": finding_id,
+            "ease": 5, "ease_grounding": finding_id,
+        }))
+    ranked = json.loads(tools.read_backlog.run())
+    assert [e["id"] for e in ranked] == ["bl_high", "bl_low"]
+
+    tools.write_backlog_candidate.run(candidate=json.dumps({"id": "bl_high", "status": "promoted"}))
+    only_candidates = json.loads(tools.read_backlog.run(status="candidate"))
+    assert [e["id"] for e in only_candidates] == ["bl_low"]
+
+
+def test_backlog_impact_staleness_flips_across_strategic_direction():
+    # Real before/after example: the SAME candidate's impact scored under
+    # two different strategic directions - staleness must be lazy (only
+    # flagged, never silently mass-recomputed) and the ice_score must
+    # actually change once genuinely re-scored.
+    reset_state()
+    finding_id = _real_research_finding_id()
+    holding.read_subsidiaries.run()  # bootstrap api-sentinel
+
+    dir_a = json.loads(holding.set_strategic_direction.run(
+        subsidiary_id="api-sentinel", focus_area="organic community growth", reasoning="baseline",
+    ))["filed"]
+    tools.write_backlog_candidate.run(candidate=json.dumps({
+        "id": "bl_stale", "statement": BACKLOG_STATEMENT, "source": "growth", "fits_subsidiary_scope": "yes",
+        "impact": 8, "impact_grounding": finding_id,
+        "confidence": 5, "confidence_grounding": finding_id,
+        "ease": 5, "ease_grounding": finding_id,
+    }))
+    before = json.loads(tools.read_backlog.run())[0]
+    assert before["impact_stale"] is False
+    assert before["ice_score"] == 8 * 5 * 5
+
+    dir_b = json.loads(holding.set_strategic_direction.run(
+        subsidiary_id="api-sentinel", focus_area="paid B2B tier instead", reasoning="market shift",
+    ))["filed"]
+    assert dir_b != dir_a
+    after_direction_change = json.loads(tools.read_backlog.run())[0]
+    assert after_direction_change["impact_stale"] is True, "must flag stale, not silently keep the old number"
+    assert after_direction_change["impact"] == 8, "must NOT eagerly mass-recompute - the raw number is unchanged"
+
+    tools.write_backlog_candidate.run(candidate=json.dumps({
+        "id": "bl_stale", "impact": 3, "impact_grounding": finding_id,
+    }))
+    after_rescore = json.loads(tools.read_backlog.run())[0]
+    assert after_rescore["impact_stale"] is False
+    assert after_rescore["ice_score"] == 3 * 5 * 5
+    assert after_rescore["ice_score"] != before["ice_score"], "same idea, genuinely different score under a new direction"
+
+
+def test_backlog_grounding_exists_checks_real_ids():
+    reset_state()
+    assert tools._backlog_grounding_exists("") is False
+    assert tools._backlog_grounding_exists("nonexistent_id") is False
+    finding_id = _real_research_finding_id()
+    assert tools._backlog_grounding_exists(finding_id) is True
+    assert tools._backlog_grounding_exists("reddit") is True  # seeded channel id from reset_state()
+
+
+# --- tools.py: business-report continuity ----------------------------------
+
+def test_set_next_step_and_get_and_clear_roundtrip():
+    reset_state()
+    result = json.loads(tools.set_next_step.run(next_step="Promote bl_high to active testing next cycle."))
+    assert result == {"ok": True}
+    assert tools.get_and_clear_pending_next_step() == "Promote bl_high to active testing next cycle."
+    # cleared after read - a second call falls back to the default
+    assert tools.get_and_clear_pending_next_step(default="(none)") == "(none)"
+
+
+def test_set_next_step_rejects_empty():
+    reset_state()
+    result = json.loads(tools.set_next_step.run(next_step="   "))
+    assert "error" in result
+
+
+def test_save_and_read_last_business_report_roundtrip():
+    reset_state()
+    assert tools.read_last_business_report() is None
+    tools.save_business_report(next_step="ship the landing page variant", reported_approval_ids=["appr_1", "appr_2"])
+    last = tools.read_last_business_report()
+    assert last["next_step"] == "ship the landing page variant"
+    assert last["reported_approval_ids"] == ["appr_1", "appr_2"]
+    tools.save_business_report(next_step="second report", reported_approval_ids=[])
+    assert tools.read_last_business_report()["next_step"] == "second report"
+
+
+def test_snapshot_state_counts_reflects_real_writes():
+    reset_state()
+    before = tools.snapshot_state_counts()
+    finding_id = _real_research_finding_id()
+    tools.write_backlog_candidate.run(candidate=json.dumps({
+        "id": "bl_snap", "statement": BACKLOG_STATEMENT, "source": "growth", "fits_subsidiary_scope": "yes",
+        "impact": 5, "impact_grounding": finding_id,
+        "confidence": 5, "confidence_grounding": finding_id,
+        "ease": 5, "ease_grounding": finding_id,
+    }))
+    after = tools.snapshot_state_counts()
+    assert after["research_findings"] == before["research_findings"] + 1
+    assert after["hypothesis_backlog"] == before["hypothesis_backlog"] + 1
+
+
+def test_list_pending_approval_ids_scopes_by_subsidiary():
+    reset_state()
+    tools.request_approval.run(category="publish", proposal=json.dumps({
+        "platform": "reddit", "target_url": "u", "title": "t", "text": "x", "footer": "keiner",
+        "hypothesis_id": "hyp_x", "evidence_stage": "research", "is_experiment": True,
+        "success_criterion": "n/a",
+    }), reasoning="r")
+    ids = tools.list_pending_approval_ids("api-sentinel")
+    assert len(ids) == 1
+    assert tools.list_pending_approval_ids("some-other-subsidiary") == []
+
+
+# --- holding.py: Kaizen acted/deferred persistence + backlog-aware streak -
+
+def test_file_kaizen_report_persists_selbst_umsetzbar_actions():
+    reset_state()
+    holding.read_subsidiaries.run()
+    result = json.loads(holding.file_kaizen_report.run(subsidiary_id="api-sentinel", kaizen_report=json.dumps({
+        "selbst_umsetzbar": [
+            {"action": "re-scored a stale backlog candidate", "grounding": "reddit", "status": "acted"},
+            {"action": "left a low-priority candidate alone", "grounding": "reddit", "status": "deferred",
+             "deferred_reason": "not enough spare capacity this cycle"},
+        ],
+        "fuer_aufsichtsrat": [{"suggestion": "consider raising the backlog WIP limit", "grounding": "reddit"}],
+    })))
+    assert result == {"logged_selbst_umsetzbar": 2, "logged_fuer_aufsichtsrat": 1}
+
+    actions = holding.read_kaizen_actions("api-sentinel")
+    assert len(actions) == 2
+    assert {a["status"] for a in actions} == {"acted", "deferred"}
+    suggestions = holding.read_kaizen_suggestions("api-sentinel")
+    assert len(suggestions) == 1
+
+
+def test_read_kaizen_actions_and_suggestions_filter_by_since():
+    reset_state()
+    holding.read_subsidiaries.run()
+    holding.file_kaizen_report.run(subsidiary_id="api-sentinel", kaizen_report=json.dumps({
+        "selbst_umsetzbar": [{"action": "first", "grounding": "reddit", "status": "acted"}],
+        "fuer_aufsichtsrat": [{"suggestion": "first", "grounding": "reddit"}],
+    }))
+    cutoff = datetime.now(timezone.utc).isoformat()
+    holding.file_kaizen_report.run(subsidiary_id="api-sentinel", kaizen_report=json.dumps({
+        "selbst_umsetzbar": [{"action": "second", "grounding": "reddit", "status": "acted"}],
+        "fuer_aufsichtsrat": [{"suggestion": "second", "grounding": "reddit"}],
+    }))
+    since_actions = holding.read_kaizen_actions("api-sentinel", since_iso=cutoff)
+    assert [a["action"] for a in since_actions] == ["second"]
+    since_suggestions = holding.read_kaizen_suggestions("api-sentinel", since_iso=cutoff)
+    assert [s["suggestion"] for s in since_suggestions] == ["second"]
+
+
+def test_check_zero_state_streak_resets_on_backlog_activity():
+    reset_state()
+    holding.check_zero_state_streak("api-sentinel", 100)  # baseline snapshot
+    holding.check_zero_state_streak("api-sentinel", 100)  # unchanged -> streak 1
+    finding_id = _real_research_finding_id()
+    tools.write_backlog_candidate.run(candidate=json.dumps({
+        "id": "bl_antistall", "statement": BACKLOG_STATEMENT, "source": "growth", "fits_subsidiary_scope": "yes",
+        "impact": 5, "impact_grounding": finding_id,
+        "confidence": 5, "confidence_grounding": finding_id,
+        "ease": 5, "ease_grounding": finding_id,
+    }))
+    holding.check_zero_state_streak("api-sentinel", 100)
+    subs = json.loads(holding.read_subsidiaries.run())
+    idx = next(i for i, s in enumerate(subs) if s["id"] == "api-sentinel")
+    streak = (subs[idx].get("fix_check_streaks") or {}).get("zero_state_streak", 0)
+    assert streak == 0, "a new backlog candidate alone must reset the streak, same as any other real state change"
+
+
+# --- crew.py: Message A/B assembly -----------------------------------------
+
+def test_technical_status_message_clean_cycle_is_three_lines():
+    reset_state()
+    msg = crew._technical_status_message(
+        "api-sentinel", usage=None, kickoff_error=None, persistence_warning=None,
+        telegram_action_log=None, fix_md_new_entries=None,
+    )
+    lines = msg.split("\n")
+    assert len(lines) == 3
+    assert lines[0].startswith("api-sentinel Zyklus - ")
+    assert lines[2] == "System gesund: kein Crash, Zustand persistent, keine Sicherheitslimits ausgeloest."
+
+
+def test_technical_status_message_flags_kickoff_error_and_persistence_warning():
+    reset_state()
+    msg = crew._technical_status_message(
+        "api-sentinel", usage=None, kickoff_error=RuntimeError("boom"), persistence_warning="no volume mounted",
+        telegram_action_log=None, fix_md_new_entries=None,
+    )
+    assert "WARNUNG: Der Crew-Lauf ist fehlgeschlagen: boom" in msg
+    assert "WARNUNG: Zustand vermutlich nicht persistent: no volume mounted" in msg
+    assert "System gesund" not in msg
+
+
+def test_technical_status_message_includes_fix_md_pointer():
+    reset_state()
+    msg = crew._technical_status_message(
+        "api-sentinel", usage=None, kickoff_error=None, persistence_warning=None,
+        telegram_action_log=None, fix_md_new_entries=[{"id": "fix_1", "category": "technisch", "headline": "x"}],
+    )
+    assert "FIX.md aktualisiert (1 neue Eintraege)" in msg
+
+
+def test_build_top_hypotheses_block_ranks_backlog_and_hypotheses_together():
+    reset_state()
+    finding_id = _real_research_finding_id()
+    for cid, impact in (("bl_a", 9), ("bl_b", 7), ("bl_c", 2)):
+        tools.write_backlog_candidate.run(candidate=json.dumps({
+            "id": cid, "statement": BACKLOG_STATEMENT, "source": "growth", "fits_subsidiary_scope": "yes",
+            "impact": impact, "impact_grounding": finding_id,
+            "confidence": 5, "confidence_grounding": finding_id,
+            "ease": 5, "ease_grounding": finding_id,
+        }))
+    hyp = dict(SAMPLE_HYP)
+    hyp["impact_score"], hyp["confidence_score"] = 4, 4  # comparable score 16 - below bl_b (35), above bl_c (10)
+    tools.write_hypothesis.run(hypothesis=json.dumps(hyp))
+
+    block = tools.build_top_hypotheses_block(limit=2)
+    top_ids = [c["id"] for c in block["top"]]
+    assert top_ids == ["bl_a", "bl_b"], top_ids  # scores: bl_a=225, bl_b=175, bl_c=50, hyp=16 - ranked purely by score
+    new_ids = {c["id"] for c in block["new_this_cycle"]}
+    assert new_ids == {"bl_c", hyp["id"]}, new_ids  # everything not in top-2, first-ever report so all count as new
+    assert all(c["is_new"] for c in block["top"]), "first-ever report - nothing to compare against, everything is new"
+
+
+def test_top_hypotheses_lines_marks_new_and_lists_overflow():
+    block = {
+        "top": [{"id": "bl_a", "one_liner": "x", "status": "backlog/candidate", "score": 225.0, "is_new": True}],
+        "new_this_cycle": [{"id": "bl_c", "one_liner": "y", "status": "backlog/candidate", "score": 10.0}],
+    }
+    lines = crew._top_hypotheses_lines(block)
+    joined = "\n".join(lines)
+    assert "bl_a (neu)" in joined
+    assert "bl_c" in joined and "Weitere, neu diesen Zyklus" in joined
+
+
+def test_kaizen_business_lines_splits_acted_deferred_proposed():
+    reset_state()
+    holding.read_subsidiaries.run()
+    holding.file_kaizen_report.run(subsidiary_id="api-sentinel", kaizen_report=json.dumps({
+        "selbst_umsetzbar": [
+            {"action": "re-scored bl_stale", "grounding": "reddit", "status": "acted"},
+            {"action": "held off on bl_low", "grounding": "reddit", "status": "deferred", "deferred_reason": "no capacity"},
+        ],
+        "fuer_aufsichtsrat": [{"suggestion": "raise the WIP cap", "grounding": "reddit"}],
+    }))
+    lines = crew._kaizen_business_lines("api-sentinel", since_iso="")
+    joined = "\n".join(lines)
+    assert "Direkt umgesetzt (1)" in joined and "re-scored bl_stale" in joined
+    assert "Zurueckgestellt (1)" in joined and "no capacity" in joined
+    assert "Dem Board vorgeschlagen (1)" in joined
+
+
+def test_kaizen_business_lines_empty_when_nothing_filed():
+    reset_state()
+    assert crew._kaizen_business_lines("api-sentinel", since_iso="") == []
+
+
+def test_approvals_business_lines_splits_new_vs_known():
+    reset_state()
+    appr_1 = json.loads(tools.request_approval.run(category="spend", proposal="p1", reasoning="r"))["queued"]
+    lines, current_ids = crew._approvals_business_lines("api-sentinel", previously_reported_ids=[appr_1])
+    joined = "\n".join(lines)
+    assert f"Bereits bekannt, weiter offen (1): {appr_1}" in joined
+    assert "Neu seit letztem Report" not in joined
+
+    appr_2 = json.loads(tools.request_approval.run(category="spend", proposal="p2", reasoning="r"))["queued"]
+    lines2, current_ids2 = crew._approvals_business_lines("api-sentinel", previously_reported_ids=[appr_1])
+    joined2 = "\n".join(lines2)
+    assert f"Neu seit letztem Report (1): {appr_2}" in joined2
+    assert f"Bereits bekannt, weiter offen (1): {appr_1}" in joined2
+    assert set(current_ids2) == {appr_1, appr_2}
+
+
+def test_send_cycle_summary_flags_anti_stagnation_in_business_report():
+    reset_state()
+    had_token = os.environ.pop("TELEGRAM_BOT_TOKEN", None)
+    captured = []
+    original_send = crew.send_telegram_message
+    try:
+        crew.send_telegram_message = lambda text, parse_mode=None: captured.append(text)
+        crew.send_cycle_summary(subsidiary_id="api-sentinel", spare_capacity_produced_nothing=True)
+        message_b = captured[1]
+        assert "--- Anti-Stagnation-Hinweis ---" in message_b
+        assert "Abschnitt 2.4" in message_b
+    finally:
+        crew.send_telegram_message = original_send
+        if had_token is not None:
+            os.environ["TELEGRAM_BOT_TOKEN"] = had_token
+
+
+def test_send_cycle_summary_persists_business_report_for_next_cycle():
+    reset_state()
+    had_token = os.environ.pop("TELEGRAM_BOT_TOKEN", None)
+    try:
+        tools.set_next_step.run(next_step="advance hyp_bootstrap research this cycle")
+        crew.send_cycle_summary(subsidiary_id="api-sentinel")
+        saved = tools.read_last_business_report()
+        assert saved["next_step"] == "advance hyp_bootstrap research this cycle"
+    finally:
+        if had_token is not None:
+            os.environ["TELEGRAM_BOT_TOKEN"] = had_token
 
 
 # --------------------------------------------------------------------------

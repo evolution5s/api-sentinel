@@ -873,9 +873,9 @@ def _persist_fix_streak(subsidiary_id: str, check_name: str, streak: int, extra:
 
 def check_zero_state_streak(subsidiary_id: str, threshold: int) -> tuple:
     """Fires when a subsidiary has produced no new persisted state (no new
-    hypothesis, knowledge_base entry, content draft, or task-order progress)
-    across `threshold` consecutive cycles - directly motivated by a real
-    observed case, not a hypothetical.
+    hypothesis, knowledge_base entry, content draft, task-order progress, or
+    backlog candidate/re-score) across `threshold` consecutive cycles -
+    directly motivated by a real observed case, not a hypothetical.
     """
     subs, idx = _get_subsidiary(subsidiary_id)
     if idx is None:
@@ -887,6 +887,11 @@ def check_zero_state_streak(subsidiary_id: str, threshold: int) -> tuple:
         "knowledge_base": len(read_jsonl(state_dir, "knowledge_base.jsonl")),
         "content_drafts": len(read_jsonl(state_dir, "content_drafts.jsonl")),
         "task_orders": len(read_jsonl(state_dir, "task_orders.jsonl")),
+        # Backlog addendum, Part 2: grooming the backlog (new candidates,
+        # re-scored stale entries) is real, productive spare-capacity work
+        # per section 2.3 - a cycle that only did that must not look
+        # identical to one that did nothing at all.
+        "hypothesis_backlog": len(read_jsonl(state_dir, "hypothesis_backlog.jsonl")),
     }
     last_counts = sub.get("_fix_last_state_counts")
     prior_streak = (sub.get("fix_check_streaks") or {}).get("zero_state_streak", 0)
@@ -1242,6 +1247,20 @@ def file_kaizen_report(subsidiary_id: str, kaizen_report: str) -> str:
             "suggestion": item["suggestion"], "grounding": item["grounding"], "telegram_notified_at": None,
         })
 
+    # cycle-reporting/backlog addendum, Part 1.1: selbst_umsetzbar items used
+    # to only exist in this call's own return value - never persisted, so
+    # nothing later could ever ask "what did Kaizen actually act on this
+    # cycle" except by re-reading the agent's own free-text task output.
+    # kaizen_actions.jsonl closes that gap without touching kaizen_
+    # suggestions.jsonl's existing shape/consumers (still exclusively the
+    # fuer_aufsichtsrat/board-facing bucket).
+    for item in selbst_umsetzbar:
+        _append("kaizen_actions.jsonl", {
+            "id": f"kaizenact_{uuid.uuid4().hex[:8]}", "created_at": now, "subsidiary_id": subsidiary_id,
+            "action": item["action"], "grounding": item["grounding"], "status": item["status"],
+            "deferred_reason": item.get("deferred_reason"),
+        })
+
     return json.dumps({
         "logged_selbst_umsetzbar": len(selbst_umsetzbar), "logged_fuer_aufsichtsrat": len(fuer_aufsichtsrat),
     })
@@ -1249,6 +1268,36 @@ def file_kaizen_report(subsidiary_id: str, kaizen_report: str) -> str:
 
 def read_unnotified_kaizen_suggestions() -> list:
     return [e for e in _read("kaizen_suggestions.jsonl") if not e.get("telegram_notified_at")]
+
+
+def read_kaizen_suggestions(subsidiary_id: str = "", since_iso: str = "") -> list:
+    """Read the fuer_aufsichtsrat/board-facing bucket, optionally scoped to
+    one subsidiary and/or a since_iso cutoff - unlike read_unnotified_
+    kaizen_suggestions (Telegram-notification-state scoped), this is for
+    "what did this cycle actually propose to the board", regardless of
+    whether the Telegram pointer already fired.
+    """
+    suggestions = _read("kaizen_suggestions.jsonl")
+    if subsidiary_id:
+        suggestions = [s for s in suggestions if s.get("subsidiary_id") == subsidiary_id]
+    if since_iso:
+        suggestions = [s for s in suggestions if (s.get("created_at") or "") > since_iso]
+    return suggestions
+
+
+def read_kaizen_actions(subsidiary_id: str = "", since_iso: str = "") -> list:
+    """Read the selbst_umsetzbar (acted/deferred) bucket persisted by
+    file_kaizen_report - used by crew.py's business-report assembly (Part
+    1.1) to show what Kaizen actually acted on this cycle vs what it
+    deferred, mechanically split from the fuer_aufsichtsrat/board bucket
+    (kaizen_suggestions.jsonl) rather than trusted to the agent's own prose.
+    """
+    actions = _read("kaizen_actions.jsonl")
+    if subsidiary_id:
+        actions = [a for a in actions if a.get("subsidiary_id") == subsidiary_id]
+    if since_iso:
+        actions = [a for a in actions if (a.get("created_at") or "") > since_iso]
+    return actions
 
 
 def mark_kaizen_suggestions_notified(entry_ids: list) -> None:

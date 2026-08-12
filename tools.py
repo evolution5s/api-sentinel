@@ -138,6 +138,23 @@ MAX_CHANNELS_TESTING = 3
 MAX_TOTAL_CHANNELS = 20
 REQUIRED_CHANNEL_FIELDS = {"id", "name", "category", "is_paid", "impact_score", "confidence_score"}
 
+# --------------------------------------------------------------------------
+# Hypothesis backlog (cycle-reporting/backlog addendum, Part 2). Deliberately
+# separate from MAX_ACTIVE_HYPOTHESES: that stays a genuine WIP limit on how
+# many hypotheses are being actively TESTED at once, this is the much larger,
+# never-capped pool of candidates identified but not yet promoted. Same
+# subsidiary-scoped file pattern as hypotheses.jsonl (_read_jsonl/_write_jsonl
+# below resolve under STATE_DIR/<subsidiary_id>/hypothesis_backlog.jsonl).
+# --------------------------------------------------------------------------
+BACKLOG_STATUSES = {"candidate", "promoted", "shelved"}
+BACKLOG_FIT_VALUES = {"yes", "no", "unclear"}
+# Minimum quality bar (section 2.2) so "always more in the backlog" can't be
+# gamed by one-line stubs generated just to inflate the count - same
+# reasoning as RESEARCH_FINDING_MIN_LENGTH above, a real starting rationale,
+# not a placeholder.
+BACKLOG_STATEMENT_MIN_LENGTH = 60
+ICE_SUB_SCORE_MIN, ICE_SUB_SCORE_MAX = scoring.ICE_SCALE_MIN, scoring.ICE_SCALE_MAX
+
 # Structural-rebuild addendum, section 2: no longer a hardcoded assumption
 # that this module only ever serves one subsidiary. crew.py calls
 # set_active_subsidiary(subsidiary_id) once per subsidiary before each
@@ -338,6 +355,40 @@ def _has_approved_stage_skip(hypothesis_id: str, target_stage: str) -> bool:
 
 
 # --------------------------------------------------------------------------
+# Backlog grounding + strategic-direction staleness (Part 2, sections 2.2/
+# 2.2-staleness). Same "cite a real id, not an unsupported number" pattern
+# as holding._kaizen_grounding_exists, just against the union of id-bearing
+# record types a backlog score would realistically cite (a research
+# finding, a knowledge-base/payment-propensity verdict, a channel signal) -
+# plus the global approval queue, same as Kaizen's own set.
+# --------------------------------------------------------------------------
+
+def _backlog_grounding_exists(grounding: str) -> bool:
+    if not grounding:
+        return False
+    ids = {r.get("id") for r in _read_jsonl("research_findings.jsonl")}
+    ids |= {k.get("id") for k in _read_jsonl("knowledge_base.jsonl")}
+    ids |= {c.get("id") for c in _read_jsonl("channels.jsonl")}
+    ids |= {a.get("id") for a in _read_global_jsonl("approval_queue.jsonl")}
+    return grounding in ids
+
+
+def _current_strategic_direction_id(subsidiary_id: str = None) -> str:
+    """Reads STATE_DIR/_holding/strategic_directions.jsonl directly, same
+    reasoning as _read_own_policies/_has_approved_stage_skip above -
+    importing holding.py back into tools.py would be circular (holding.py
+    already imports from tools.py). Returns None if no direction has ever
+    been set for this subsidiary - a normal, valid state, same as
+    holding.read_strategic_direction's own null case.
+    """
+    directions = [
+        d for d in read_jsonl(STATE_DIR / "_holding", "strategic_directions.jsonl")
+        if d.get("subsidiary_id") == (subsidiary_id or _active_subsidiary_id)
+    ]
+    return directions[-1].get("id") if directions else None
+
+
+# --------------------------------------------------------------------------
 # evidence_stage backfill for pre-existing hypotheses (2026-08-11 fix).
 # evidence_stage became a required field in the structural-rebuild
 # addendum, but that only enforces it going forward on write_hypothesis -
@@ -526,6 +577,159 @@ def log_cycle_usage(metrics: dict) -> None:
 
 
 # --------------------------------------------------------------------------
+# Business-report continuity (cycle-reporting/backlog addendum, Part 1.2).
+# A structured, persisted record of each cycle's "next step" commitment and
+# which approval ids were already reported pending - so the NEXT cycle's
+# business report can do a real lookup ("was the prior next step met?",
+# "is this approval genuinely new?") instead of the agent having to
+# remember it from context. Separate from last_cycle_note.txt above (that's
+# a large free-text blob feeding channel-strategy's continuity) and from
+# usage_history.jsonl (metrics, not narrative) - its own small JSONL file,
+# one record per cycle, never overwritten, so a real before/after history
+# accumulates.
+# --------------------------------------------------------------------------
+
+@tool("set_next_step")
+def set_next_step(next_step: str) -> str:
+    """Sub-CEO states THIS cycle's one concrete next planned step, near the
+    end of its own work - the closing commitment the business report ends
+    on, and what the NEXT cycle's report opens by checking against (did it
+    get met, partially met, or not met, and why). Persisted as a real,
+    structured record (business_reports.jsonl) rather than left buried in
+    free-text output, so that comparison is a lookup, not something to
+    remember from context. Call this once per cycle; a later call the same
+    cycle overwrites the pending value used when the report is assembled.
+    """
+    if not next_step.strip():
+        return json.dumps({"error": "next_step must not be empty"})
+    global _pending_next_step
+    _pending_next_step = next_step
+    return json.dumps({"ok": True})
+
+
+_pending_next_step: str = None
+
+
+def get_and_clear_pending_next_step(default: str = "") -> str:
+    """Orchestration-level: reads whatever set_next_step recorded this
+    cycle (or `default` if it was never called) and resets the in-process
+    global, so one subsidiary's commitment never leaks into the next
+    subsidiary's report within the same cron process (same reset-between-
+    subsidiaries discipline crew.py already applies to _limit_hits etc.).
+    """
+    global _pending_next_step
+    value = _pending_next_step or default
+    _pending_next_step = None
+    return value
+
+
+def save_business_report(next_step: str, reported_approval_ids: list) -> dict:
+    """Orchestration-level (called from crew.py's send_cycle_summary, not
+    an agent tool - same tier as log_cycle_usage/save_cycle_note): persists
+    this cycle's next-step commitment and which approval ids were reported
+    as pending, so the next cycle can tell a genuinely new approval from
+    one already known, and can look up whether this cycle's own commitment
+    was met. Returns the record written.
+    """
+    record = {
+        "id": f"bizreport_{uuid.uuid4().hex[:8]}",
+        "at": datetime.now(timezone.utc).isoformat(),
+        "next_step": next_step,
+        "reported_approval_ids": list(reported_approval_ids or []),
+    }
+    _append_jsonl("business_reports.jsonl", record)
+    return record
+
+
+def read_last_business_report() -> dict:
+    """Returns the most recently saved business_reports.jsonl record, or
+    None if this is the first cycle ever to reach this point (a normal,
+    valid state, not an error).
+    """
+    reports = _read_jsonl("business_reports.jsonl")
+    return reports[-1] if reports else None
+
+
+def snapshot_state_counts() -> dict:
+    """Counts of persisted state that changes when a cycle does genuinely
+    productive work - hypotheses, backlog candidates, research findings,
+    content drafts, task orders. Called once at the start of a cycle and
+    once at the end (crew.py's __main__) so scoring.spare_capacity_
+    produced_nothing can tell whether a cycle with unused active-testing
+    capacity genuinely produced nothing (Part 2, section 2.4) - immediate,
+    single-cycle, unlike holding.check_zero_state_streak's 3-cycle window.
+    """
+    return {
+        "hypotheses": len(_read_jsonl("hypotheses.jsonl")),
+        "hypothesis_backlog": len(_read_jsonl("hypothesis_backlog.jsonl")),
+        "research_findings": len(_read_jsonl("research_findings.jsonl")),
+        "content_drafts": len(_read_jsonl("content_drafts.jsonl")),
+        "task_orders": len(_read_jsonl("task_orders.jsonl")),
+    }
+
+
+def build_top_hypotheses_block(limit: int = 4) -> dict:
+    """Orchestration-level (Part 1.3): the real, current top-`limit` ranked
+    candidates across BOTH the hypothesis backlog (ranked by ice_score,
+    read_backlog's own computed field - one source of truth, never a
+    second parallel ranking) and active/evaluated hypotheses not sourced
+    from a backlog entry (ranked by impact_score * confidence_score, the
+    comparable fallback the addendum calls for when a hypothesis isn't
+    backlog-tracked) - plus every backlog/hypothesis record newer than
+    `since_iso`, regardless of whether it makes the top cut, so a
+    promising new candidate is never silently omitted just because older
+    ones currently outscore it.
+
+    Returns {"top": [...], "new_this_cycle": [...]}, each entry shaped
+    {"id", "one_liner", "status", "score", "source", "is_new"} - never
+    fabricated, every field traces to a real backlog/hypothesis record.
+    """
+    candidates = []
+    for c in json.loads(read_backlog.run()):
+        if c.get("status") == "promoted":
+            continue
+        candidates.append({
+            "id": c["id"],
+            "one_liner": (c.get("statement") or "")[:160],
+            "status": f"backlog/{c.get('status')}",
+            "score": c.get("ice_score"),
+            "source": "backlog",
+            "created_at": c.get("created_at") or "",
+        })
+    backlog_promoted_hyp_ids = {
+        c.get("promoted_to_hypothesis_id")
+        for c in json.loads(read_backlog.run(status="promoted"))
+    }
+    for h in _read_jsonl("hypotheses.jsonl"):
+        if h.get("id") in backlog_promoted_hyp_ids:
+            continue
+        impact = h.get("impact_score")
+        confidence = h.get("confidence_score")
+        score = impact * confidence if impact is not None and confidence is not None else None
+        candidates.append({
+            "id": h["id"],
+            "one_liner": (h.get("statement") or "")[:160],
+            "status": f"hypothesis/{h.get('status')}",
+            "score": score,
+            "source": "active_hypothesis",
+            "created_at": h.get("created_at") or "",
+        })
+
+    ranked = sorted(candidates, key=lambda c: (c["score"] is None, -(c["score"] or 0)))
+    top = ranked[:limit]
+
+    last_report = read_last_business_report()
+    since_iso = last_report["at"] if last_report else ""
+    new_ids = {c["id"] for c in candidates if c["created_at"] > since_iso} if since_iso else {c["id"] for c in candidates}
+    for c in top:
+        c["is_new"] = c["id"] in new_ids
+    top_ids = {c["id"] for c in top}
+    new_not_in_top = [c for c in candidates if c["id"] in new_ids and c["id"] not in top_ids]
+
+    return {"top": top, "new_this_cycle": new_not_in_top}
+
+
+# --------------------------------------------------------------------------
 # CEO tools: state, approvals, hypotheses
 # --------------------------------------------------------------------------
 
@@ -652,6 +856,20 @@ def check_approval_status(approval_id: str) -> str:
         "category": approval.get("category"),
         "payment_link_url": approval.get("payment_link_url"),
     })
+
+
+def list_pending_approval_ids(subsidiary_id: str = "") -> list:
+    """Orchestration-level (crew.py's business-report assembly, Part 1.1) -
+    real pending approval ids right now, optionally scoped to one
+    subsidiary. Used to mechanically distinguish a genuinely new open
+    approval request from one already reported pending in the last cycle's
+    business report, rather than re-presenting every pending request as if
+    new every time.
+    """
+    approvals = _read_global_jsonl("approval_queue.jsonl")
+    if subsidiary_id:
+        approvals = [a for a in approvals if a.get("subsidiary_id") == subsidiary_id]
+    return [a["id"] for a in approvals if a.get("status") == "pending"]
 
 
 @tool("read_hypotheses")
@@ -1295,6 +1513,207 @@ def compute_break_even(
     except ValueError as exc:
         return json.dumps({"error": str(exc)})
     return json.dumps({"applicable": True, "break_even_users": break_even_users})
+
+
+# --------------------------------------------------------------------------
+# Hypothesis backlog + ICE scoring (cycle-reporting/backlog addendum, Part
+# 2). Separate from the WIP-limited active-hypothesis line (MAX_ACTIVE_
+# HYPOTHESES) on purpose - this is the much larger, deliberately never-
+# capped pool of candidates identified but not yet promoted to active
+# testing. Broad intake by design: any agent (Sub-CEO, Growth, Dev, even
+# Main-CEO) can log a plausibly opportunity-shaped idea here, not just
+# narrow restatements of the currently-active hypothesis.
+# --------------------------------------------------------------------------
+
+@tool("write_backlog_candidate")
+def write_backlog_candidate(candidate: str) -> str:
+    """Create or update a hypothesis-backlog candidate - an idea identified
+    as plausibly worth testing later, but not yet promoted to an active
+    hypothesis. `candidate` is a JSON string of a (possibly partial, if
+    updating) candidate object with at least an "id".
+
+    Deliberately broad intake: this is NOT limited to narrow restatements
+    of whatever hypothesis is currently active. An adjacent pain point
+    surfaced in a research finding, a different audience segment noticed
+    while scanning a channel, an alternative pricing angle spotted during a
+    payment-propensity scan, even something tangential found while
+    researching an unrelated topic - all belong here. Don't self-censor to
+    only what's narrowly on-topic; the whole point of separating this from
+    the WIP-limited active-testing slots is to let the backlog stay broader
+    and messier than the active hypothesis line.
+
+    Required on CREATE: statement (this subsidiary's own specific
+    rationale, at least BACKLOG_STATEMENT_MIN_LENGTH characters - a real
+    starting rationale, not a one-line stub generated just to inflate the
+    backlog's count), source (which agent/context surfaced this, e.g.
+    'growth: r/algotrading thread' or 'ceo: payment-propensity scan on
+    reddit'), fits_subsidiary_scope (one of yes/no/unclear - does this
+    genuinely fit the current subsidiary's business model; required
+    whenever it's not 'yes': fits_subsidiary_scope_reasoning, since a
+    no/unclear candidate routes through propose_idea for the Main-CEO to
+    evaluate fresh, not through this subsidiary's own backlog ranking).
+
+    ICE scoring - three separately reasoned 1-10 scores, each requiring its
+    own grounding (a real id from this subsidiary's research_findings.jsonl/
+    knowledge_base.jsonl/channels.jsonl, or the global approval_queue.jsonl -
+    never an unsupported number, same discipline as Kaizen's grounding
+    field): impact/impact_grounding, confidence/confidence_grounding,
+    ease/ease_grounding. impact is scored RELATIVE TO THIS SUBSIDIARY'S
+    CURRENT STRATEGIC DIRECTION, not a fixed property of the idea - the
+    same idea can score very differently under a different audience/
+    pricing/business-model lens, which is exactly why impact gets
+    re-stamped with the direction it was scored under (impact_scored_
+    under_direction_id, set automatically whenever impact/impact_grounding
+    changes) and read_backlog() flags it stale once set_strategic_direction
+    moves on, rather than silently reusing an outdated number. ease should
+    reflect the evidence-stage-ladder cost logic (tools.EVIDENCE_STAGES) -
+    set ease_target_stage to the earliest stage that would actually let you
+    learn something (research/community_engagement candidates are cheaper
+    to test than ones needing landing_page to learn anything) as the
+    documented basis for your own ease number, not something this tool
+    checks mechanically.
+
+    Promotion to active testing is two steps, same pattern as route_idea:
+    call write_hypothesis to actually create the new active hypothesis
+    (optionally citing backlog_candidate_id on it), then call this tool
+    again with status='promoted' and promoted_to_hypothesis_id set. Never
+    promote past MAX_ACTIVE_HYPOTHESES - write_hypothesis enforces that cap
+    itself, this tool doesn't duplicate the check.
+    """
+    try:
+        patch = json.loads(candidate)
+    except json.JSONDecodeError as exc:
+        return json.dumps({"error": f"invalid JSON: {exc}"})
+
+    if "id" not in patch:
+        return json.dumps({"error": "candidate must include an 'id'"})
+    if "status" in patch and patch["status"] not in BACKLOG_STATUSES:
+        return json.dumps({
+            "error": f"invalid status '{patch['status']}', must be one of {sorted(BACKLOG_STATUSES)}"
+        })
+    if "fits_subsidiary_scope" in patch and patch["fits_subsidiary_scope"] not in BACKLOG_FIT_VALUES:
+        return json.dumps({
+            "error": f"invalid fits_subsidiary_scope '{patch['fits_subsidiary_scope']}', must be one of "
+                     f"{sorted(BACKLOG_FIT_VALUES)}"
+        })
+    if "ease_target_stage" in patch and patch["ease_target_stage"] not in EVIDENCE_STAGES:
+        return json.dumps({
+            "error": f"invalid ease_target_stage '{patch['ease_target_stage']}', must be one of {EVIDENCE_STAGES}"
+        })
+
+    backlog = _read_jsonl("hypothesis_backlog.jsonl")
+    existing_index = next((i for i, c in enumerate(backlog) if c.get("id") == patch["id"]), None)
+    existing_record = backlog[existing_index] if existing_index is not None else {}
+    merged_for_checks = {**existing_record, **patch}
+
+    if merged_for_checks.get("status") == "shelved" and not (merged_for_checks.get("shelved_reasoning") or "").strip():
+        return json.dumps({"error": "status='shelved' requires a non-empty shelved_reasoning"})
+
+    fit = merged_for_checks.get("fits_subsidiary_scope")
+    if fit in ("no", "unclear") and not (merged_for_checks.get("fits_subsidiary_scope_reasoning") or "").strip():
+        return json.dumps({
+            "error": f"fits_subsidiary_scope='{fit}' requires a non-empty fits_subsidiary_scope_reasoning - "
+                     "this is what the Main-CEO reviews via propose_idea, say plainly why it might not fit"
+        })
+
+    if existing_index is None:
+        statement = (patch.get("statement") or "").strip()
+        if len(statement) < BACKLOG_STATEMENT_MIN_LENGTH:
+            return json.dumps({
+                "error": f"statement must be at least {BACKLOG_STATEMENT_MIN_LENGTH} characters - a real, "
+                         "specific starting rationale, not a one-line stub"
+            })
+        if _instruction_echo_match(statement):
+            return json.dumps({
+                "error": "statement echoes known instruction/incident template language rather than this "
+                         "subsidiary's own reasoning - describe what's actually specific to this candidate"
+            })
+        missing = {"statement", "source", "fits_subsidiary_scope"} - patch.keys()
+        if missing:
+            return json.dumps({"error": f"new backlog candidate missing required fields: {sorted(missing)}"})
+        for score_field, grounding_field in (
+            ("impact", "impact_grounding"), ("confidence", "confidence_grounding"), ("ease", "ease_grounding"),
+        ):
+            if score_field not in patch or grounding_field not in patch:
+                return json.dumps({
+                    "error": f"new backlog candidate requires both '{score_field}' and '{grounding_field}' - "
+                             "every ICE sub-score must cite a real reason, never an unsupported number"
+                })
+
+    for score_field, grounding_field in (
+        ("impact", "impact_grounding"), ("confidence", "confidence_grounding"), ("ease", "ease_grounding"),
+    ):
+        if score_field in patch:
+            score_value = patch[score_field]
+            if not (ICE_SUB_SCORE_MIN <= score_value <= ICE_SUB_SCORE_MAX):
+                return json.dumps({
+                    "error": f"{score_field} must be between {ICE_SUB_SCORE_MIN} and {ICE_SUB_SCORE_MAX}, "
+                             f"got {score_value}"
+                })
+            grounding = patch.get(grounding_field, existing_record.get(grounding_field))
+            if not _backlog_grounding_exists(grounding):
+                return json.dumps({
+                    "error": f"{grounding_field} '{grounding}' is not a real research_finding/knowledge_base/"
+                             "channel/approval id from this subsidiary's current data - an unsupported "
+                             "number isn't accepted"
+                })
+
+    if "impact" in patch or "impact_grounding" in patch:
+        patch["impact_scored_under_direction_id"] = _current_strategic_direction_id()
+
+    if existing_index is None:
+        record = {
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "status": "candidate",
+            "fits_subsidiary_scope_reasoning": None,
+            "ease_target_stage": None,
+            "promoted_to_hypothesis_id": None,
+            "shelved_reasoning": None,
+            "impact_scored_under_direction_id": _current_strategic_direction_id(),
+            **patch,
+        }
+        backlog.append(record)
+    else:
+        merged = dict(backlog[existing_index])
+        merged.update(patch)
+        backlog[existing_index] = merged
+
+    _write_jsonl("hypothesis_backlog.jsonl", backlog)
+    return json.dumps({"ok": True, "id": patch["id"]})
+
+
+@tool("read_backlog")
+def read_backlog(status: str = "") -> str:
+    """Return hypothesis-backlog candidates as JSON, each annotated with a
+    computed ice_score (scoring.compute_ice_score(impact, confidence,
+    ease) - the same formula used in the cycle report's top-4 block, one
+    source of truth) and impact_stale (true if impact was last scored
+    under a strategic direction that isn't this subsidiary's current one
+    anymore - a signal to re-score before relying on it for ranking/
+    promotion, not something this tool recomputes on its own; only the
+    agent's own judgment can produce a real new impact number).
+    Pass status='candidate'/'promoted'/'shelved' to filter, or '' for all.
+    Sorted by ice_score descending (candidates without a complete ICE score
+    yet sort last, not zero - an incomplete entry isn't "worthless", just
+    not yet rankable).
+    """
+    backlog = _read_jsonl("hypothesis_backlog.jsonl")
+    if status:
+        backlog = [c for c in backlog if c.get("status") == status]
+    current_direction = _current_strategic_direction_id()
+    annotated = []
+    for c in backlog:
+        entry = dict(c)
+        if c.get("impact") is not None and c.get("confidence") is not None and c.get("ease") is not None:
+            entry["ice_score"] = scoring.compute_ice_score(c["impact"], c["confidence"], c["ease"])
+        else:
+            entry["ice_score"] = None
+        entry["impact_stale"] = (
+            c.get("impact") is not None and c.get("impact_scored_under_direction_id") != current_direction
+        )
+        annotated.append(entry)
+    annotated.sort(key=lambda e: (e["ice_score"] is None, -(e["ice_score"] or 0)))
+    return json.dumps(annotated, ensure_ascii=False)
 
 
 # --------------------------------------------------------------------------
