@@ -2,14 +2,14 @@
   "active_profile": "testing",
   "profiles": {
     "testing": {
-      "description": "Minimal-cost functional check while still in testing - cheapest model, small token/iteration caps. This is for verifying the crew still runs end to end, not for judging output quality. Switch active_profile back to 'normal' once done.",
+      "description": "Still cheapest-model (Haiku) functional check, not for judging output quality - but token/iteration caps are 5x the original minimal values (2026-08-12, token-starvation addendum step 3) after repeated real evidence of truncation (posts and intermediate reasoning steps cut off, Growth hitting max_iter without completing its task). Switch active_profile back to 'normal' once done.",
       "model": "claude-haiku-4-5",
-      "cycle_token_budget": 50000,
+      "cycle_token_budget": 250000,
       "agents": {
-        "growth": {"max_tokens": 900, "max_iter": 9, "max_execution_time": 120},
-        "dev": {"max_tokens": 2000, "max_iter": 6, "max_execution_time": 90},
-        "sub_ceo": {"max_tokens": 800, "max_iter": 15, "max_execution_time": 240},
-        "main_ceo": {"max_tokens": 500, "max_iter": 6, "max_execution_time": 120}
+        "growth": {"max_tokens": 4500, "max_iter": 9, "max_execution_time": 120},
+        "dev": {"max_tokens": 10000, "max_iter": 6, "max_execution_time": 90},
+        "sub_ceo": {"max_tokens": 4000, "max_iter": 15, "max_execution_time": 240},
+        "main_ceo": {"max_tokens": 2500, "max_iter": 6, "max_execution_time": 120}
       }
     },
     "normal": {

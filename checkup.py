@@ -3495,6 +3495,29 @@ def test_testing_profile_dev_limits_raised_past_confirmed_stall_floor():
     assert growth_cfg["max_iter"] >= 7, growth_cfg
 
 
+def test_testing_profile_5x_scale_up_matches_confirmed_real_values():
+    # Token-starvation addendum, step 3 (2026-08-12): confirmed via a real
+    # cycle's logs that Growth alone used 48,788 of a 50,000 cycle budget
+    # and still hit max_iter without finishing - the original testing
+    # profile's caps were genuinely too tight, not just a floor mechanism
+    # problem. Jan's explicit decision: multiply every testing-profile
+    # limit by exactly 5x from the confirmed-current values (50,000 /
+    # growth=900 / dev=2,000 / sub_ceo=800 / main_ceo=500), staying on
+    # claude-haiku-4-5 - not a switch to the 'normal'/Sonnet profile. This
+    # locks in the real numbers so a future edit can't silently drift
+    # without deliberately re-deciding the multiplier.
+    with open(crew._AGENT_PROFILE_FILE, encoding="utf-8") as f:
+        config = json.load(f)
+    testing = config["profiles"]["testing"]
+    assert testing["model"] == "claude-haiku-4-5"
+    assert testing["cycle_token_budget"] == 50000 * 5
+    agents = testing["agents"]
+    assert agents["growth"]["max_tokens"] == 900 * 5
+    assert agents["dev"]["max_tokens"] == 2000 * 5
+    assert agents["sub_ceo"]["max_tokens"] == 800 * 5
+    assert agents["main_ceo"]["max_tokens"] == 500 * 5
+
+
 def test_agents_are_configured_from_the_active_profile():
     profile = crew.AGENT_PROFILE
     assert crew.growth_llm.max_tokens == profile["agents"]["growth"]["max_tokens"]
@@ -3583,7 +3606,44 @@ def test_only_first_task_is_unconditional():
     assert not isinstance(crew.task_channel_strategy, ConditionalTask)
     for task in (crew.task_growth, crew.task_ceo, crew.task_main_ceo_review, crew.task_dev):
         assert isinstance(task, ConditionalTask)
-        assert task.condition is crew._within_cycle_budget
+
+
+def test_budget_gate_waterfall_reserves_floor_for_ceo_and_main_ceo():
+    # Token-starvation addendum, step 2: task_growth must reserve budget for
+    # BOTH task_ceo and task_main_ceo_review (they run after it), task_ceo
+    # must reserve for task_main_ceo_review only (it runs after task_ceo but
+    # not after task_growth), and the last two protected/lowest-priority
+    # tasks reserve nothing further - a strict waterfall, not four identical
+    # checks against the same flat threshold.
+    assert crew.task_growth.condition is crew._within_cycle_budget_reserving_ceo_and_main_ceo
+    assert crew.task_ceo.condition is crew._within_cycle_budget_reserving_main_ceo
+    assert crew.task_main_ceo_review.condition is crew._within_cycle_budget
+    assert crew.task_dev.condition is crew._within_cycle_budget
+
+
+def test_budget_gate_waterfall_actually_protects_downstream_tasks():
+    # Functional test of the fix, not just wiring: at a usage level inside
+    # growth's reserved zone but below the ceo-only reserve and below the
+    # full budget, growth must be blocked while ceo and main_ceo_review are
+    # still allowed to run - this is the real bug the addendum reported
+    # (Growth alone consuming 45k-48k of a 50k budget and starving both).
+    from crewai import Crew
+    crew._limit_hits.clear()
+    original = Crew.calculate_usage_metrics
+    try:
+        reserve_ceo_and_main_ceo = round(crew.CYCLE_TOKEN_BUDGET * crew.RESERVE_FRACTION_FOR_CEO_AND_MAIN_CEO)
+        reserve_main_ceo_only = round(crew.CYCLE_TOKEN_BUDGET * crew.RESERVE_FRACTION_FOR_MAIN_CEO)
+        assert reserve_ceo_and_main_ceo > reserve_main_ceo_only, "test assumes a real gap between the two reserves"
+        # Just inside growth's reserved zone, but still below ceo's own
+        # (smaller) reserve and below the full budget.
+        total_in_growth_reserve_only = crew.CYCLE_TOKEN_BUDGET - reserve_main_ceo_only - 1
+        Crew.calculate_usage_metrics = lambda self: type("U", (), {"total_tokens": total_in_growth_reserve_only})()
+        assert crew._within_cycle_budget_reserving_ceo_and_main_ceo(None) is False
+        assert crew._within_cycle_budget_reserving_main_ceo(None) is True
+        assert crew._within_cycle_budget(None) is True
+    finally:
+        Crew.calculate_usage_metrics = original
+        crew._limit_hits.clear()
 
 
 def test_all_task_descriptions_and_agent_backstories_interpolate_cleanly():

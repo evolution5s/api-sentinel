@@ -677,16 +677,56 @@ def _on_tool_validate_input_error(source, event) -> None:
 # Minimum senkt, nicht nur die Werte pro Task.
 CYCLE_TOKEN_BUDGET = AGENT_PROFILE["cycle_token_budget"]
 
+# --------------------------------------------------------------------------
+# Reserved floor for task_ceo/task_main_ceo_review (token-starvation
+# addendum, step 2). Confirmed real bug: the flat check below on its own
+# lets whichever tasks run FIRST (Channel-Strategy, Growth) spend the whole
+# CYCLE_TOKEN_BUDGET, leaving nothing for the Sub-CEO's Build-Measure-Learn
+# evaluation or the Main-CEO's review - both then get skipped by their own
+# ConditionalTask condition, silently, every time it happens (confirmed
+# against a real cycle's logs: Channel-Strategy=16,974 + Growth=48,788 =
+# 65,762 already past a 50,000 budget before task_ceo's condition was ever
+# checked). Fixed as a waterfall: each earlier task's gate reserves a
+# fraction of the budget for the tasks after it that matter more, so a
+# task only gets to run if doing so still leaves room for what's reserved
+# below it. This governs whether a task is allowed to START, same as
+# before - it is NOT a hard per-task token cap (max_tokens/max_iter already
+# are that, per agent) and can't retroactively stop a task that's already
+# running from overrunning its reserved slice; it only prevents queuing a
+# lower-priority task once the reserved zone has already been entered.
+RESERVE_FRACTION_FOR_CEO_AND_MAIN_CEO = 0.35
+RESERVE_FRACTION_FOR_MAIN_CEO = 0.10
 
-def _within_cycle_budget(_previous_task_output) -> bool:
-    total = crew.calculate_usage_metrics().total_tokens
-    if total >= CYCLE_TOKEN_BUDGET:
-        _limit_hits.append(
-            f"Zyklus-Token-Budget ({CYCLE_TOKEN_BUDGET:,}) erreicht "
-            f"({total:,} verbraucht) - verbleibende Tasks diesen Zyklus uebersprungen"
-        )
-        return False
-    return True
+
+def _make_budget_gate(reserve_fraction: float, reserved_for: str = ""):
+    reserve_tokens = round(CYCLE_TOKEN_BUDGET * reserve_fraction)
+
+    def _gate(_previous_task_output) -> bool:
+        total = crew.calculate_usage_metrics().total_tokens
+        limit = CYCLE_TOKEN_BUDGET - reserve_tokens
+        if total >= limit:
+            reserve_note = f", davon {reserve_tokens:,} fuer {reserved_for} reserviert" if reserve_tokens else ""
+            _limit_hits.append(
+                f"Zyklus-Token-Budget ({CYCLE_TOKEN_BUDGET:,}{reserve_note}) erreicht "
+                f"({total:,} verbraucht) - verbleibende Tasks diesen Zyklus uebersprungen"
+            )
+            return False
+        return True
+    return _gate
+
+
+# No reservation - the full-budget gate, used by the lowest-priority tasks
+# (nothing runs after them that still needs protecting) and kept under its
+# original name since existing tests/callers reference it directly.
+_within_cycle_budget = _make_budget_gate(0.0)
+# Growth runs before task_ceo AND task_main_ceo_review - reserves for both.
+_within_cycle_budget_reserving_ceo_and_main_ceo = _make_budget_gate(
+    RESERVE_FRACTION_FOR_CEO_AND_MAIN_CEO, "Sub-CEO+Main-CEO"
+)
+# task_ceo runs before task_main_ceo_review only - reserves for just that one.
+_within_cycle_budget_reserving_main_ceo = _make_budget_gate(
+    RESERVE_FRACTION_FOR_MAIN_CEO, "Main-CEO"
+)
 
 
 # Tasks definieren
@@ -813,7 +853,7 @@ task_channel_strategy = Task(
 )
 
 task_growth = ConditionalTask(
-    condition=_within_cycle_budget,
+    condition=_within_cycle_budget_reserving_ceo_and_main_ceo,
     description=(
         "0) Call read_task_orders(to_role='growth', status='open') first. "
         "These are the Sub-CEO's concrete asks for this cycle, if any were "
@@ -841,7 +881,24 @@ task_growth = ConditionalTask(
         "into (short technical post vs. thread vs. changelog digest, etc.) "
         "and note which format seems to fit each channel's audience best - "
         "this is input for the CEO's channel decision, not a decision you "
-        "make yourself.\n"
+        "make yourself. search_web/read_webpage are available for this "
+        "format comparison and for checking a specific community's current "
+        "rules before drafting - NOT for open-ended research into whether "
+        "the underlying problem is real (confirmed real waste from a real "
+        "cycle, 2026-08-12: an entire 9-iteration run went into general "
+        "problem-validation research - GitHub issues, third-party analyses "
+        "- duplicating work that is task_ceo's own evidence_stage='research' "
+        "job, and never reached step 2's actual deliverable below at all). "
+        "If a genuine market gap surfaces incidentally, propose_idea or "
+        "note it for the Sub-CEO - don't chase it here. Reaching step 2's "
+        "draft_content/request_approval this cycle (or explicitly reporting "
+        "there's nothing new to draft) takes priority over any optional "
+        "research above once the concrete work is otherwise ready. If a "
+        "direct fetch against a reddit.com URL (not the .json metrics "
+        "endpoint read_channel_metrics already uses) gets blocked once this "
+        "run, don't retry another one this cycle - it's a known, recurring "
+        "block on this outbound IP range, not a fluke worth spending a "
+        "second iteration on.\n"
         "2) Content creation is real work here, not something to skip: for "
         "each active hypothesis (or an explicit task order asking for it), "
         "consider drafting one genuine piece of organic community content "
@@ -908,7 +965,7 @@ task_growth = ConditionalTask(
 )
 
 task_ceo = ConditionalTask(
-    condition=_within_cycle_budget,
+    condition=_within_cycle_budget_reserving_main_ceo,
     description=(
         "Run the Build-Measure-Learn loop. Every hypothesis you create in "
         "this task - the bootstrap one in step 0, or a pivot follow-up in "
