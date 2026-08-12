@@ -5,6 +5,26 @@ und wo weiterhin nachgefragt werden muss. Ziel: weniger Unterbrechungen bei
 Routinearbeit, aber die gleiche Vorsicht bei Dingen, die echten Schaden
 anrichten oder den Scope stillschweigend erweitern können.
 
+## Lokale Entwicklungsumgebung
+
+`.venv/` in diesem Repo ist die einzige korrekte Python-Umgebung für lokale
+Läufe von `checkup.py` o.ä. - nicht das System-`python`/`where python`
+(landet auf Windows auf Inkscapes mitgeliefertem Python-Interpreter, ohne
+`crewai` und den Rest von `requirements.txt`), und nicht irgendeine andere
+global installierte Python-Version.
+
+- **Venv-Python direkt aufrufen (bevorzugt, kein Aktivieren nötig):**
+  `.venv/Scripts/python.exe checkup.py`
+- **Venv aktivieren (PowerShell):** `.venv\Scripts\Activate.ps1`, danach
+  reicht `python checkup.py`.
+- **Falls `.venv/` fehlt oder kaputt ist** (z.B. `pyvenv.cfg` zeigt auf
+  einen falschen `home`-Pfad statt einer echten Python-Installation): neu
+  aufbauen aus der globalen Python-3.11-Installation unter
+  `C:\Users\janal\AppData\Local\Programs\Python\Python311\python.exe -m venv
+  .venv`, danach `.venv/Scripts/python.exe -m pip install -r
+  requirements.txt`. `.venv/` ist in `.gitignore`, muss also nach jedem
+  Neuaufbau lokal neu installiert werden, nie eingecheckt.
+
 ## Ohne Rückfrage erlaubt (Autopilot)
 
 - **Lesende Operationen, immer:** `railway logs`, `railway status`,
