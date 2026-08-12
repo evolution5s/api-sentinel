@@ -2083,19 +2083,36 @@ def _approvals_business_lines(subsidiary_id: str, previously_reported_ids: list)
 
 
 def _top_hypotheses_lines(block: dict) -> list:
-    """Part 1.3: the top-4 block plus every genuinely new-this-cycle entry
-    not already in it - real, current ice_score/status from build_top_
-    hypotheses_block, never restated stale figures.
+    """Part 1.3, revised (report-verification addendum): two separate
+    sections, not one merged ranking - "Aktuell in Testung" (every active
+    hypothesis, always shown regardless of score - real ongoing validation
+    work) and "Top-Backlog-Kandidaten" (backlog only, ranked by ice_score).
+    Kept apart because an active hypothesis's own score has no enforced
+    1-10 range unlike backlog ICE sub-scores, so merging them into one
+    sorted list would compare two differently-scaled numbers - on top of
+    real, in-flight work otherwise reading as less important than an
+    untested paper idea purely because ICE's wider range dwarfs it.
     """
-    if not block["top"] and not block["new_this_cycle"]:
+    if not block["active"] and not block["top_backlog"] and not block["new_this_cycle"]:
         return []
-    lines = ["", "--- Top-Hypothesen ---"]
-    for i, c in enumerate(block["top"], 1):
-        marker = " (neu)" if c.get("is_new") else ""
-        score = f"{c['score']:.1f}" if c.get("score") is not None else "n/a"
-        lines.append(f"{i}. {c['id']}{marker} [{c['status']}, score={score}]: {c['one_liner']}")
+    lines = ["", "--- Aktuell in Testung ---"]
+    if block["active"]:
+        for c in block["active"]:
+            marker = " (neu)" if c.get("is_new") else ""
+            score = f"{c['score']:.1f}" if c.get("score") is not None else "n/a"
+            lines.append(f"- {c['id']}{marker} [eigener Score={score}]: {c['one_liner']}")
+    else:
+        lines.append("Keine aktiven Hypothesen.")
+    lines += ["", "--- Top-Backlog-Kandidaten ---"]
+    if block["top_backlog"]:
+        for i, c in enumerate(block["top_backlog"], 1):
+            marker = " (neu)" if c.get("is_new") else ""
+            score = f"{c['score']:.1f}" if c.get("score") is not None else "n/a"
+            lines.append(f"{i}. {c['id']}{marker} [ice_score={score}]: {c['one_liner']}")
+    else:
+        lines.append("Backlog aktuell leer.")
     if block["new_this_cycle"]:
-        lines.append("Weitere, neu diesen Zyklus (noch nicht in den Top 4):")
+        lines.append("Weitere, neu diesen Zyklus (noch nicht oben gelistet):")
         for c in block["new_this_cycle"]:
             score = f"{c['score']:.1f}" if c.get("score") is not None else "n/a"
             lines.append(f"- {c['id']} [{c['status']}, score={score}]: {c['one_liner']}")

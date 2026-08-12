@@ -669,44 +669,50 @@ def snapshot_state_counts() -> dict:
 
 
 def build_top_hypotheses_block(limit: int = 4) -> dict:
-    """Orchestration-level (Part 1.3): the real, current top-`limit` ranked
-    candidates across BOTH the hypothesis backlog (ranked by ice_score,
-    read_backlog's own computed field - one source of truth, never a
-    second parallel ranking) and active/evaluated hypotheses not sourced
-    from a backlog entry (ranked by impact_score * confidence_score, the
-    comparable fallback the addendum calls for when a hypothesis isn't
-    backlog-tracked) - plus every backlog/hypothesis record newer than
-    `since_iso`, regardless of whether it makes the top cut, so a
-    promising new candidate is never silently omitted just because older
-    ones currently outscore it.
+    """Orchestration-level (Part 1.3, revised after the report-verification
+    addendum's design review). Returns two DELIBERATELY SEPARATE sections
+    rather than one merged, score-sorted list:
 
-    Returns {"top": [...], "new_this_cycle": [...]}, each entry shaped
-    {"id", "one_liner", "status", "score", "source", "is_new"} - never
-    fabricated, every field traces to a real backlog/hypothesis record.
+    "active" - every currently status='active' hypothesis (excluding any
+    already tracked as a promoted backlog entry, to avoid double-listing),
+    always shown regardless of score - real ongoing validation work, never
+    ranked against untested backlog candidates in the same list.
+
+    "top_backlog" - the top-`limit` backlog candidates (status='candidate'
+    only), ranked by ice_score - read_backlog's own computed field, one
+    source of truth, never a second parallel computation.
+
+    Why separate rather than one merged ranking: an active hypothesis's
+    comparable score (impact_score * confidence_score) has no enforced
+    1-10 range, unlike backlog ICE sub-scores which do (ICE_SUB_SCORE_MIN/
+    MAX) - merging them into one sorted list would silently compare two
+    differently-scaled numbers, on top of the separate optics problem of
+    real, in-flight validation work reading as less important than an
+    untested paper idea just because ICE's 1-1000 range dwarfs a smaller
+    hypothesis-level score.
+
+    "new_this_cycle" - every active hypothesis or backlog candidate
+    created since the last business report, regardless of whether it's
+    already shown in "active"/"top_backlog", deduplicated against both -
+    so a promising new candidate is never silently omitted just because
+    it doesn't yet rank in the backlog top-N.
+
+    Each entry is shaped {"id", "one_liner", "status", "score", "source",
+    "is_new"} - never fabricated, every field traces to a real backlog/
+    hypothesis record.
     """
-    candidates = []
-    for c in json.loads(read_backlog.run()):
-        if c.get("status") == "promoted":
-            continue
-        candidates.append({
-            "id": c["id"],
-            "one_liner": (c.get("statement") or "")[:160],
-            "status": f"backlog/{c.get('status')}",
-            "score": c.get("ice_score"),
-            "source": "backlog",
-            "created_at": c.get("created_at") or "",
-        })
     backlog_promoted_hyp_ids = {
         c.get("promoted_to_hypothesis_id")
         for c in json.loads(read_backlog.run(status="promoted"))
     }
+    active_hyps = []
     for h in _read_jsonl("hypotheses.jsonl"):
-        if h.get("id") in backlog_promoted_hyp_ids:
+        if h.get("status") != "active" or h.get("id") in backlog_promoted_hyp_ids:
             continue
         impact = h.get("impact_score")
         confidence = h.get("confidence_score")
         score = impact * confidence if impact is not None and confidence is not None else None
-        candidates.append({
+        active_hyps.append({
             "id": h["id"],
             "one_liner": (h.get("statement") or "")[:160],
             "status": f"hypothesis/{h.get('status')}",
@@ -715,18 +721,32 @@ def build_top_hypotheses_block(limit: int = 4) -> dict:
             "created_at": h.get("created_at") or "",
         })
 
-    ranked = sorted(candidates, key=lambda c: (c["score"] is None, -(c["score"] or 0)))
-    top = ranked[:limit]
+    backlog_candidates = []
+    for c in json.loads(read_backlog.run(status="candidate")):
+        backlog_candidates.append({
+            "id": c["id"],
+            "one_liner": (c.get("statement") or "")[:160],
+            "status": f"backlog/{c.get('status')}",
+            "score": c.get("ice_score"),
+            "source": "backlog",
+            "created_at": c.get("created_at") or "",
+        })
+    ranked_backlog = sorted(backlog_candidates, key=lambda c: (c["score"] is None, -(c["score"] or 0)))
+    top_backlog = ranked_backlog[:limit]
 
+    all_candidates = active_hyps + backlog_candidates
     last_report = read_last_business_report()
     since_iso = last_report["at"] if last_report else ""
-    new_ids = {c["id"] for c in candidates if c["created_at"] > since_iso} if since_iso else {c["id"] for c in candidates}
-    for c in top:
+    new_ids = (
+        {c["id"] for c in all_candidates if c["created_at"] > since_iso} if since_iso
+        else {c["id"] for c in all_candidates}
+    )
+    for c in active_hyps + top_backlog:
         c["is_new"] = c["id"] in new_ids
-    top_ids = {c["id"] for c in top}
-    new_not_in_top = [c for c in candidates if c["id"] in new_ids and c["id"] not in top_ids]
+    shown_ids = {c["id"] for c in active_hyps} | {c["id"] for c in top_backlog}
+    new_not_shown = [c for c in all_candidates if c["id"] in new_ids and c["id"] not in shown_ids]
 
-    return {"top": top, "new_this_cycle": new_not_in_top}
+    return {"active": active_hyps, "top_backlog": top_backlog, "new_this_cycle": new_not_shown}
 
 
 # --------------------------------------------------------------------------

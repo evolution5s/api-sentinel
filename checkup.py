@@ -4642,7 +4642,12 @@ def test_technical_status_message_includes_fix_md_pointer():
     assert "FIX.md aktualisiert (1 neue Eintraege)" in msg
 
 
-def test_build_top_hypotheses_block_ranks_backlog_and_hypotheses_together():
+def test_build_top_hypotheses_block_keeps_active_and_backlog_separate():
+    # Report-verification addendum: active hypotheses are NOT ranked
+    # numerically against backlog candidates in the same list anymore -
+    # "active" is always-shown regardless of score, "top_backlog" is its
+    # own ranking. A low-scoring active hypothesis must still appear in
+    # "active", and must never appear inside "top_backlog".
     reset_state()
     finding_id = _real_research_finding_id()
     for cid, impact in (("bl_a", 9), ("bl_b", 7), ("bl_c", 2)):
@@ -4653,26 +4658,54 @@ def test_build_top_hypotheses_block_ranks_backlog_and_hypotheses_together():
             "ease": 5, "ease_grounding": finding_id,
         }))
     hyp = dict(SAMPLE_HYP)
-    hyp["impact_score"], hyp["confidence_score"] = 4, 4  # comparable score 16 - below bl_b (35), above bl_c (10)
+    hyp["impact_score"], hyp["confidence_score"] = 4, 4  # own score 16 - would rank below bl_a/bl_b if merged
     tools.write_hypothesis.run(hypothesis=json.dumps(hyp))
 
     block = tools.build_top_hypotheses_block(limit=2)
-    top_ids = [c["id"] for c in block["top"]]
-    assert top_ids == ["bl_a", "bl_b"], top_ids  # scores: bl_a=225, bl_b=175, bl_c=50, hyp=16 - ranked purely by score
+    assert [c["id"] for c in block["active"]] == [hyp["id"]], "the active hypothesis must always be shown"
+    assert block["active"][0]["score"] == 16
+    top_backlog_ids = [c["id"] for c in block["top_backlog"]]
+    assert top_backlog_ids == ["bl_a", "bl_b"], top_backlog_ids  # ice_scores: 225, 175, 50 - ranked purely by score
+    assert hyp["id"] not in top_backlog_ids, "an active hypothesis must never appear in the backlog ranking"
     new_ids = {c["id"] for c in block["new_this_cycle"]}
-    assert new_ids == {"bl_c", hyp["id"]}, new_ids  # everything not in top-2, first-ever report so all count as new
-    assert all(c["is_new"] for c in block["top"]), "first-ever report - nothing to compare against, everything is new"
+    assert new_ids == {"bl_c"}, new_ids  # bl_c is the only real record not already shown in active/top_backlog
+    assert block["active"][0]["is_new"] is True, "first-ever report - nothing to compare against, everything is new"
 
 
-def test_top_hypotheses_lines_marks_new_and_lists_overflow():
+def test_build_top_hypotheses_block_ice_score_matches_compute_ice_score():
+    # Report-verification addendum, question 2: the report path must never
+    # independently recompute or transform the score - it must always be
+    # exactly scoring.compute_ice_score()'s own output for that record.
+    reset_state()
+    finding_id = _real_research_finding_id()
+    tools.write_backlog_candidate.run(candidate=json.dumps({
+        "id": "bl_regression", "statement": BACKLOG_STATEMENT, "source": "growth", "fits_subsidiary_scope": "yes",
+        "impact": 8, "impact_grounding": finding_id,
+        "confidence": 6, "confidence_grounding": finding_id,
+        "ease": 7, "ease_grounding": finding_id,
+    }))
+    expected = scoring.compute_ice_score(8, 6, 7)
+    via_read_backlog = json.loads(tools.read_backlog.run())[0]["ice_score"]
+    via_top_block = tools.build_top_hypotheses_block()["top_backlog"][0]["score"]
+    assert via_read_backlog == expected
+    assert via_top_block == expected
+
+
+def test_top_hypotheses_lines_separates_active_from_backlog_and_marks_new():
     block = {
-        "top": [{"id": "bl_a", "one_liner": "x", "status": "backlog/candidate", "score": 225.0, "is_new": True}],
-        "new_this_cycle": [{"id": "bl_c", "one_liner": "y", "status": "backlog/candidate", "score": 10.0}],
+        "active": [{"id": "hyp_x", "one_liner": "x", "status": "hypothesis/active", "score": 16, "is_new": False}],
+        "top_backlog": [{"id": "bl_a", "one_liner": "y", "status": "backlog/candidate", "score": 225.0, "is_new": True}],
+        "new_this_cycle": [{"id": "bl_c", "one_liner": "z", "status": "backlog/candidate", "score": 10.0}],
     }
     lines = crew._top_hypotheses_lines(block)
     joined = "\n".join(lines)
-    assert "bl_a (neu)" in joined
+    assert "--- Aktuell in Testung ---" in joined and "--- Top-Backlog-Kandidaten ---" in joined
+    assert "hyp_x" in joined and "bl_a (neu)" in joined
     assert "bl_c" in joined and "Weitere, neu diesen Zyklus" in joined
+    # the active hypothesis must appear ONLY in its own section, never mixed into the backlog ranking
+    active_section = joined.split("--- Top-Backlog-Kandidaten ---")[0]
+    backlog_section = joined.split("--- Top-Backlog-Kandidaten ---")[1]
+    assert "hyp_x" in active_section and "hyp_x" not in backlog_section
 
 
 def test_kaizen_business_lines_splits_acted_deferred_proposed():
