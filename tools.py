@@ -510,9 +510,10 @@ def _parse_signup_body(body: str) -> dict:
 def sync_signups_from_github() -> int:
     """Fetch issues titled with the signup prefix from the public repo and
     append any not already recorded to signups.jsonl. Uses the unauthenticated
-    GitHub Search API (60 req/hour, plenty for a 6h cron); set GITHUB_TOKEN to
-    raise the rate limit if it ever becomes a problem. Returns how many new
-    signups were recorded.
+    GitHub Search API (60 req/hour, plenty for the real 2h cron - confirmed
+    2026-08-13 against actual container-start log timestamps, see
+    OPERATING_MODEL.md chapter 6); set GITHUB_TOKEN to raise the rate limit
+    if it ever becomes a problem. Returns how many new signups were recorded.
     """
     known_issue_numbers = {r.get("issue_number") for r in _read_jsonl("signups.jsonl")}
 
@@ -3148,7 +3149,9 @@ def is_system_paused() -> tuple[bool, str]:
     """Whether the system is currently paused via a Telegram 'stop' command,
     and the note explaining why. This is durable, cross-cycle state (not
     per-run) - it stays paused until an explicit 'start'/'resume' clears it,
-    same file survives across every 6h cron invocation.
+    same file survives across every 2h cron invocation (confirmed live
+    against real container-start log timestamps 2026-08-13, not the stale
+    "6h" this docstring previously claimed - see OPERATING_MODEL.md chapter 6).
     """
     path = STATE_DIR / _SYSTEM_PAUSE_FILE
     if not path.exists():

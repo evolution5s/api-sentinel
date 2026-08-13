@@ -1620,7 +1620,11 @@ der Behauptung eines anderen Agenten zu vertrauen.
 
 ### 8.2 Telegram - Benachrichtigung und Fernsteuerung
 
-`send_telegram_message` postet die Zyklus-Zusammenfassung; benötigt
+`send_telegram_message` postet die Zyklus-Zusammenfassung als zwei
+getrennte Nachrichten pro Zyklus - **Message A** (kurzer technischer
+Status) und **Message B** (Business-Report) - volle Struktur beider in
+Kapitel 9.6, da sie inhaltlich zum Token-/Kosten-Reporting gehören,
+zusammen mit dem restlichen Zyklus-Reporting; benötigt
 `TELEGRAM_BOT_TOKEN` und `TELEGRAM_CHAT_ID`, degradiert bei fehlenden/
 ungültigen Credentials sauber (Warnung im Log, kein Crash).
 `notify_new_pending_approvals` schickt für jede neue offene Freigabe eine
@@ -1805,32 +1809,53 @@ USD pro Million Tokens (`pricing.py::PRICING_TABLE`):
 | `claude-sonnet-5` (vor 2026-09-01) | 2,00 | 2,50 | 4,00 | 0,20 | 10,00 |
 | `claude-sonnet-5` (ab 2026-09-01) | 3,00 | 3,75 | 6,00 | 0,30 | 15,00 |
 
-**Report-Aufbau: eine einzige Telegram-Nachricht** (Structural-Rebuild-
-Addendum, Kapitel 15 - die vorherige zweite "formatierte Kosten-Tabelle"-
-Nachricht war vollständig redundant zu `_usage_headline()`/
-`_usage_detail_line()` in der Hauptnachricht, dieselben Zahlen nur
-retabelliert; Wegfall verliert keine Information und entfernt zugleich ein
-echtes Formatierungsfehler-Risiko - eine Prosa-Nachricht mit
-Hypothesen-IDs/Sonderzeichen unter `parse_mode="Markdown"` zu senden hätte
-genau das Risiko zurückgeholt, das die alte Zwei-Nachrichten-Trennung
-eigentlich vermeiden sollte). `_usage_headline()` steht als eigene,
-unmissverständliche Zeile (`Gesamt-Tokens diesen Zyklus: X (Y%
-Zyklus-Budget) - Kosten: $Z`) direkt am Anfang, gefolgt von der neuen
-**Hypothesen-Übersicht** (`build_hypothesis_overview()`/
-`_format_hypothesis_overview()`, Kapitel 5.9-nah) - pro aktiver Hypothese
-ID, `evidence_stage`, eine Statuszeile, der letzte geloggte Research-Fund
-(oder "keine Erkenntnis geloggt"), der nächste konkrete Schritt (älteste
-offene Task-Order, oder "keine offene Task-Order") - lesbar für sich
-allein, ohne jeden Agenten-Report einzeln durchzugehen. Danach Warnungen/
-Telegram-Kommando-Logs, `_usage_detail_line()` (Agent-Profil/Modell,
-Prompt-/Completion-/Cache-Aufteilung, `max_tokens` pro Agent), die
-Pro-Agent-Abschnitte (Channel-Strategie/Wachstum/Sub-CEO/Main-CEO/Dev,
-weiterhin gekürzt), und ganz am Ende optional **"Für den
-Aufsichtsrat"** (`_aufsichtsrat_lines()`) - erscheint nur bei mindestens
-einem von drei konkreten Auslösern: offene Freigaben in der Queue, eine
-noch nicht bestätigte `max_duration_days_by_stage`-Policy (Kapitel 5.13),
-oder offene Stage-Skip-Anfragen (Kapitel 7.3) - sonst komplett
-weggelassen, kein Pflichtabschnitt.
+**Report-Aufbau: zwei getrennte Telegram-Nachrichten pro Zyklus**
+(`send_cycle_summary`, Cycle-Reporting/Backlog-Addendum, Teil 1.1 -
+**korrigiert 2026-08-13**: dieser Abschnitt beschrieb bis dahin noch die
+ursprüngliche Structural-Rebuild-Addendum-Fassung mit einer einzigen
+kombinierten Nachricht; das wurde später durch die hier beschriebene
+Zwei-Nachrichten-Aufteilung ersetzt, ohne dass dieses Kapitel
+nachgezogen wurde - volle Schritt-für-Schritt-Herleitung des gesamten
+Zyklus, nicht nur des Reportings, in `OPERATING_MODEL.md` Kapitel 1):
+
+- **Message A** (`_technical_status_message`, Label "Technischer
+  Status") - bewusst kurz, wächst nur bei einem echten Problem. Auf einem
+  sauberen Zyklus exakt drei Zeilen: Kopfzeile mit Zeitstempel,
+  `_usage_headline()` (`Gesamt-Tokens diesen Zyklus: X (Y% Zyklus-Budget)
+  - Kosten: $Z`), und eine Gesundheitsbestätigung ("System gesund: kein
+  Crash, Zustand persistent, keine Sicherheitslimits ausgeloest."). Wächst
+  nur bei: einem fehlgeschlagenen Crew-Lauf, einer Persistenz-Warnung
+  (Kapitel 9.7), ausgelösten Sicherheitslimits (`_limit_hits`), einem
+  fehlerhaften Tool-Aufruf, neuen `FIX.md`-Einträgen, oder verarbeiteten
+  Telegram-Kommandos diesen Zyklus.
+- **Message B** (Label "Business Update") - der eigentliche
+  Sub-CEO-zu-Board-Bericht, in dieser Reihenfolge: Kopfzeile, die
+  **Hypothesen-Übersicht** (`build_hypothesis_overview()`/
+  `_format_hypothesis_overview()`, Kapitel 5.9-nah - pro aktiver
+  Hypothese ID, `evidence_stage`, eine Statuszeile, der letzte geloggte
+  Research-Fund inkl. URL, der nächste konkrete Schritt), der Sub-CEOs
+  eigener Zyklus-Report (`task_ceo`-Ausgabe), der **Top-Hypothesen-Block**
+  (`_top_hypotheses_lines`, Kapitel 5.15 - "Aktuell in Testung"/"Top-
+  Backlog-Kandidaten" getrennt, nie vermischt), die Kaizen-Zeilen (Kapitel
+  7.5), die Freigabe-Zeilen (neu seit letztem Report vs. weiterhin offen),
+  optional ein **"Anti-Stagnation-Hinweis"**-Block (Kapitel 5.15) wenn
+  freie Testkapazität ungenutzt blieb, der Main-CEO-Holding-Review, der
+  Dev-Abschnitt (mechanisch auf einen Einzeiler erzwungen, wenn keine
+  offenen Task-Orders vorlagen - Kapitel 3.2), optional **"Für den
+  Aufsichtsrat"** (`_aufsichtsrat_lines()` - erscheint nur bei mindestens
+  einem von mehreren konkreten Auslösern: offene Freigaben, eine noch
+  nicht bestätigte `max_duration_days_by_stage`-Policy, offene
+  Stage-Skip-Anfragen, eine Stagnations-Eskalation, neue `FIX.md`-/
+  Kaizen-Einträge - sonst komplett weggelassen), und ganz am Ende der
+  nächste konkrete Schritt (`set_next_step`, wird auch als
+  Zyklus-Kontinuitätsnotiz für den nächsten Report gespeichert).
+
+Beide Nachrichten werden bei Bedarf an echten Grenzen in mehrere
+Telegram-Nachrichten gesplittet, nie mitten im Wort abgeschnitten (Kapitel
+8.2). Der Wechsel von einer auf zwei Nachrichten trennt bewusst "kurz und
+fast immer gleich" (Message A - für ein schnelles "läuft alles"-Scannen)
+von "lang und inhaltlich variabel" (Message B - der eigentliche Bericht),
+statt beides ununterscheidbar in einem Text zu vermischen.
 
 **Instrumentierung (ohne Limit-Änderung):** `_task_usage_log` erfasst pro
 Task den tatsächlichen Token-Verbrauch (Differenz von
@@ -2422,13 +2447,31 @@ eine Zusammenfassung; Exit-Code `0` nur wenn wirklich alles bestanden hat.
   Cron-Lauf-Zeitstempeln verifiziert (Audit-Addendum) - sieben
   aufeinanderfolgende Läufe (22:04, 00:04, 02:01, 04:00, 06:03, 08:01, 10:00)
   lagen tatsächlich ~2h auseinander, die Service-Instance-Diskrepanz ist mit
-  dem 2h-Deploy nicht mehr reproduzierbar. **Erneut beobachtet (2026-08-13):**
-  ein späterer `railway status --json`-Check zeigte wieder zwei
-  unterschiedliche Werte in zwei Feldern derselben Antwort (`"0 */6 * * *"`
-  service-seitig vs. `"0 */2 * * *"` in den Deployment-Metadaten) - noch
-  nicht abschließend reproduzierbar/geklärt, siehe `OPERATING_MODEL.md`
-  Kapitel 6 für den aktuellen Stand; ein direkter Dashboard-Check bleibt der
-  zuverlässigste Weg, das zu klären.
+  dem 2h-Deploy nicht mehr reproduzierbar. **Erneut beobachtet, dann
+  endgültig aufgelöst (2026-08-13):** ein späterer `railway status
+  --json`-Check zeigte wieder dieselben zwei unterschiedlichen Werte
+  (`"0 */6 * * *"` service-seitig vs. `"0 */2 * * *"` in den
+  Deployment-Metadaten aus `railway.json`) - diesmal nicht über
+  `deployment list` geprüft (das zeigt nur Push-Events, `"reason":
+  "deploy"` bei jedem einzelnen Eintrag, nie einen echten Cron-Tick auf
+  einem bereits laufenden Deployment - dafür strukturell blind), sondern
+  über echte Runtime-Logs: `railway logs --deployment <alte, lange
+  ungestörte Deployment-ID> --json`, gefiltert auf `"Autonomous Loop
+  Started"`-Zeilen, lieferte vier reale, aufeinanderfolgende
+  Container-Start-Zeitstempel vom 2026-08-11 (System war die ganze Zeit
+  per Telegram `stop` pausiert, der Loop startete aber trotzdem jedes
+  Mal - ein sauberes Signal ohne echte Zyklus-Nebenwirkungen):
+  `10:04:53`, `12:02:15`, `14:02:58`, `16:03:05`, `18:02:55` - Abstände
+  1h57m/2h00m/2h00m/1h59m, also echte **2 Stunden**, deckungsgleich mit
+  `railway.json`. Die beiden `tools.py`-Docstrings, die noch "6h"
+  behaupteten (`is_system_paused`, `sync_signups_from_github`), waren
+  die veralteten Stellen und sind jetzt auf 2h korrigiert, mit dieser
+  Evidenz direkt im Code zitiert. Das service-seitige `"0 */6 * * *"`-Feld
+  selbst bleibt ein ungeklärtes, aber bestätigt kosmetisches
+  Railway-Artefakt (vermutlich eine veraltete Dashboard-Einstellung
+  unabhängig von `railway.json`) - beeinflusst das reale Verhalten
+  nachweislich nicht mehr. Volle Herleitung: `OPERATING_MODEL.md`
+  Kapitel 6.
 - **Audit-Addendum (Dev/Growth-Limits, Lean-Startup-Tiefe,
   Pricing-Isolation, Idee-Intake):** Statusaudit bestätigte drei
   unabhängige Ursachen für veraltete Zyklus-Reports gleichzeitig: (1) der

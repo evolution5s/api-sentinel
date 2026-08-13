@@ -454,16 +454,32 @@ validate against an actual cycle.
 
 ## 6. Known gaps and limitations (reframed from README chapter 15)
 
-- **Cron cadence discrepancy worth confirming directly on the Railway
-  dashboard.** `tools.py`'s `is_system_paused` docstring says "same file
-  survives across every 6h cron invocation" and the linked project's
-  service-level `cronSchedule` read `"0 */6 * * *"` during this session's
-  Railway status check - but that same status check's `latestDeployment`
-  metadata separately showed `"0 */2 * * *"` under
-  `fileServiceManifest.deploy.cronSchedule`. These are two different
-  cadences (every 6h vs. every 2h) read from two different fields of the
-  same API response. Not resolved in this session - worth a direct
-  dashboard check rather than trusting either field blindly.
+- **Cron cadence discrepancy - resolved 2026-08-13, real cadence is 2h.**
+  `tools.py`'s `is_system_paused`/`sync_signups_from_github` docstrings
+  used to say "6h," and `railway status --json` showed two different
+  values in two different fields of the same response
+  (`"0 */6 * * *"` at the service-instance level vs. `"0 */2 * * *"` in
+  the `fileServiceManifest`/`serviceManifest` deployment metadata, which
+  is sourced from the repo's own `railway.json`). Resolved with real
+  evidence, not just config-reading: `railway logs --deployment <old,
+  long-lived deployment id> --json`, filtered to `"Autonomous Loop
+  Started"` lines, gave four consecutive real container-start timestamps
+  from 2026-08-11 (system was paused that whole stretch via Telegram
+  `stop`, so the loop started but did no real work each time - a clean
+  signal): `10:04:53`, `12:02:15`, `14:02:58`, `16:03:05`, `18:02:55` -
+  gaps of 1h57m, 2h00m, 2h00m, 1h59m, i.e. genuinely ~2h, matching
+  `railway.json` and refuting the "6h" docstrings. `deployment list`
+  itself could NOT be used for this - it only records build/deploy
+  events (every entry in a normal session shows `"reason": "deploy"`,
+  triggered by a push), never a cron tick re-running an already-deployed
+  image, so it undercounts real executions completely; real container-
+  start log timestamps were the only reliable signal. Both `tools.py`
+  docstrings corrected to "2h" with this evidence cited inline. The
+  stray `"0 */6 * * *"` service-instance-level field itself is still
+  unexplained (likely a stale Railway dashboard setting independent of
+  `railway.json` that was never actually enforced) but is now confirmed
+  cosmetic, not something driving real behavior - not worth further
+  chasing unless it starts disagreeing with real timestamps again.
 - **No CLI path currently gives real volume access between cron ticks -
   confirmed empirically, three ways tried, all three fail** (session of
   2026-08-13). `railway run -- cat /data/_holding/FIX.md` runs *locally*
