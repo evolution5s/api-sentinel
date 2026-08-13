@@ -138,8 +138,13 @@ Hypothese entwerfen, echte Reichweite nach Freigabe und Veröffentlichung
 messen, und dabei die Posting-Historie jedes Accounts innerhalb der Regeln
 seiner Community sowie der 90/10-Genuine-zu-Werbe-Quote halten.
 
-**Backstory (Kernpunkte):** Technischer Marketer für die Freqtrade/CCXT- und
-Quant-Bot-Communities. Entwirft echte Posts (`draft_content`) in eigenen,
+**Backstory (Kernpunkte):** Technischer Marketer für welche Entwickler-/
+Tech-Community auch immer die reale Zielgruppe der gerade aktiven Subsidiary
+tatsächlich ist (aus deren eigenem Channel-Roster und strategischer
+Richtung, nie eine fest angenommene Nische - **korrigiert 2026-08-13**,
+Competitor-Research-Addendum: hier vorher hardcoded "Freqtrade/CCXT- und
+Quant-Bot-Communities", obwohl dieser Agent geteilter Code für jede
+Subsidiary ist, siehe Kapitel 15). Entwirft echte Posts (`draft_content`) in eigenen,
 einfachen Worten - veröffentlicht sie aber nie selbst; das bestätigt immer
 ein Mensch per Telegram-`posted:`-Antwort. Jede Reichweitenzahl kommt aus
 `read_channel_metrics`, nie eine Schätzung aus der Luft. Ein Account pro
@@ -411,12 +416,19 @@ Freigabe-Pflicht: es wird direkt per Telegram-Bestätigung gesetzt (Kapitel
 5.11, 8.2), nicht über `update_subsidiary_policies` - eine bereits explizit
 vom Menschen angestoßene Bestätigung, kein neuer Freigabe-Weg.
 
-**Wichtig:** Die konkrete Kanalliste für API Sentinel (r/algotrading,
-r/quantfinance, r/quant, QuantConnect Forum/Discord, Elite Trader,
-Trade2Win, quant.stackexchange.com) ist bewusst *nicht* Teil dieser
-holdingweiten Policies - sie steht im Task-Text von `task_channel_strategy`
-in `crew.py`, weil sie API-Sentinel-spezifisch ist. Jede neue Subsidiary
-bekäme ihre eigene, andere Kanalliste.
+**Korrigiert 2026-08-13 (Competitor-Research-Addendum):** Es gibt inzwischen
+gar keine hardcodierte Kanalliste mehr, für keine Subsidiary. Die frühere
+Fassung dieses Absatzes beschrieb noch eine konkrete, API-Sentinel-
+spezifische Kandidatenliste (r/algotrading, r/quantfinance, QuantConnect
+Forum/Discord, Elite Trader, Trade2Win, quant.stackexchange.com), fest im
+Task-Text von `task_channel_strategy` in `crew.py` - das war exakt die Art
+von stillschweigender Annahme, die eine zweite Subsidiary beim ersten
+echten Zyklus geerbt hätte, ohne dass sie zu deren Nische passt.
+`task_channel_strategy` leitet die reale Nische jetzt zur Laufzeit aus der
+aktuell aktiven Subsidiary her (`read_strategic_direction`, bestehende
+Hypothesen/Research-Findings) statt aus fest eingebautem Text - derselbe
+Task läuft identisch für jede Subsidiary, nicht mehr nur korrekt für die
+eine, die heute existiert.
 
 ### 4.3 Entscheidungs-Framework: Two-Way vs. One-Way Doors
 
@@ -539,15 +551,32 @@ artefaktbelegte Historie durch `research` **und** `community_engagement`
 (Kapitel 5.9) - oder eine vom Main-CEO genehmigte Stage-Skip-Anfrage
 (Kapitel 5.9, 7.3).
 
-Dazu optionale, freitextliche Reasoning-Felder (keine neue Pass/Fail-Hürde,
-nur dokumentierte Abwägung, ebenfalls dem Anti-Copying-Tripwire unterworfen
-für `defensibility_notes`): `defensibility_notes` (könnte ein Solo-
-Entwickler das an einem Nachmittag mit einem LLM nachbauen?),
-`pricing_tier_reasoning` (niedriger Preis braucht großes, scharfes
-Painpoint + Volumen; höherer Preis braucht weniger Volumen, aber
-langsamere Adoption), `expansion_notes` (Upsell-/B2B-Potenzial, rein
-zukunftsgerichtet), `channel_fit_reasoning` (warum genau dieser Kanal zu
-genau dieser Zielgruppe passt).
+**`defensibility_notes` + `defensibility_grounding` sind jetzt ab
+`evidence_stage='landing_page'` verpflichtend, nicht mehr optional**
+(Competitor-Research-Addendum, **korrigiert 2026-08-13** - vorher hier
+fälschlich als "optionales Feld" beschrieben, obwohl Kapitel 5.1 an
+anderer Stelle bereits behauptete, die Ökonomie-Felder inklusive
+Defensibility seien "der verpflichtende Filter, den jede Hypothese
+erfüllen muss" - eine echte Lücke zwischen behauptetem und tatsächlich
+erzwungenem Verhalten, jetzt geschlossen). `defensibility_grounding` muss
+eine echte ID sein (`research_finding`/`knowledge_base`/`channel`/
+`approval`, dieselbe ID-Welt wie beim Backlog-ICE-Grounding, über
+`_backlog_grounding_exists` geprüft) - typischerweise ein
+`knowledge_base`-Eintrag aus dem neuen Wettbewerbs-Scan (Kapitel 5.16).
+`defensibility_notes` selbst bleibt zusätzlich dem Anti-Copying-Tripwire
+unterworfen (Kapitel 5.12) und muss sich jetzt inhaltlich auf die echten
+Funde dieses Scans beziehen (oder dessen ehrliches "kein Wettbewerber
+gefunden"), nicht auf ein generisches Defensibility-Argument: könnte ein
+Solo-Entwickler das an einem Nachmittag mit einem LLM nachbauen - konkret
+gegen das abgewogen, was der Scan tatsächlich gefunden hat?
+
+Weiterhin echt optionale, freitextliche Reasoning-Felder (keine
+Pass/Fail-Hürde, nur dokumentierte Abwägung): `pricing_tier_reasoning`
+(niedriger Preis braucht großes, scharfes Painpoint + Volumen; höherer
+Preis braucht weniger Volumen, aber langsamere Adoption), `expansion_
+notes` (Upsell-/B2B-Potenzial, rein zukunftsgerichtet),
+`channel_fit_reasoning` (warum genau dieser Kanal zu genau dieser
+Zielgruppe passt).
 
 Vor der Formulierung einer neuen Hypothese: `read_knowledge_base(topic=...)`
 prüfen (Kapitel 5.7) - vielleicht existiert schon eine distillierte
@@ -1100,6 +1129,52 @@ nichts zu tun.
 `hypothesis_backlog.jsonl` liegt subsidiary-gescoped unter `STATE_DIR/
 <subsidiary_id>/`, gleiche Ablage wie `hypotheses.jsonl` (Kapitel 11.1).
 
+### 5.16 Wettbewerbs-Scan (`topic='competitor scan'`)
+
+**Die Lücke, die dieser Scan schließt** (Competitor-Research-Addendum):
+Wettbewerbsbewusstsein tauchte bisher nur zufällig auf - der
+Payment-Propensity-Scan (Kapitel 5.14) hat einmal beiläufig ein
+Drittanbieter-Produkt (SpeedBot) gefunden, aber das floss nur als
+unstrukturierte Erwähnung in `defensibility_notes` ein, nie als
+eigenständig recherchiertes Ergebnis. Dieselbe Disziplin wie beim
+Payment-Propensity-Scan, jetzt als eigene, benannte Dimension statt eines
+Nebenprodukts.
+
+**Wann er läuft:** Pro **Hypothese**, nicht pro Channel (anders als der
+Payment-Propensity-Scan) - Wettbewerb betrifft das konkrete Problem/die
+konkrete Lösung, nicht die Community, in der darüber gesprochen wird.
+Ausgelöst, wenn eine Hypothese sich Richtung `evidence_stage='landing_
+page'` bewegt, wo `defensibility_notes`/`defensibility_grounding` ab jetzt
+Pflichtfelder sind (Kapitel 5.1). `read_knowledge_base(hypothesis_id=...,
+topic='competitor scan')` prüft zuerst, ob bereits ein Eintrag existiert,
+der nicht älter als `tools.COMPETITOR_SCAN_STALENESS_DAYS` (90 Tage,
+dieselbe reine Cache-Frische-Konstante wie beim Payment-Propensity-Scan)
+ist - dann wiederverwenden statt erneut zu scannen.
+
+**Was gesucht wird:** Über `search_web`/`read_webpage` (Kapitel 5.11) nach
+existierenden Produkten/Services, die dasselbe oder ein angrenzendes
+Problem lösen - was real existiert, die echte Preisgestaltung, wo
+auffindbar, und eine ehrliche Einschätzung, wie ausgereift/etabliert sie
+wirken (aktive Weiterentwicklung, echte Nutzerbasis, vs. verlassen/dünn).
+
+**Wie das Ergebnis geloggt wird:** Über `write_knowledge_entry(topic=
+'competitor scan', source_hypothesis_ids=[diese Hypothesen-ID],
+confidence=..., takeaway=...)`. Ein echtes "kein klarer Wettbewerber
+gefunden" ist ein vollständiges, gültiges Ergebnis für sich - ein dünner
+Markt darf nie zu falscher Zuversicht umgedeutet werden, dieselbe
+Ehrlichkeitspflicht wie beim Payment-Propensity-Scan.
+
+**Mechanische Verzahnung mit `defensibility_notes` (nicht nur
+Instruktion):** `write_hypothesis` verlangt ab `evidence_stage='landing_
+page'` ein `defensibility_grounding`-Feld - eine echte ID aus
+`research_finding`/`knowledge_base`/`channel`/`approval` (dieselbe
+`_backlog_grounding_exists`-Prüfung wie beim Backlog-ICE-Grounding,
+Kapitel 5.15), typischerweise die ID des `write_knowledge_entry`-Aufrufs
+oben. `defensibility_notes` selbst bleibt zusätzlich dem
+Anti-Copying-Tripwire unterworfen (Kapitel 5.12), muss sich aber
+inhaltlich auf die echten Funde dieses Scans beziehen, nicht auf ein
+generisches, unbelegtes Argument.
+
 ---
 
 ## 6. Channel-Auswahl und Content-Erstellung
@@ -1112,10 +1187,14 @@ brainstormen, bewerten, wenige gleichzeitig testen (`MAX_CHANNELS_TESTING =
 3`), auf den Gewinner setzen, nicht funktionierende austauschen statt an
 ihnen festzuhalten (`MAX_TOTAL_CHANNELS = 20` insgesamt).
 
-Konkrete Kandidaten für API Sentinel (im Task-Text, nicht abschließend):
-r/algotrading, r/quantfinance, r/quant, QuantConnect Community-Forum und
--Discord, Elite Trader, Trade2Win, quant.stackexchange.com (letzteres mit
-echtem `view_count`-Feld pro Frage).
+**Korrigiert 2026-08-13:** keine fest eingebaute Kandidatenliste mehr im
+Task-Text (Competitor-Research-Addendum, Kapitel 4.2 für die volle
+Herleitung) - `task_channel_strategy` leitet die reale Nische zur Laufzeit
+aus der aktiven Subsidiary her (`read_strategic_direction`, bestehende
+Hypothesen/Research-Findings), statt eine feste Community-Liste
+vorzugeben. Ein Kanal mit echtem, nicht geschätztem Reichweiten-Feld (z.B.
+ein öffentliches `view_count` pro Frage/Post) ist explizit erwähnenswert,
+unabhängig davon, welche konkrete Plattform das gerade ist.
 
 Ein bezahlter Kanal (`is_paid=true`) braucht **beides**: die Policy
 `paid_channels_allowed=true` (Kapitel 4.2) **und** eine freigegebene
@@ -1605,8 +1684,26 @@ Ein Mensch entscheidet über:
 ```bash
 python approve.py                       # offene Anfragen auflisten
 python approve.py approve appr_ab12cd34
-python approve.py reject appr_ab12cd34 [grund]
+python approve.py reject appr_ab12cd34 <grund>
 ```
+
+**Ablehnung braucht jetzt zwingend einen echten Grund, um wirklich zu
+schließen** (Rejection-Reasoning-Addendum) - vorher optional, und eine
+Ablehnung ohne Begründung ging genau die Information verloren, die das
+System eigentlich lernen sollte: was künftig nicht mehr vorgeschlagen
+werden soll. `approve.py reject <id>` ohne Grund (oder Telegram
+`reject`/`nein`/`no` ohne Text danach) schließt die Anfrage **nicht** -
+sie bleibt `status='pending'`, bekommt `needs_rejection_reason=true` und
+taucht im nächsten Business-Update explizit unter "Für den Aufsichtsrat"
+als offene Frage auf ("Ablehnung ohne Begründung - bitte Grund
+nachreichen"), statt still als abgelehnt zu verschwinden. Ein Grund kann
+sofort mitgegeben werden (`approve.py reject appr_X duplicate of appr_Y`,
+oder Telegram `"<id> reject <grund>"`/als Reply auf die Benachrichtigung
+`"reject <grund>"`/`"nein, <grund>"`) oder nachgereicht werden (erneut
+dieselbe `id` mit Grund, egal ob per CLI oder Telegram) - erst dann wird
+wirklich `status='rejected'` gesetzt, mit `decision_reason` lesbar
+gespeichert. Genehmigungen (`approve`) brauchen weiterhin nie einen Grund.
+Gilt für **jede** `category`, nicht nur `publish`.
 
 Vollständige Nutzungshinweise (was jede `category` konkret bedeutet, worauf
 vor einer Genehmigung zu achten ist, und wie sich Telegram-Freigaben zu
@@ -1846,7 +1943,8 @@ Zyklus, nicht nur des Reportings, in `OPERATING_MODEL.md` Kapitel 1):
   einem von mehreren konkreten Auslösern: offene Freigaben, eine noch
   nicht bestätigte `max_duration_days_by_stage`-Policy, offene
   Stage-Skip-Anfragen, eine Stagnations-Eskalation, neue `FIX.md`-/
-  Kaizen-Einträge - sonst komplett weggelassen), und ganz am Ende der
+  Kaizen-Einträge, oder eine Ablehnung ohne Begründung, die deshalb noch
+  offen steht (Kapitel 8.1) - sonst komplett weggelassen), und ganz am Ende der
   nächste konkrete Schritt (`set_next_step`, wird auch als
   Zyklus-Kontinuitätsnotiz für den nächsten Report gespeichert).
 
@@ -2100,7 +2198,7 @@ Global, `STATE_DIR/_global/` (nicht subsidiary-gebunden, siehe oben):
 | `system_paused.json` | Pause-Status (Telegram `stop`/`start`) |
 | `telegram_update_offset.txt` | Zuletzt verarbeitetes Telegram-Update |
 
-#### 11.1.2 Bekannte Grenze: statischer Task-Text
+#### 11.1.2 Ehemals bekannte Grenze: statischer Task-Text - behoben 2026-08-13
 
 `crew.py` durchläuft pro Zyklus alle aktiven Subsidiaries in einer
 Schleife, setzt vor jedem `crew.kickoff()` den aktiven Kontext
@@ -2109,13 +2207,27 @@ Kickoff-Input (crewai-natives `{subsidiary_id}`-Platzhalter-Interpolation
 in den Task-Texten) - kein hartcodiertes `OWN_SUBSIDIARY_ID` und keine
 Annahme von genau einer Subsidiary mehr im Code. Heute läuft dabei
 effektiv weiterhin nur ein Crew-Durchlauf, weil nur `api-sentinel` aktiv
-ist. Offen bleibt: die Task-*Inhalte* selbst (Kanal-Kandidaten,
-Freqtrade/CCXT-Framing usw.) sind weiterhin API-Sentinel-spezifischer
-Fließtext, nicht pro Subsidiary dynamisch generiert - eine zweite aktive
-Subsidiary bekäme heute technisch isolierte Daten, aber inhaltlich noch
-dieselben, unpassenden Formulierungen in den Tasks. Bewusst nicht in
-diesem Schritt behoben (ein größerer Folgeschritt, kein Blocker für die
-Datenisolation selbst) - siehe Kapitel 15.
+ist.
+
+**Competitor-Research-Addendum:** die Task-*Inhalte* selbst waren bis
+dahin noch API-Sentinel-spezifischer Fließtext (Kanal-Kandidaten,
+Freqtrade/CCXT-Framing) - eine zweite aktive Subsidiary hätte technisch
+isolierte Daten, aber inhaltlich dieselben, unpassenden Formulierungen in
+den Tasks geerbt. Vollständig durchgeprüft und behoben: `task_channel_
+strategy`s Kanalliste (Kapitel 6.1), `growth_agent`s und `ceo_agent`s
+Backstories (Kapitel 3.1/3.3), `ceo_agent`s `role`/`goal` (jetzt selbst
+`{subsidiary_id}`-parametrisiert, real gegen crewai geprüft - `agent.
+interpolate_inputs` cached das Original-Template beim ersten Aufruf und
+interpoliert bei jedem weiteren `kickoff()` frisch daraus, keine
+destruktive Einweg-Ersetzung), die Beispiel-Evidenzliste im Payment-
+Propensity-Scan (Kapitel 5.14), die Beispielformulierung für die
+Main-CEO-Strategic-Direction-Baseline (Kapitel 7.1) und die
+Pause-Skip-Telegram-Nachricht (holdingweit, nie subsidiary-spezifisch
+benannt). `checkup.py` deckt sowohl die echte Parametrisierung
+(`test_ceo_agent_role_goal_backstory_are_genuinely_parametrized_per_
+subsidiary`) als auch das Fehlen der konkreten alten Liste
+(`test_task_channel_strategy_has_no_hardcoded_subreddit_list`) ab, nicht
+nur "crasht nicht".
 
 ### 11.2 Holding-Ebene (`holding.py`, `STATE_DIR/_holding/`)
 

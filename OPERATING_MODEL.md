@@ -179,7 +179,8 @@ identical post-processing):**
   section 2), Kaizen business lines, approvals, Main-CEO review summary,
   Dev summary (mechanically overridden per item 8 above when applicable),
   Aufsichtsrat-facing lines (pending stage-skip requests, stagnation
-  escalations, FIX.md new entries), and the next-step commitment. Both
+  escalations, FIX.md new entries, reason-less rejections still awaiting a
+  real reason - section 2), and the next-step commitment. Both
   messages are split at real section/paragraph/line boundaries (never
   mid-word) if they exceed ~4000 characters, each chunk labeled `(i/n)`
   when there's more than one (section 2, item 5).
@@ -223,6 +224,9 @@ identical post-processing):**
 | Telegram message length | split at ~4000 chars (`TELEGRAM_SAFE_CHUNK_LENGTH`), real Telegram hard limit 4096 (`TELEGRAM_MAX_MESSAGE_LENGTH`) | `tools.py`, `_split_message_at_boundaries` / `send_telegram_message` (item 5, this addendum) | Hard (never silently truncates; splits at a real boundary instead) |
 | Task-summary render budget | `TASK_SUMMARY_MAX_CHARS = 6000` | `crew.py`, `_task_summary` | Soft (marks visibly `[... gekuerzt ...]` if a genuine outlier still exceeds it; real overflow beyond this is handled by the Telegram splitter above, never a silent cut) |
 | Instruction-echo rejection | reasoning fields must not reuse known instruction/incident template phrasing | `tools.py`, `_INSTRUCTION_ECHO_PHRASES` check, applied to `build_cost_reasoning`/`defensibility_notes`/research summaries/stage-skip reasoning | Hard block |
+| Defensibility grounding | from `evidence_stage='landing_page'` on, `defensibility_notes`+`defensibility_grounding` both required; `defensibility_grounding` must be a real id (research_finding/knowledge_base/channel/approval) | `tools.py`, `write_hypothesis` (`STAGE_GATED_ECONOMICS_FIELDS`, `_backlog_grounding_exists` reuse) | Hard block |
+| Competitor scan staleness | `COMPETITOR_SCAN_STALENESS_DAYS = 90`, per-hypothesis cache freshness for a `topic='competitor scan'` knowledge_base entry | `tools.py:COMPETITOR_SCAN_STALENESS_DAYS`, checked in `task_ceo`'s own prompt text (not mechanically enforced - same as `PAYMENT_PROPENSITY_STALENESS_DAYS`, a cache-freshness knob, not a governance parameter) | Advisory (prompt-level cache check only) |
+| Rejection reason requirement | `category` rejection (any category) without a real, non-empty reason does not close the request - stays `status='pending'`, `needs_rejection_reason=true` | `approve.py`, `decide()`; same enforcement reused by the Telegram reject path (`tools.py`, `_apply_telegram_commands`) | Hard block on closing (the reject action itself is always accepted, just doesn't take effect without a reason) |
 
 ---
 
@@ -314,6 +318,8 @@ testable that way, but the distinction matters for trust calibration.
 | Telegram message splitting at real boundaries | **Implemented, not confirmed live** | The bug it fixes (mid-word truncation) *was* confirmed live in a real cycle; the fix itself has only run under `checkup.py` |
 | Dev one-line mechanical enforcement | **Implemented, not confirmed live** | Brand-new this addendum |
 | Main-CEO stage-skip review (step 6.5) | **Implemented, not confirmed live** | Brand-new this addendum (section 5, finding 4) - closes a real gap where pending stage-skip requests had no operational step ever reading/deciding them |
+| Competitor scan + defensibility grounding | **Implemented, real live network test (not production)** | Full real pipeline (`search_web`/`read_webpage`/`log_research_finding`/`draft_content`/`write_knowledge_entry`/`write_hypothesis`) run against real Serper results and `hyp_research_001`'s real, documented topic domain, but against a local throwaway `STATE_DIR` - production `hyp_research_001` itself was not touched (blocked, see section 6) |
+| Rejection-reason enforcement | **Implemented, not confirmed live** | Brand-new this addendum; `checkup.py` covers both the `approve.py` and Telegram paths, no real cycle has exercised it yet |
 | Task-main-ceo-review "ground truth over assertion" fix | **Implemented, not confirmed live** | The regression it fixes (Main-CEO second-guessing persisted state) was confirmed live; the fix has not yet run a real cycle |
 | `agent_profile.json` `testing` mode | **Verified-live, currently active** | Printed directly to stdout on every process start; confirmed by this session's own test runs |
 | `update_reach_multiplier` recalibration | **Not live, not reachable by any agent at all** | See section 5, finding 5 |
@@ -534,12 +540,33 @@ validate against an actual cycle.
 - **`testing` agent profile is live in production** (section 0) - every
   cycle currently runs on Haiku with a quarter of the intended token
   budget. Nothing mechanically reminds anyone to switch back to `normal`.
-- **One subsidiary in practice.** The holding model supports many, but
-  several code paths (task description interpolation baked in once at
-  module load, e.g. `task_channel_strategy`'s concrete channel candidate
-  list) are explicitly commented as "fine with the one subsidiary that
-  exists today, a real limitation once a second one is genuinely
-  operative."
+- **One subsidiary in practice, but the known hardcoded-content gap is
+  fixed (2026-08-13, competitor-research addendum).** The holding model
+  supports many, but every shared agent/task text was audited for
+  concrete `api-sentinel`-specific content (channel names, audience
+  descriptions, problem framing) that would have silently carried over to
+  a second subsidiary's first real cycle. Fixed: `task_channel_strategy`'s
+  hardcoded r/algotrading-style candidate list (replaced with generic
+  brainstorming guidance that derives the real niche from
+  `read_strategic_direction`/existing hypotheses at runtime);
+  `growth_agent`'s and `ceo_agent`'s backstories (Freqtrade/CCXT-specific
+  framing); `ceo_agent`'s `role`/`goal` (hardcoded "API Sentinel" - now
+  `{subsidiary_id}`, confirmed via crewai's own `agent.interpolate_inputs`
+  to re-derive correctly per subsidiary from a cached original template,
+  not a one-way destructive replace); the payment-propensity scan's
+  example evidence list (trading-bot-specific categories); the Main-CEO's
+  strategic-direction-baseline example (a "Freqtrade/CCXT users" phrasing
+  inside a task that explicitly runs once per active subsidiary, so a
+  hardcoded example there was especially wrong); and the pause-skip
+  Telegram message (hardcoded "API Sentinel" for what's actually a
+  holding-wide flag, checked once before the per-subsidiary loop even
+  starts). `checkup.py` now has a regression test for genuine per-
+  subsidiary parametrization and for the specific hardcoded list's
+  absence, not just "doesn't crash." What's still genuinely a one-
+  subsidiary-only limitation: the *continuity note* content (prior
+  cycle's free-text business-report digest) is inherently per-subsidiary
+  dynamic state, not hardcoded text - no fix needed there, just noted so
+  it isn't confused with the fixed gap above.
 - **Duration caps are proposed, not enforced**, until a human explicitly
   confirms via `duration_policy: confirm` - a hypothesis can currently run
   past what looks like a firm per-stage cap because that cap has never been

@@ -13,10 +13,17 @@ Commands:
         Mark a request approved. For category='spend', this does NOT set up
         a payment link itself - reply on Telegram with
         "payment_link: <id> <url>" separately once a real one exists.
-    python approve.py reject appr_ab12cd34 [reason]
-        Mark a request rejected, optionally with a reason (recommended -
-        it's what the agent sees when it later checks this request's
-        status).
+    python approve.py reject appr_ab12cd34 <reason>
+        Mark a request rejected - reason is now REQUIRED to actually take
+        effect (rejection-reasoning addendum), not just recommended. A
+        reject with no reason does not close the request: it stays
+        status='pending', flagged needs_rejection_reason=true, and keeps
+        surfacing in the Telegram report's "Fuer den Aufsichtsrat" section
+        as an open question until a real reason is given (reply again with
+        the same id and a reason to actually close it). This exists
+        because a silent, reason-less rejection was exactly the raw
+        material this system was losing - the "why not" a future
+        self-improvement pass could learn from.
 
 What to weigh before approving, by category:
     spend    - real money or a payment-intent test going out. Confirm the
@@ -78,15 +85,36 @@ def list_pending(records):
 
 
 def decide(records, request_id, status, reason=None):
+    """Apply an approve/reject decision. status='approved' always takes
+    effect immediately, no reason needed.
+
+    status='rejected' WITHOUT a real, non-empty reason does NOT close the
+    request (rejection-reasoning addendum) - a reject with no reason is
+    exactly the feedback this system loses today: what NOT to propose
+    again. Instead the request stays status='pending' with
+    needs_rejection_reason=True, so it keeps surfacing as an open question
+    (see crew.py's _aufsichtsrat_lines) rather than silently vanishing as a
+    closed rejection. Reply again with a real reason (same request_id) to
+    actually close it - at that point status='rejected' is set for real,
+    decision_reason is recorded, and needs_rejection_reason clears.
+    """
     for r in records:
         if r.get("id") == request_id:
             if r.get("status") != "pending":
                 print(f"{request_id} is already '{r.get('status')}', not touching it.")
                 return records
+            if status == "rejected" and not (reason or "").strip():
+                r["needs_rejection_reason"] = True
+                print(
+                    f"{request_id}: reject has no reason - left status='pending' rather than closing it. "
+                    "Reply again with a real reason to actually reject it."
+                )
+                return records
             r["status"] = status
             r["decided_at"] = datetime.now(timezone.utc).isoformat()
             if reason:
                 r["decision_reason"] = reason
+            r["needs_rejection_reason"] = False
             print(f"{request_id} marked {status}.")
             return records
     print(f"No request with id {request_id} found.")

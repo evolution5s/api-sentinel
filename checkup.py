@@ -125,6 +125,15 @@ SAMPLE_HYP = {
     "break_even_horizon_months": 1,
     "break_even_users": 1,  # ceil(5 / (20 * 1))
     "build_cost_reasoning": "~10 Dev-agent LLM calls to generate the landing page HTML/CSS, no recurring infra beyond what's already provisioned",
+    # Competitor-research addendum: defensibility_notes/defensibility_
+    # grounding join the economics fields above as landing_page/build-gated
+    # requirements - same "present but harmless at 'research'" reasoning.
+    # "reddit" is a real grounding id here because reset_state() always
+    # seeds a channel with that id (_seed_testing_channel) before any test
+    # runs - reused rather than fabricating a fake competitor-scan
+    # knowledge_base entry every test doesn't actually need.
+    "defensibility_notes": "test placeholder - no real competitor scan behind this in fixtures",
+    "defensibility_grounding": "reddit",
     "impact_score": 3,
     "confidence_score": 3,
     "primary_variable_tested": "audience",  # required for a first attempt (no prior_hypothesis_id)
@@ -2015,10 +2024,19 @@ def test_get_account_stats_ratio():
 
 def test_write_hypothesis_defaults_new_optional_fields():
     reset_state()
-    tools.write_hypothesis.run(hypothesis=json.dumps(SAMPLE_HYP))
+    # defensibility_notes/defensibility_grounding excluded here specifically
+    # to test their true default (None) - SAMPLE_HYP itself sets both now
+    # since they're required from landing_page on (competitor-research
+    # addendum), so this is the one test that needs a hypothesis without
+    # them to actually exercise the default-is-None path.
+    without_defensibility = {
+        k: v for k, v in SAMPLE_HYP.items() if k not in ("defensibility_notes", "defensibility_grounding")
+    }
+    tools.write_hypothesis.run(hypothesis=json.dumps(without_defensibility))
     stored = json.loads(tools.read_hypotheses.run())[0]
     assert stored["landing_page_live"] is False
     assert stored["defensibility_notes"] is None
+    assert stored["defensibility_grounding"] is None
     assert stored["pricing_tier_reasoning"] is None
     assert stored["expansion_notes"] is None
     assert stored["channel_fit_reasoning"] is None
@@ -2621,16 +2639,36 @@ def test_classify_command_approve_reject_via_reply():
     reply_text = "Neue Freigabe angefragt: appr_ab12cd34\nKategorie: spend"
     assert tools._classify_command("approve", reply_text) == ("approve", "appr_ab12cd34")
     assert tools._classify_command("ja", reply_text) == ("approve", "appr_ab12cd34")
-    assert tools._classify_command("reject", reply_text) == ("reject", "appr_ab12cd34")
-    assert tools._classify_command("nein", reply_text) == ("reject", "appr_ab12cd34")
+    assert tools._classify_command("reject", reply_text) == ("reject", ("appr_ab12cd34", ""))
+    assert tools._classify_command("nein", reply_text) == ("reject", ("appr_ab12cd34", ""))
     # a plain approve/reject with nothing to reply to isn't a recognized command
     assert tools._classify_command("approve", "") is None
+
+
+def test_classify_command_reject_via_reply_with_reason():
+    reply_text = "Neue Freigabe angefragt: appr_ab12cd34\nKategorie: publish"
+    assert tools._classify_command("reject duplicate of appr_ef56gh78", reply_text) == (
+        "reject", ("appr_ab12cd34", "duplicate of appr_ef56gh78")
+    )
+    assert tools._classify_command("nein, das haben wir schon zweimal gefragt", reply_text) == (
+        "reject", ("appr_ab12cd34", "das haben wir schon zweimal gefragt")
+    )
 
 
 def test_classify_command_approve_reject_via_typed_id():
     assert tools._classify_command("appr_ab12cd34 approve", "") == ("approve", "appr_ab12cd34")
     assert tools._classify_command("approve appr_ab12cd34", "") == ("approve", "appr_ab12cd34")
-    assert tools._classify_command("appr_ab12cd34 reject", "") == ("reject", "appr_ab12cd34")
+    assert tools._classify_command("appr_ab12cd34 reject", "") == ("reject", ("appr_ab12cd34", ""))
+
+
+def test_classify_command_reject_via_typed_id_with_reason():
+    assert tools._classify_command("appr_ab12cd34 reject duplicate content", "") == (
+        "reject", ("appr_ab12cd34", "duplicate content")
+    )
+    # case of the reason itself is preserved even though matching is case-insensitive
+    assert tools._classify_command("appr_ab12cd34 REJECT Duplicate Content", "") == (
+        "reject", ("appr_ab12cd34", "Duplicate Content")
+    )
 
 
 def test_classify_command_unrecognized_text_is_ignored():
@@ -2711,6 +2749,155 @@ def test_apply_telegram_commands_approve_via_reply():
             os.environ["TELEGRAM_BOT_TOKEN"] = had_token
         if had_chat is not None:
             os.environ["TELEGRAM_CHAT_ID"] = had_chat
+
+
+# --- rejection-reasoning addendum: reject without a reason stays open ------
+
+def test_apply_telegram_commands_reject_without_reason_stays_pending():
+    reset_state()
+    had_token = os.environ.pop("TELEGRAM_BOT_TOKEN", None)
+    had_chat = os.environ.pop("TELEGRAM_CHAT_ID", None)
+    try:
+        appr = json.loads(tools.request_approval.run(category="deploy", proposal="p", reasoning="r"))
+        request_id = appr["queued"]
+        notification_text = f"Neue Freigabe angefragt: {request_id}\nKategorie: deploy"
+
+        log = tools._apply_telegram_commands([{"text": "reject", "reply_to_text": notification_text}])
+        assert any("ohne Begruendung" in entry for entry in log)
+        stored = next(r for r in tools._read_global_jsonl("approval_queue.jsonl") if r["id"] == request_id)
+        assert stored["status"] == "pending", "a reason-less reject must not close the request"
+        assert stored["needs_rejection_reason"] is True
+    finally:
+        if had_token is not None:
+            os.environ["TELEGRAM_BOT_TOKEN"] = had_token
+        if had_chat is not None:
+            os.environ["TELEGRAM_CHAT_ID"] = had_chat
+
+
+def test_apply_telegram_commands_reject_with_reason_closes():
+    reset_state()
+    had_token = os.environ.pop("TELEGRAM_BOT_TOKEN", None)
+    had_chat = os.environ.pop("TELEGRAM_CHAT_ID", None)
+    try:
+        appr = json.loads(tools.request_approval.run(category="deploy", proposal="p", reasoning="r"))
+        request_id = appr["queued"]
+        notification_text = f"Neue Freigabe angefragt: {request_id}\nKategorie: deploy"
+
+        log = tools._apply_telegram_commands(
+            [{"text": "reject too risky right now", "reply_to_text": notification_text}]
+        )
+        assert any(request_id in entry and "rejected" in entry for entry in log)
+        stored = next(r for r in tools._read_global_jsonl("approval_queue.jsonl") if r["id"] == request_id)
+        assert stored["status"] == "rejected"
+        assert stored["decision_reason"] == "too risky right now"
+        assert stored["needs_rejection_reason"] is False
+    finally:
+        if had_token is not None:
+            os.environ["TELEGRAM_BOT_TOKEN"] = had_token
+        if had_chat is not None:
+            os.environ["TELEGRAM_CHAT_ID"] = had_chat
+
+
+def test_apply_telegram_commands_reject_followup_reason_closes_flagged_entry():
+    reset_state()
+    had_token = os.environ.pop("TELEGRAM_BOT_TOKEN", None)
+    had_chat = os.environ.pop("TELEGRAM_CHAT_ID", None)
+    try:
+        appr = json.loads(tools.request_approval.run(category="deploy", proposal="p", reasoning="r"))
+        request_id = appr["queued"]
+        notification_text = f"Neue Freigabe angefragt: {request_id}\nKategorie: deploy"
+
+        tools._apply_telegram_commands([{"text": "reject", "reply_to_text": notification_text}])
+        stored = next(r for r in tools._read_global_jsonl("approval_queue.jsonl") if r["id"] == request_id)
+        assert stored["status"] == "pending" and stored["needs_rejection_reason"] is True
+
+        # Same id, typed directly this time (message scrolled out of view), now with a real reason.
+        tools._apply_telegram_commands([{"text": f"{request_id} reject duplicate of another request", "reply_to_text": ""}])
+        stored = next(r for r in tools._read_global_jsonl("approval_queue.jsonl") if r["id"] == request_id)
+        assert stored["status"] == "rejected"
+        assert stored["decision_reason"] == "duplicate of another request"
+        assert stored["needs_rejection_reason"] is False
+    finally:
+        if had_token is not None:
+            os.environ["TELEGRAM_BOT_TOKEN"] = had_token
+        if had_chat is not None:
+            os.environ["TELEGRAM_CHAT_ID"] = had_chat
+
+
+def test_approve_decide_reject_without_reason_stays_pending():
+    reset_state()
+    tools.request_approval.run(category="deploy", proposal="p", reasoning="r")
+    records = approve._load()
+    request_id = records[0]["id"]
+
+    records = approve.decide(records, request_id, "rejected")
+    approve._save(records)
+    reloaded = approve._load()
+    assert reloaded[0]["status"] == "pending"
+    assert reloaded[0]["needs_rejection_reason"] is True
+    assert "decision_reason" not in reloaded[0]
+
+
+def test_approve_decide_reject_with_whitespace_only_reason_stays_pending():
+    reset_state()
+    tools.request_approval.run(category="deploy", proposal="p", reasoning="r")
+    records = approve._load()
+    request_id = records[0]["id"]
+
+    records = approve.decide(records, request_id, "rejected", "   ")
+    reloaded_status = next(r for r in records if r["id"] == request_id)["status"]
+    assert reloaded_status == "pending", "whitespace-only isn't a real reason either"
+
+
+def test_approve_decide_reject_with_reason_closes_for_real():
+    reset_state()
+    tools.request_approval.run(category="deploy", proposal="p", reasoning="r")
+    records = approve._load()
+    request_id = records[0]["id"]
+
+    records = approve.decide(records, request_id, "rejected", "content too similar to appr_xyz")
+    approve._save(records)
+    reloaded = approve._load()
+    assert reloaded[0]["status"] == "rejected"
+    assert reloaded[0]["decision_reason"] == "content too similar to appr_xyz"
+    assert reloaded[0]["needs_rejection_reason"] is False
+
+
+def test_approve_decide_approve_never_needs_a_reason():
+    reset_state()
+    tools.request_approval.run(category="deploy", proposal="p", reasoning="r")
+    records = approve._load()
+    request_id = records[0]["id"]
+
+    records = approve.decide(records, request_id, "approved")
+    reloaded_status = next(r for r in records if r["id"] == request_id)["status"]
+    assert reloaded_status == "approved", "approve must never be held back for lack of a reason"
+
+
+def test_list_approvals_needing_rejection_reason():
+    reset_state()
+    appr1 = json.loads(tools.request_approval.run(category="deploy", proposal="p1", reasoning="r"))["queued"]
+    appr2 = json.loads(tools.request_approval.run(category="deploy", proposal="p2", reasoning="r"))["queued"]
+    records = approve._load()
+    records = approve.decide(records, appr1, "rejected")  # no reason - stays pending, flagged
+    approve._save(records)
+
+    flagged = tools.list_approvals_needing_rejection_reason()
+    assert flagged == [appr1]
+    assert appr2 not in flagged
+
+
+def test_aufsichtsrat_lines_surfaces_needs_rejection_reason():
+    lines = crew._aufsichtsrat_lines(
+        0, None, 0, needs_rejection_reason_ids=["appr_ab12cd34"],
+    )
+    joined = "\n".join(lines)
+    assert "--- Fuer den Aufsichtsrat ---" in joined
+    assert "appr_ab12cd34" in joined
+    assert "ohne Begruendung" in joined
+
+    # no flagged ids and nothing else triggered -> no section at all
+    assert crew._aufsichtsrat_lines(0, None, 0, needs_rejection_reason_ids=[]) == []
 
 
 def test_apply_telegram_commands_live_marks_hypothesis():
@@ -3887,6 +4074,40 @@ def test_all_task_descriptions_and_agent_backstories_interpolate_cleanly():
             t.description, t.expected_output, t.output_file = description, expected_output, output_file
         for a, role, goal, backstory in agent_originals:
             a.role, a.goal, a.backstory = role, goal, backstory
+
+
+def test_ceo_agent_role_goal_backstory_are_genuinely_parametrized_per_subsidiary():
+    # Competitor-research addendum, item 3: role/goal/backstory used to
+    # hardcode "API Sentinel" literally - correct for the one subsidiary
+    # that exists today, but silently wrong the moment a second subsidiary
+    # runs the exact same shared Agent object. Proves the fix genuinely
+    # re-parametrizes per subsidiary_id (not just "doesn't crash", which
+    # the interpolation test above already covers) by interpolating with a
+    # DIFFERENT id and checking it actually shows up, the old hardcoded
+    # business name does not, and no other api-sentinel-specific domain
+    # term leaked into the agent definitions either.
+    agent = crew.ceo_agent
+    original = (agent.role, agent.goal, agent.backstory)
+    try:
+        agent.interpolate_inputs({"subsidiary_id": "second-co"})
+        assert "second-co" in agent.role
+        assert "second-co" in agent.goal
+        assert "second-co" in agent.backstory
+        for field_name, text in (("role", agent.role), ("goal", agent.goal), ("backstory", agent.backstory)):
+            assert "API Sentinel" not in text, f"{field_name} still hardcodes the old subsidiary name"
+            for term in ("Freqtrade", "CCXT", "quant-bot", "trading-bot"):
+                assert term not in text, f"{field_name} still hardcodes api-sentinel-specific domain term '{term}'"
+    finally:
+        agent.role, agent.goal, agent.backstory = original
+
+
+def test_task_channel_strategy_has_no_hardcoded_subreddit_list():
+    # The specific instance OPERATING_MODEL.md flagged: a concrete
+    # r/algotrading-style candidate list baked into shared task text.
+    # Confirms it's gone, not just reworded elsewhere.
+    description = crew.task_channel_strategy.description
+    for term in ("r/algotrading", "r/quantfinance", "QuantConnect", "Elite Trader", "Trade2Win"):
+        assert term not in description, f"task_channel_strategy still hardcodes '{term}'"
 
 
 def test_cycle_token_budget_gate_allows_under_budget():
@@ -5111,6 +5332,104 @@ def test_write_knowledge_entry_payment_propensity_channel_roundtrip():
 
     by_topic = json.loads(tools.read_knowledge_base.run(topic="payment propensity"))
     assert len(by_topic) == 1
+
+
+# --- tools.py: competitor scan (competitor-research addendum) --------------
+
+def test_write_knowledge_entry_competitor_scan_hypothesis_id_roundtrip():
+    reset_state()
+    result = json.loads(tools.write_knowledge_entry.run(
+        topic="competitor scan", confidence="moderate",
+        source_hypothesis_ids=json.dumps(["hyp_comp_test"]),
+        takeaway="One direct competitor found (SpeedBot, $19/mo) - active development, small but real user base.",
+    ))
+    assert result["ok"] is True
+
+    stored = json.loads(tools.read_knowledge_base.run(hypothesis_id="hyp_comp_test"))
+    assert len(stored) == 1
+    assert stored[0]["topic"] == "competitor scan"
+    assert "SpeedBot" in stored[0]["takeaway"]
+
+    other_hyp = json.loads(tools.read_knowledge_base.run(hypothesis_id="hyp_other"))
+    assert other_hyp == [], "must be scoped per hypothesis, not shared across hypotheses"
+
+
+def test_read_knowledge_base_hypothesis_id_matches_any_source_id():
+    reset_state()
+    tools.write_knowledge_entry.run(
+        topic="competitor scan", confidence="low",
+        source_hypothesis_ids=json.dumps(["hyp_a", "hyp_b"]),
+        takeaway="No clear competitor found for either angle - a genuine, complete negative result.",
+    )
+    assert len(json.loads(tools.read_knowledge_base.run(hypothesis_id="hyp_a"))) == 1
+    assert len(json.loads(tools.read_knowledge_base.run(hypothesis_id="hyp_b"))) == 1
+    assert json.loads(tools.read_knowledge_base.run(hypothesis_id="hyp_c")) == []
+
+
+def test_write_hypothesis_landing_page_requires_defensibility_grounding():
+    reset_state()
+    without_defensibility = {
+        k: v for k, v in SAMPLE_HYP.items() if k not in ("defensibility_notes", "defensibility_grounding")
+    }
+    tools.write_hypothesis.run(hypothesis=json.dumps(without_defensibility))
+    _seed_research_artifact(SAMPLE_HYP["id"])
+    _seed_community_engagement_artifact(SAMPLE_HYP["id"])
+    tools.write_hypothesis.run(hypothesis=json.dumps({
+        "id": SAMPLE_HYP["id"], "evidence_stage": "community_engagement",
+    }))
+    result = json.loads(tools.write_hypothesis.run(
+        hypothesis=json.dumps({"id": SAMPLE_HYP["id"], "evidence_stage": "landing_page"})
+    ))
+    assert "error" in result
+    assert "defensibility_grounding" in result["error"]
+    assert "defensibility_notes" in result["error"]
+
+
+def test_write_hypothesis_landing_page_rejects_fake_defensibility_grounding():
+    reset_state()
+    without_defensibility = {
+        k: v for k, v in SAMPLE_HYP.items() if k not in ("defensibility_notes", "defensibility_grounding")
+    }
+    tools.write_hypothesis.run(hypothesis=json.dumps(without_defensibility))
+    _seed_research_artifact(SAMPLE_HYP["id"])
+    _seed_community_engagement_artifact(SAMPLE_HYP["id"])
+    tools.write_hypothesis.run(hypothesis=json.dumps({
+        "id": SAMPLE_HYP["id"], "evidence_stage": "community_engagement",
+    }))
+    result = json.loads(tools.write_hypothesis.run(hypothesis=json.dumps({
+        "id": SAMPLE_HYP["id"], "evidence_stage": "landing_page",
+        "defensibility_notes": "no real competitor scan behind this id",
+        "defensibility_grounding": "made_up_id_that_does_not_exist",
+    })))
+    assert "error" in result
+    assert "defensibility_grounding" in result["error"]
+
+
+def test_write_hypothesis_landing_page_accepts_real_competitor_scan_grounding():
+    reset_state()
+    without_defensibility = {
+        k: v for k, v in SAMPLE_HYP.items() if k not in ("defensibility_notes", "defensibility_grounding")
+    }
+    tools.write_hypothesis.run(hypothesis=json.dumps(without_defensibility))
+    _seed_research_artifact(SAMPLE_HYP["id"])
+    _seed_community_engagement_artifact(SAMPLE_HYP["id"])
+    tools.write_hypothesis.run(hypothesis=json.dumps({
+        "id": SAMPLE_HYP["id"], "evidence_stage": "community_engagement",
+    }))
+    scan = json.loads(tools.write_knowledge_entry.run(
+        topic="competitor scan", confidence="moderate",
+        source_hypothesis_ids=json.dumps([SAMPLE_HYP["id"]]),
+        takeaway="One direct competitor found (SpeedBot, $19/mo) - active development, small but real user base.",
+    ))
+    result = json.loads(tools.write_hypothesis.run(hypothesis=json.dumps({
+        "id": SAMPLE_HYP["id"], "evidence_stage": "landing_page",
+        "defensibility_notes": "SpeedBot exists at $19/mo but is thin on features - real moat is ongoing "
+                                "monitoring infra, not a one-off script, so a solo dev couldn't easily replicate it",
+        "defensibility_grounding": scan["id"],
+    })))
+    assert "error" not in result, result
+    stored = json.loads(tools.read_hypotheses.run())[0]
+    assert stored["defensibility_grounding"] == scan["id"]
 
 
 def test_payment_propensity_scan_live_reddit_algotrading():

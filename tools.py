@@ -81,6 +81,17 @@ BASE_REQUIRED_HYPOTHESIS_FIELDS = {
 STAGE_GATED_ECONOMICS_FIELDS = {
     "estimated_build_cost", "price_point_monthly",
     "break_even_horizon_months", "break_even_users", "build_cost_reasoning",
+    # Competitor-research addendum: defensibility_notes was previously
+    # optional free-text (see task_ceo's own prior wording, now corrected)
+    # despite README chapter 5.1 already describing it as part of "the
+    # mandatory filter every hypothesis must clear" - a real gap between
+    # documented and enforced behavior, closed here rather than left as
+    # aspirational prose. defensibility_grounding pairs with it: a real
+    # knowledge_base id from an actual competitor scan (validated below,
+    # same _backlog_grounding_exists reuse as backlog ICE sub-scores) -
+    # defensibility_notes must be argued FROM that scan's real findings,
+    # not a generic, ungrounded defensibility argument.
+    "defensibility_notes", "defensibility_grounding",
 }
 # Union, for anything that wants "everything write_hypothesis could ever
 # require" rather than the stage-conditional split (e.g. a full-coverage
@@ -136,6 +147,12 @@ RESEARCH_FINDING_MIN_LENGTH = 80
 # caps/FIX thresholds are - deliberately a plain constant, not a third
 # parallel Telegram-confirmable governance parameter.
 PAYMENT_PROPENSITY_STALENESS_DAYS = 90
+# Competitor-research addendum: same cache-freshness reasoning as
+# PAYMENT_PROPENSITY_STALENESS_DAYS above, just for a knowledge_base
+# competitor-scan verdict (topic="competitor scan") - scoped per
+# hypothesis (not per channel, since competition is about the specific
+# problem/solution being tested, not the community it's discussed in).
+COMPETITOR_SCAN_STALENESS_DAYS = 90
 # A community_engagement-stage artifact must be one of these post_types
 # (section 4) - an actual thread reply or a genuine question post, not
 # passive lurking.
@@ -1063,6 +1080,18 @@ def list_pending_approval_ids(subsidiary_id: str = "") -> list:
     return [a["id"] for a in approvals if a.get("status") == "pending"]
 
 
+def list_approvals_needing_rejection_reason() -> list:
+    """Orchestration-level (crew.py's business-report assembly), same
+    pattern as list_pending_approval_ids above - rejection-reasoning
+    addendum: real ids currently sitting status='pending' with
+    needs_rejection_reason=true (approve.decide left them there because a
+    reject came in with no real reason), so send_cycle_summary can surface
+    each one explicitly in "Fuer den Aufsichtsrat" as an open question.
+    """
+    approvals = _read_global_jsonl("approval_queue.jsonl")
+    return [a["id"] for a in approvals if a.get("status") == "pending" and a.get("needs_rejection_reason")]
+
+
 @tool("read_hypotheses")
 def read_hypotheses(status: str = "") -> str:
     """Return hypotheses as JSON. Pass status="active" or status="evaluated"
@@ -1161,8 +1190,21 @@ def write_hypothesis(hypothesis: str) -> str:
     At landing_page/build (crossing toward a one-way door - real cost, real
     commitment): estimated_build_cost, price_point_monthly, break_even_
     horizon_months, break_even_users, and build_cost_reasoning become
-    required and must be precise, evidence-grounded numbers. Crossing into
-    either for the first time also requires artifact-backed history through
+    required and must be precise, evidence-grounded numbers. defensibility_
+    notes and defensibility_grounding become required too (competitor-
+    research addendum) - defensibility_notes was previously optional
+    free-text; grounding it mechanically is what actually makes it "the
+    mandatory filter every hypothesis must clear" this system's own docs
+    already claimed. defensibility_grounding must be a real id (research_
+    finding/knowledge_base/channel/approval, same id universe as backlog
+    ICE-score grounding) - typically a knowledge_base entry from
+    write_knowledge_entry(topic='competitor scan', source_hypothesis_ids=
+    [this hypothesis's id], ...) after a real search_web/read_webpage
+    competitor scan. defensibility_notes must actually argue from that
+    scan's real findings (or its genuine "no clear competitor found"
+    result) - not a generic defensibility argument untethered from any
+    real research. Crossing into either for the first time also requires
+    artifact-backed history through
     research (a substantive log_research_finding entry, RESEARCH_FINDING_
     MIN_LENGTH+ chars) AND community_engagement (a real draft_content
     artifact) - or a Main-CEO-approved stage-skip request
@@ -1403,6 +1445,19 @@ def write_hypothesis(hypothesis: str) -> str:
                          f"{sorted(_missing_econ)} - this is a one-way door, the numbers backing it must "
                          "be precise and evidence-grounded, not a rough_economics_note guess anymore"
             })
+        # Competitor-research addendum: defensibility_grounding must point
+        # at a real record (typically a knowledge_base competitor-scan
+        # entry from write_knowledge_entry(topic='competitor scan', ...) -
+        # same id universe/helper as backlog ICE sub-score grounding, not a
+        # second parallel existence check.
+        _defensibility_grounding = _merged_econ.get("defensibility_grounding")
+        if not _backlog_grounding_exists(_defensibility_grounding):
+            return json.dumps({
+                "error": f"defensibility_grounding '{_defensibility_grounding}' is not a real "
+                         "research_finding/knowledge_base/channel/approval id from this subsidiary's "
+                         "current data - defensibility_notes must be grounded in an actual competitor "
+                         "scan (write_knowledge_entry(topic='competitor scan', ...)), not general reasoning"
+            })
 
     # Section 6: duration-cap policy, board-set via Telegram confirmation
     # (see DEFAULT_PROPOSED_DURATION_CAPS) - only enforced once
@@ -1503,6 +1558,7 @@ def write_hypothesis(hypothesis: str) -> str:
             "next_step": None,
             "landing_page_live": False,
             "defensibility_notes": None,
+            "defensibility_grounding": None,
             "pricing_tier_reasoning": None,
             "expansion_notes": None,
             "channel_fit_reasoning": None,
@@ -2010,13 +2066,18 @@ def write_knowledge_entry(
 
 
 @tool("read_knowledge_base")
-def read_knowledge_base(topic: str = "", channel: str = "") -> str:
+def read_knowledge_base(topic: str = "", channel: str = "", hypothesis_id: str = "") -> str:
     """Read distilled takeaways before generating a new hypothesis - check
     whether this topic/channel/tactic has already been tested before
     proposing it again in a different wrapper without noticing. topic
     matches as a case-insensitive substring against each entry's topic;
-    channel matches exactly. Both empty returns every entry, most recent
-    last.
+    channel matches exactly; hypothesis_id matches if it appears anywhere
+    in an entry's source_hypothesis_ids (competitor-research addendum -
+    a competitor scan is scoped per hypothesis, not per channel like the
+    payment-propensity scan, so channel-based lookup doesn't fit it; e.g.
+    read_knowledge_base(hypothesis_id=..., topic='competitor scan') to
+    check for an existing, still-fresh scan before running a new one).
+    All filters empty returns every entry, most recent last.
     """
     entries = _read_jsonl("knowledge_base.jsonl")
     if topic:
@@ -2024,6 +2085,8 @@ def read_knowledge_base(topic: str = "", channel: str = "") -> str:
         entries = [e for e in entries if topic_lower in (e.get("topic") or "").lower()]
     if channel:
         entries = [e for e in entries if e.get("channel") == channel]
+    if hypothesis_id:
+        entries = [e for e in entries if hypothesis_id in (e.get("source_hypothesis_ids") or [])]
     return json.dumps(entries, ensure_ascii=False)
 
 
@@ -3238,7 +3301,12 @@ def _classify_command(text: str, reply_to_text: str):
     the operator may just be chatting, that's not an error, it's silently
     ignored. Payload shape depends on action:
     - "pause"/"resume": payload is None.
-    - "approve"/"reject": payload is the appr_... approval id.
+    - "approve": payload is the appr_... approval id.
+    - "reject": payload is (approval_id, reason) - reason is "" when none
+      was given (rejection-reasoning addendum: a reject without a real
+      reason does NOT close the request, see _apply_telegram_commands/
+      approve.decide - the caller is what enforces that, not this
+      classifier, which only ever reports what was actually typed).
     - "live": payload is the hypothesis_id to mark landing_page_live=true,
       confirming a PR has actually been merged (a human-only step this
       system otherwise has no way to observe).
@@ -3274,18 +3342,40 @@ def _classify_command(text: str, reply_to_text: str):
     if normalized in _START_WORDS:
         return "resume", None
 
-    decision = "approve" if normalized in _APPROVE_WORDS else "reject" if normalized in _REJECT_WORDS else None
-    if decision:
-        match = _APPROVAL_ID_RE.search(reply_to_text)
-        return (decision, match.group(0)) if match else None
+    # Reply directly to the notification message that announced a pending
+    # approval - the id lives in reply_to_text, not text. approve/ja/yes
+    # never needs a reason; reject/nein/no may be followed by one
+    # (rejection-reasoning addendum) - "reject" alone, or "reject <grund>"/
+    # "nein, <grund>".
+    reply_match = _APPROVAL_ID_RE.search(reply_to_text)
+    if reply_match:
+        if normalized in _APPROVE_WORDS:
+            return "approve", reply_match.group(0)
+        for word in _REJECT_WORDS:
+            if normalized == word:
+                return "reject", (reply_match.group(0), "")
+            if normalized.startswith(word + " ") or normalized.startswith(word + ","):
+                reason = text.strip()[len(word):].lstrip(",").strip()
+                return "reject", (reply_match.group(0), reason)
 
+    # Typed directly: "<id> approve"/"<id> reject [grund]" (or the id
+    # first or last, either order - only the id is removed from the
+    # remainder, not assumed to be at a fixed position).
     id_match = _APPROVAL_ID_RE.search(text)
     if id_match:
         remainder = normalized.replace(id_match.group(0).lower(), "").strip()
         if remainder in _APPROVE_WORDS:
             return "approve", id_match.group(0)
-        if remainder in _REJECT_WORDS:
-            return "reject", id_match.group(0)
+        for word in _REJECT_WORDS:
+            if remainder == word:
+                return "reject", (id_match.group(0), "")
+            if remainder.startswith(word + " "):
+                # Slice the original-case text (id removed, same length
+                # arithmetic works regardless of case) rather than the
+                # lowercased remainder, so the reason keeps its real casing.
+                reason_source = text.replace(id_match.group(0), "").strip()
+                reason = reason_source[len(word):].strip()
+                return "reject", (id_match.group(0), reason)
 
     if normalized.startswith("live:"):
         hypothesis_id = text.split(":", 1)[1].strip()
@@ -3527,15 +3617,28 @@ def _apply_telegram_commands(messages: list) -> list:
             send_telegram_message(f"FIX-Thresholds gesetzt und bestaetigt: {values}")
             continue
 
+        # action in ("approve", "reject") from here - reject's payload is
+        # (approval_id, reason), approve's is just the approval_id.
+        approval_id, reject_reason = target_id if action == "reject" else (target_id, None)
         if records is None:
             records = approve._load()
-        record = next((r for r in records if r.get("id") == target_id), None)
+        record = next((r for r in records if r.get("id") == approval_id), None)
         if record is None or record.get("status") != "pending":
             continue
         status = "approved" if action == "approve" else "rejected"
-        records = approve.decide(records, target_id, status, "via Telegram")
-        log.append(f"{target_id} {status} (Telegram)")
-        send_telegram_message(f"{target_id}: {status}.")
+        records = approve.decide(records, approval_id, status, reject_reason)
+        updated = next(r for r in records if r.get("id") == approval_id)
+        if action == "reject" and updated.get("status") == "pending":
+            # No real reason given - approve.decide left it pending rather
+            # than closing it (rejection-reasoning addendum).
+            log.append(f"{approval_id} Ablehnung ohne Begruendung - bleibt offen (Telegram)")
+            send_telegram_message(
+                f"{approval_id}: Ablehnung ohne Begruendung wurde nicht uebernommen, bleibt 'pending'. "
+                "Antworte nochmal mit einem echten Grund, damit die Ablehnung wirksam wird."
+            )
+        else:
+            log.append(f"{approval_id} {updated['status']} (Telegram)")
+            send_telegram_message(f"{approval_id}: {updated['status']}.")
 
     if records is not None:
         approve._save(records)

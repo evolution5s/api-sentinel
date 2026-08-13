@@ -40,6 +40,7 @@ from tools import (
     get_account_stats,
     get_and_clear_pending_next_step,
     is_system_paused,
+    list_approvals_needing_rejection_reason,
     list_pending_approval_ids,
     log_cycle_usage,
     log_research_finding,
@@ -204,7 +205,10 @@ growth_agent = Agent(
     role="Growth Engine / Dev Relations",
     goal="Draft genuine, organic community content matching the currently active hypothesis, measure real reach after it's approved and posted, and keep every account's posting history within its community's rules and its 90/10 genuine-to-promotional ratio",
     backstory=(
-        "Technical marketer for the Freqtrade/CCXT and quant-bot communities. "
+        "Technical marketer for whichever developer/technical community this "
+        "subsidiary's actual audience lives in (per its own channel roster "
+        "and strategic direction - never assumed to be one fixed niche, "
+        "this role runs for whichever subsidiary is currently active). "
         "Drafts real posts (draft_content) in its own plain words - never "
         "publishing them itself, that's always a human, confirmed back via a "
         "Telegram 'posted:' reply. For a 'thread_reply' specifically - "
@@ -293,10 +297,11 @@ dev_agent = Agent(
 )
 
 ceo_agent = Agent(
-    role="Sub-CEO of API Sentinel (reports to the Main-CEO)",
+    role="Sub-CEO of {subsidiary_id} (reports to the Main-CEO)",
     goal=(
-        "Evaluate due hypotheses, formulate follow-up hypotheses, and grow API "
-        "Sentinel by validating real problems worth solving for its target "
+        "Evaluate due hypotheses, formulate follow-up hypotheses, and grow "
+        "{subsidiary_id} by validating real problems worth solving for its "
+        "target "
         "users - monetization (break-even economics, defensibility, pricing) "
         "is a required filter every hypothesis must clear, not the thing "
         "being optimized for - without ever fabricating a number, bypassing "
@@ -329,7 +334,7 @@ ceo_agent = Agent(
         "a 'build' outcome (that one always needs a human look before "
         "anyone starts building), otherwise whenever something actually "
         "needs a decision from above. "
-        "Operates strictly within API Sentinel's current business model - "
+        "Operates strictly within {subsidiary_id}'s current business model - "
         "when check_escalation signals a fundamental strategy problem, files "
         "a structured pivot proposal with the Main-CEO (file_pivot_proposal) "
         "instead of deciding a pivot alone or escalating straight to the "
@@ -893,16 +898,23 @@ task_channel_strategy = Task(
         "ePrivacy/GDPR and German UWG, not a policy toggle you can work "
         "around).\n"
         "1) Call read_channels() to see the current roster. If it's empty, "
-        "brainstorm a first set of candidate organic channels for this "
-        "niche (Freqtrade/CCXT and broader quant-trading-bot users) and "
-        "write each one with write_channel. Concrete api-sentinel-specific "
-        "candidates worth considering (not an exhaustive or mandatory "
-        "list - use your own judgment on fit, and drop ones that turn out "
-        "not to fit): r/algotrading, r/quantfinance, r/quant, the "
-        "QuantConnect community forum and Discord, Elite Trader, "
-        "Trade2Win, and quant.stackexchange.com (which also exposes a "
-        "real view_count per question - a genuine, non-guessed reach "
-        "signal worth wiring into metrics_channel reasoning). If the "
+        "brainstorm a first set of candidate organic channels for THIS "
+        "subsidiary's actual niche and write each one with write_channel - "
+        "this task description is shared across every subsidiary, so never "
+        "assume a specific niche or community list; derive the real one "
+        "from this subsidiary's own current state instead (call "
+        "read_strategic_direction(subsidiary_id='{subsidiary_id}') if a "
+        "direction has been set, and read whatever hypotheses/research "
+        "findings already exist for this subsidiary for its real target "
+        "audience and problem domain). Concretely: where does this "
+        "specific audience actually gather - subreddits, forums, Discord/"
+        "Slack communities, existing platforms or marketplaces relevant to "
+        "the real problem being solved - use your own judgment on fit for "
+        "THIS subsidiary's real audience, not a generic or borrowed list, "
+        "and drop ones that turn out not to fit. If a channel exposes a "
+        "real, non-guessed reach metric (e.g. a public view/subscriber "
+        "count), note that explicitly - worth wiring into metrics_channel "
+        "reasoning. If the "
         "roster already has entries - including a partial set from an "
         "earlier interrupted attempt - do NOT brainstorm a fresh "
         "batch from scratch: work with what's already there (it persists "
@@ -1155,11 +1167,13 @@ task_ceo = ConditionalTask(
         "search_web/read_webpage scan of the whole community - "
         "deliberately not narrowly scoped to this hypothesis's own "
         "question - looking for real, concrete evidence in both "
-        "directions: confirming (people actually paying for trading-bot-"
-        "as-a-service, paid signal/Discord groups, paid data feeds, "
-        "premium exchange tiers, paid indicators/marketplaces, paid "
-        "backtesting platforms - with whatever rough price points are "
-        "mentioned or discoverable, e.g. '$30/mo signal group') vs. "
+        "directions: confirming (people actually paying for any paid tool/"
+        "service adjacent to this specific community's real domain - paid "
+        "signal/community groups, paid data/API access, premium tiers of "
+        "an existing free tool, paid add-ons/marketplaces, paid "
+        "alternatives to what's normally done for free here - with "
+        "whatever rough price points are mentioned or discoverable, e.g. "
+        "'$30/mo signal group') vs. "
         "disconfirming (a recurring preference for free/open-source tools "
         "as the default, explicit unwillingness to pay, DIY building "
         "described as the norm even when it's more work, paid options "
@@ -1258,17 +1272,48 @@ task_ceo = ConditionalTask(
         "...) - a short, distilled takeaway (not the raw hypothesis log) "
         "on this topic/channel/tactic may already exist from a prior cycle; "
         "don't re-test the same thing in a different wrapper without "
-        "noticing. Alongside the required economics, also reason through these "
-        "(optional free-text fields on write_hypothesis - not a new "
-        "pass/fail bar, just recorded reasoning that should shape your "
-        "choices between comparable options): defensibility_notes - could "
-        "a solo developer rebuild this in an afternoon with an LLM? Prefer "
-        "the more defensible option when cost/effort is comparable, but a "
+        "noticing.\n\n"
+        "Competitor scan (competitor-research addendum; before writing "
+        "defensibility_notes below, once per HYPOTHESIS, not once per "
+        "channel like the payment-propensity scan above - competition is "
+        "about the specific problem/solution being tested, not the "
+        "community it's discussed in): call read_knowledge_base(hypothesis_"
+        "id=<this hypothesis's id>, topic='competitor scan') first. If it "
+        "returns a real entry no older than tools.COMPETITOR_SCAN_"
+        "STALENESS_DAYS (90 days), reuse it, don't re-scan. Otherwise run a "
+        "real search_web/read_webpage scan for existing products/services "
+        "solving the same or an adjacent problem: what actually exists, "
+        "their real pricing where discoverable, and a rough, honest read on "
+        "how mature/entrenched they are (active development and a real "
+        "user base, vs. abandoned or thin). Write the verdict via write_"
+        "knowledge_entry(topic='competitor scan', source_hypothesis_ids="
+        "[this hypothesis's id], confidence=..., takeaway=<the actual "
+        "competitors found and their pricing/maturity, or a genuine 'no "
+        "clear competitor found' - both are complete, valid results, never "
+        "spin a thin/uncontested market into false confidence>). Capture "
+        "the resulting id - defensibility_notes below needs it.\n\n"
+        "Alongside the required economics, also reason through these "
+        "(free-text fields on write_hypothesis; defensibility_notes/"
+        "defensibility_grounding are now required from evidence_stage="
+        "landing_page on, per Jan's explicit instruction the competitor "
+        "scan above exists to ground - not just recorded reasoning, "
+        "write_hypothesis mechanically checks defensibility_grounding "
+        "points at a real id and rejects a missing one; the others below "
+        "stay optional, recorded reasoning that should shape your choices "
+        "between comparable options): defensibility_notes - could a solo "
+        "developer rebuild this in an afternoon with an LLM, weighed "
+        "specifically against what the competitor scan above actually "
+        "found (or its genuine absence) - not an abstract argument "
+        "untethered from that scan's real findings. Prefer the more "
+        "defensible option when cost/effort is comparable, but a "
         "weak-moat product can still be worth building for speed-to-market "
-        "- say which case this is. Things that actually raise "
-        "defensibility: an accumulating data set, ongoing monitoring "
+        "- say which case this is, and set defensibility_grounding to the "
+        "competitor scan's write_knowledge_entry id. Things that actually "
+        "raise defensibility: an accumulating data set, ongoing monitoring "
         "infrastructure rather than a one-off script, integration depth/"
-        "switching costs, non-obvious domain knowledge. pricing_tier_"
+        "switching costs, non-obvious domain knowledge - state which of "
+        "these genuinely apply here, grounded in the real competitors (or "
+        "their absence) the scan surfaced. pricing_tier_"
         "reasoning - price_point_monthly is a real trade-off, never "
         "default to 'cheapest': a very low price (~EUR5/month) needs a "
         "large, sharply-felt pain point and volume; a higher tier "
@@ -1717,10 +1762,13 @@ task_main_ceo_review = ConditionalTask(
         "required, non-negotiable filter every hypothesis must clear (the "
         "existing break-even/defensibility/pricing economics), not as the "
         "thing being optimized for (e.g. 'validate a real problem worth "
-        "solving for Freqtrade/CCXT users; every hypothesis still has to "
-        "clear its own break-even economics before it can reach build, but "
-        "chasing revenue directly over solving the actual problem is not "
-        "the goal') - this establishes the actual point of the exercise, it "
+        "solving for this subsidiary's actual target users; every "
+        "hypothesis still has to clear its own break-even economics before "
+        "it can reach build, but chasing revenue directly over solving the "
+        "actual problem is not the goal' - phrased for THIS subsidiary's "
+        "real audience, this task runs identically for every active "
+        "subsidiary and must never assume any one fixed audience/niche) - "
+        "this establishes the actual point of the exercise, it "
         "does not override the Sub-CEO's own tactical channel/hypothesis "
         "judgment. Do this for every subsidiary "
         "that's never had one, every cycle, not just once ever across the "
@@ -2027,7 +2075,7 @@ def _format_hypothesis_overview(overview: list) -> list:
 def _aufsichtsrat_lines(
     pending_approvals, duration_policy: dict, pending_stage_skips: int,
     stagnation_escalations: list = None, fix_md_new_entries: list = None,
-    kaizen_new_count: int = 0,
+    kaizen_new_count: int = 0, needs_rejection_reason_ids: list = None,
 ) -> list:
     """"Fuer den Aufsichtsrat" only appears when something genuinely needs
     a human decision (section 8) - never printed out of habit. Triggers:
@@ -2036,13 +2084,23 @@ def _aufsichtsrat_lines(
     escalation (section 3, stays until 'stagnation_ack: <id>' or a real
     build clears it), new unread FIX.md entries (FIX.md addendum Part 1.4 -
     short pointer only, never the full addendum text, resolve via
-    'fix_resolved: <id>'), and new unread Kaizen board suggestions (Part
+    'fix_resolved: <id>'), new unread Kaizen board suggestions (Part
     2.3 - same short-pointer/dedup pattern, full text lives in
-    kaizen_suggestions.jsonl only).
+    kaizen_suggestions.jsonl only), and reason-less rejections
+    (rejection-reasoning addendum - approve.decide left these
+    status='pending' with needs_rejection_reason=true instead of silently
+    closing them, so they keep showing up here as an open question until a
+    real reason is given).
     """
     items = []
     if isinstance(pending_approvals, int) and pending_approvals > 0:
         items.append(f"- {pending_approvals} offene Freigabe(n) in der Queue (approve.py / Telegram-Reply).")
+    for approval_id in (needs_rejection_reason_ids or []):
+        items.append(
+            f"- Ablehnung ohne Begruendung - {approval_id}: bitte Grund nachreichen "
+            f"('{approval_id} reject <grund>' oder Telegram-Reply), damit das System daraus lernen kann. "
+            "Bleibt sonst unbegrenzt offen stehen, nie stillschweigend als abgelehnt geschlossen."
+        )
     if duration_policy and duration_policy.get("status") == "proposed":
         items.append(
             "- Duration-Policy-Vorschlag wartet auf Bestaetigung: "
@@ -2273,6 +2331,7 @@ def send_cycle_summary(
             read_subsidiary_policies.run(subsidiary_id=subsidiary_id)
         ).get("max_duration_days_by_stage")
         pending_stage_skips = len(json.loads(read_stage_skip_requests.run(status="pending")))
+        needs_rejection_reason_ids = list_approvals_needing_rejection_reason()
         stagnation_escalations = [
             s["id"] for s in json.loads(read_subsidiaries.run()) if s.get("stagnation_escalated")
         ]
@@ -2329,6 +2388,7 @@ def send_cycle_summary(
         lines_b += _aufsichtsrat_lines(
             len(current_approval_ids), duration_policy, pending_stage_skips, stagnation_escalations,
             fix_md_new_entries=fix_md_new_entries, kaizen_new_count=len(kaizen_new_entries),
+            needs_rejection_reason_ids=needs_rejection_reason_ids,
         )
         lines_b += ["", f"Naechster Schritt: {next_step}"]
         message_b = "\n".join(lines_b)
@@ -2352,8 +2412,12 @@ if __name__ == "__main__":
     paused, pause_note = is_system_paused()
     if paused:
         print(f"[api-sentinel] system paused ({pause_note}) - skipping this cycle.")
+        # Holding-wide, not subsidiary-specific - is_system_paused() is a
+        # single global flag checked once before the per-subsidiary loop
+        # below even starts, so this must never name one specific
+        # subsidiary (item 3, competitor-research addendum).
         skip_message = (
-            f"API Sentinel Zyklus uebersprungen - System ist pausiert ({pause_note}). "
+            f"Zyklus uebersprungen - System ist pausiert ({pause_note}). "
             "Sende 'start', um fortzufahren."
         )
         if persistence["warning"]:
