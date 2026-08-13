@@ -5,7 +5,10 @@
 > `agent_profile.json`. Insbesondere Kapitel 3 (Agenten) und Kapitel 9
 > (Modelle/Token/Limits) müssen aktualisiert werden, sobald sich Rollen,
 > Tools, Prompts oder Limits ändern - sie sind eine Momentaufnahme, keine
-> automatisch generierte Doku.
+> automatisch generierte Doku. Siehe auch `OPERATING_MODEL.md`: dieselbe
+> Momentaufnahme-Pflicht, aber als sequenzieller Entscheidungs-Walkthrough
+> statt Kapitel-für-Komponente-Referenz - beide bei jeder relevanten
+> Code-Änderung zusammen pflegen, nicht nur eine der beiden.
 
 ## Inhaltsverzeichnis
 
@@ -806,6 +809,17 @@ Mechanisch mit einer Mindestlänge erzwungen
 mindestens ein solches Artefakt für diese `hypothesis_id` existiert (Kapitel
 5.9) - im Code geprüft, nicht auf eine Selbstauskunft vertraut.
 
+**`source` braucht eine echte, abrufbare `https?://`-URL** (Citation-Fix-
+Addendum) - eine bloße Bezeichnung wie "GitHub Issue #11957" ohne Link ist
+für einen Menschen nicht nachvollziehbar. `log_research_finding` lehnt
+`source` ohne echte URL mechanisch ab; einzige Ausnahme ein Quelltyp ohne
+echten Link (ein persönliches Gespräch, eine private DM) - dann muss
+`source` wörtlich mit `"kein Link:"` gefolgt von der Begründung beginnen,
+dieselbe Ehrlichkeits-Disziplin wie bei anderen Pflichtfeldern, die
+manchmal genuin nicht erfüllbar sind. Die letzte geloggte Quelle pro
+Hypothese wird im Zyklus-Report inklusive dieser URL angezeigt
+(`build_hypothesis_overview`), nicht nur als Kurzfassung ohne Beleg.
+
 **Echte Recherche-Werkzeuge: `search_web` / `read_webpage`.** Damit dieses
 Artefakt für ein wirklich neues Thema (nicht nur API-Sentinel) überhaupt
 erreichbar ist, haben `ceo_agent`, `growth_agent` und `main_ceo_agent`
@@ -1021,6 +1035,70 @@ Umgebung, dasselbe bekannte Problem wie in Kapitel 6.2/5.11) - bewusst
 nicht geraten, sondern als offene Lücke benannt. Live-Smoke-Test:
 `test_payment_propensity_scan_live_reddit_algotrading` (`checkup.py`,
 Kapitel 13), überspringt sich selbst ohne gesetzten Key.
+
+### 5.15 Hypothesen-Backlog und ICE-Scoring (`hypothesis_backlog.jsonl`)
+
+`MAX_ACTIVE_HYPOTHESES = 3` (Kapitel 5.8) begrenzt, wie viele Hypothesen
+gleichzeitig aktiv **getestet** werden - nicht, wie viele Ideen dieses
+System sammeln darf. `write_backlog_candidate` legt Kandidaten in einen
+separaten, bewusst nie gedeckelten Pool ab: ein angrenzender Schmerzpunkt
+aus einem Research-Finding, ein anderes Zielgruppen-Segment, ein
+alternativer Preis-Winkel aus einem Payment-Propensity-Scan, auch etwas
+Tangentiales aus der Recherche zu einem ganz anderen Thema - kein
+Selbstzensur auf das gerade aktiv Getestete.
+
+Jeder Kandidat bekommt drei Sub-Scores (1-10, mit je einer echten,
+nachvollziehbaren `_grounding`-ID - ein Research-Finding, ein Knowledge-
+Base-/Payment-Propensity-Verdikt, ein Channel-Signal, nie eine
+unbegründete Zahl):
+
+- **Impact** - relativ zur *aktuellen* strategischen Richtung der
+  Subsidiary bewertet, keine feste Eigenschaft der Idee. Ändert sich die
+  Richtung (`set_strategic_direction`), markiert `read_backlog` betroffene
+  Einträge als `impact_stale` statt den alten Wert stillschweigend
+  weiterzuverwenden oder ihn eigenmächtig neu zu berechnen.
+- **Confidence** - wie sicher die Grundlage ist.
+- **Ease** - wie billig/schnell ein erster Test wäre.
+
+`scoring.compute_ice_score(impact, confidence, ease)` multipliziert die
+drei zu einem Score 1-1000 (Standard-ICE-Konvention, ein Produkt, keine
+gewichtete Summe) - dieselbe Formel für `read_backlog`s Ranking und den
+Top-4-Block im Zyklus-Report, kein zweiter, paralleler Scoring-Pfad.
+
+**Harte Regel, direkt von Jan vorgegeben (nicht nur ein
+Governance-Vorschlag zur Bestätigung):** `MIN_BACKLOG_BEFORE_ACTIVE_
+PROMOTION = 10` - `write_hypothesis` verweigert jede Beförderung einer
+Hypothese auf `status='active'` (neu angelegt, oder eine bestehende
+reaktiviert), solange nicht mindestens 10 echte, bewertete
+Backlog-Kandidaten existieren (die zu befördernde Hypothese selbst zählt
+nicht mit). Grund: ein Backlog mit weniger als 10 echten Kandidaten ist
+nicht breit genug, um zu vertrauen, dass die beförderte Idee tatsächlich
+die beste verfügbare ist, statt einfach die einzige, die je aufgeschrieben
+wurde. Gilt nur für den Übergang IN `status='active'` - eine bereits aktive
+Hypothese, die aktiv bleibt, löst die Prüfung bei einem unrelated Update
+nicht erneut aus. Die eine Hypothese, die bereits aktiv war, bevor diese
+Regel existierte (`hyp_research_001`), läuft unter Bestandsschutz weiter;
+erst die *nächste* Beförderung wird gegen die Regel geprüft.
+
+**Anti-Stagnation, jetzt mit echtem mechanischem Fallback statt nur
+Erkennung:** `scoring.spare_capacity_produced_nothing` erkennt bereits
+mechanisch, wenn ein Zyklus freie Testkapazität hatte und trotzdem keinen
+neuen persistenten Zustand erzeugt hat - das allein führte aber lange zu
+keiner Handlung, nur zu einer Zeile im Report. `crew.py`s `__main__` prüft
+das jetzt nach jedem Zyklus: hat der Zyklus selbst schon eskaliert (ein
+neuer `propose_idea`-Eintrag), passiert nichts weiter. Sonst feuert der
+Code selbst, mechanisch, den letzten Eskalationsschritt der
+Anti-Stagnations-Anweisung nach (`propose_idea`, sichtbar im Report als
+"mechanisch nachgeholt"). Die beiden vorrangigeren Reaktionen - den
+nächsthöchsten Backlog-Kandidaten aktiv befördern, oder Backlog-Grooming
+vorantreiben - bleiben bewusst der Prompt-Instruktion überlassen, nicht
+mechanisch automatisiert: eine echte Beförderung braucht einen
+Forschungsplan, Channel, `evidence_stage` und Ökonomie-Felder, die sich
+nicht sicher automatisch erzeugen lassen, ohne schlechter zu sein als gar
+nichts zu tun.
+
+`hypothesis_backlog.jsonl` liegt subsidiary-gescoped unter `STATE_DIR/
+<subsidiary_id>/`, gleiche Ablage wie `hypotheses.jsonl` (Kapitel 11.1).
 
 ---
 
@@ -1325,6 +1403,20 @@ Eine genehmigte Anfrage erlaubt genau einen `write_hypothesis`-Aufruf, der
 ohne Artefakte setzt (Kapitel 5.9) - keine allgemeine Ausnahme für die
 Hypothese insgesamt.
 
+**Korrigierte Lücke (2026-08-13):** `main_ceo_agent` hatte
+`read_stage_skip_requests`/`decide_stage_skip_request` seit dem
+Structural-Rebuild-Addendum im eigenen Tool-Set, und die Backstory
+beschrieb die Zuständigkeit - aber `task_main_ceo_review`s tatsächliche,
+nummerierte Checkliste rief keins von beiden je auf. Eine offene
+Stage-Skip-Anfrage konnte damit unbegrenzt liegen bleiben, ohne dass ein
+operativer Schritt sie je gelesen/entschieden hätte - derselbe Fehlertyp
+wie der bereits bekannte `complete_task_order`-Vorfall (ein Tool
+vorhanden, eine Backstory, die es beschreibt, aber kein Task-Schritt, der
+es tatsächlich aufruft). Jetzt als eigener Schritt 6.5 in
+`task_main_ceo_review` verdrahtet: jeden Zyklus offene Anfragen lesen,
+standardmäßig ablehnen (zurück zu den früheren Stages), nur bei
+tatsächlich zutreffender, hypothesenspezifischer Begründung genehmigen.
+
 ### 7.4 FIX.md - Autonome Diagnose
 
 Bisher konnte eine Subsidiary unbemerkt feststecken oder wiederholt am
@@ -1481,6 +1573,33 @@ es über `_format_publish_proposal` mit den exakten deutschen Feld-Labels,
 nie zu Prosa umgeflossen - zusätzliche Begründung steht als eigene Zeile
 klar getrennt darunter.
 
+**`category='publish'` wird automatisch dedupliziert, zwei Schichten**
+(Duplicate-Approval-Addendum) - konfirmiert nötig, nachdem in der Praxis
+mehrfach nahezu identische Freigabe-Anfragen für dieselbe Hypothese
+gleichzeitig in der Queue standen:
+
+a) **Innerhalb der offenen Queue** (`_find_duplicate_publish_approval`):
+   existiert bereits ein Eintrag mit derselben `hypothesis_id`+`platform`
+   und ähnlichem `text` (normalisierter Ähnlichkeitsvergleich,
+   `PUBLISH_DEDUP_SIMILARITY_THRESHOLD = 0.85`, keine Byte-Identität
+   nötig) - noch `pending`, oder innerhalb der letzten
+   `PUBLISH_DEDUP_RECENT_DECISION_HOURS = 24`h entschieden - wird der neue
+   Antrag nicht angelegt, sondern mit `{"skipped": true, "duplicate_of":
+   <id>}` beantwortet.
+b) **Gegen die gesamte, tatsächlich gepostete Historie**
+   (`_find_similar_posted_content`): Abgleich gegen jeden
+   `content_drafts.jsonl`-Eintrag mit `status='posted'` - also wirklich
+   von einem Menschen bestätigt live, nicht nur genehmigt - über die
+   **gesamte** Historie dieser Subsidiary, kein Zeitfenster. Ähnlicher
+   Inhalt, **derselbe** Platform+Community: blockiert genauso wie (a).
+   Ähnlicher Inhalt, **andere** Community (Cross-Forum-Muster - derselbe
+   Text an mehrere Foren, genau das Signal, das Plattform-eigene
+   Anti-Spam-Systeme beobachten und das dem 90/10-Prinzip widerspricht,
+   Kapitel 6.3): **nicht** blockiert, aber als `similar_prior_posts`-Feld
+   am Freigabe-Eintrag gespeichert und in der Telegram-Benachrichtigung
+   klar als Warnung angezeigt, damit ein Mensch das Cross-Forum-Muster
+   vor der Entscheidung sieht, nicht erst danach.
+
 Ein Mensch entscheidet über:
 
 ```bash
@@ -1507,6 +1626,26 @@ ungültigen Credentials sauber (Warnung im Log, kein Crash).
 `notify_new_pending_approvals` schickt für jede neue offene Freigabe eine
 eigene Nachricht (Idempotenz über ein `telegram_notified`-Flag auf dem
 Record).
+
+**Nachrichten-Splitting an echten Grenzen, nicht mitten im Wort**
+(Truncation-Fix-Addendum). Bestätigte reale Ursache für abgeschnittene
+Reports ("Main-CEO mitten im Wort, Dev mitten im Satz"): **nicht** ein zu
+knappes Modell-Token-Budget, sondern ein hartes `text[:2500]`/`[:1000]`/
+`[:400]`-Slicing auf die rohen Task-Outputs, direkt vor dem Telegram-
+Versand - unabhängig sowohl vom echten `max_tokens`-Limit als auch von
+Telegrams eigenem 4096-Zeichen-Limit (`TELEGRAM_MAX_MESSAGE_LENGTH`).
+Ersetzt durch: `TASK_SUMMARY_MAX_CHARS = 6000` als großzügigeres
+Render-Budget pro Task-Abschnitt (bei einem echten Ausreißer darüber
+hinaus sichtbar mit `[... gekuerzt ...]` markiert, nie stillschweigend
+abgeschnitten), plus `_split_message_at_boundaries` (`tools.py`): jede
+Nachricht über `TELEGRAM_SAFE_CHUNK_LENGTH = 4000` Zeichen wird an einer
+echten Grenze geteilt - zuerst `\n---\n` (Abschnittstrenner), dann
+Absatzumbruch, dann Zeilenumbruch, erst als letzter Ausweg ein harter
+Schnitt (nur wenn ein einzelner Lauf ganz ohne Grenze länger als das Limit
+ist). Mehrteilige Nachrichten werden nummeriert (`label="Business Update"`
+→ `"Business Update (1/3)"`), damit klar ist, ob man den ganzen Report
+gesehen hat. Gilt für jeden Sendeweg - Message A, Message B, und die
+einzelnen Freigabe-Benachrichtigungen.
 
 `process_telegram_commands` liest neue Nachrichten seit dem letzten
 verarbeiteten Update (`telegram_update_offset.txt`) und wertet sie aus
@@ -1548,7 +1687,7 @@ sondern in `agent_profile.json` mit zwei benannten Profilen. Umschalten =
 {
   "active_profile": "testing",
   "profiles": {
-    "testing": { "model": "claude-haiku-4-5", "cycle_token_budget": 50000, ... },
+    "testing": { "model": "claude-haiku-4-5", "cycle_token_budget": 250000, ... },
     "normal":  { "model": "claude-sonnet-5",  "cycle_token_budget": 1000000, ... }
   }
 }
@@ -1563,13 +1702,17 @@ Pro Agent (`agents.<rolle>` im aktiven Profil):
 
 | Agent (Profil-Key) | `testing`: max_tokens/max_iter/max_execution_time | `normal`: max_tokens/max_iter/max_execution_time |
 |---|---|---|
-| `growth` | 900 / 9 / 120s | 3000 / 30 / 600s |
-| `dev` | 2000 / 6 / 90s | 8000 / 15 / 300s |
-| `sub_ceo` (`ceo_agent`) | 800 / 15 / 240s | 8000 / 50 / 900s |
-| `main_ceo` | 500 / 6 / 120s | 4000 / 25 / 600s |
+| `growth` | 4500 / 9 / 120s | 3000 / 30 / 600s |
+| `dev` | 10000 / 6 / 90s | 8000 / 15 / 300s |
+| `sub_ceo` (`ceo_agent`) | 4000 / 15 / 240s | 8000 / 50 / 900s |
+| `main_ceo` | 2500 / 6 / 120s | 4000 / 25 / 600s |
 
-`cycle_token_budget`: `testing` = 50.000, `normal` = 1.000.000 Tokens pro
-Zyklus insgesamt.
+`cycle_token_budget`: `testing` = 250.000, `normal` = 1.000.000 Tokens pro
+Zyklus insgesamt. Die `testing`-Werte wurden 2026-08-12 nochmal um das
+5-Fache angehoben (Token-Starvation-Addendum, Schritt 3) - reale Evidenz
+für abgeschnittene Posts/Zwischenschritte und Growth, das `max_iter`
+erreichte, ohne die Aufgabe fertigzustellen; unten stehende
+Log-Begründung bezieht sich auf die noch frühere erste Anhebung.
 
 `growth`/`dev` wurden im Audit-Addendum (Kapitel 15) von 500/6 bzw. 500/4
 angehoben - in echten Railway-Zyklus-Logs bestätigt: Dev erreichte
@@ -2041,18 +2184,44 @@ Laufen gehalten.
 
 ### 12.4 Manuelles Auslösen / Volume-Zugriff
 
-Ein Zyklus lässt sich nicht direkt per Railway-CLI "on demand" auslösen
-(kein Trigger-Befehl für Cron-Services) - dafür entweder auf den nächsten
-planmäßigen Lauf warten oder lokal mit `STATE_DIR` auf einen lokalen Pfad
-gesetzt testen (siehe `checkup.py`). Der persistente Zustand
-(`/data`) ist ausschließlich über einen laufenden Container einsehbar, nicht
-direkt über das Railway-Dashboard als Dateibrowser.
+**Korrigiert 2026-08-13, empirisch gegen die echte Railway-CLI getestet -
+die vorherige Fassung dieses Abschnitts war falsch.** `api-sentinel` ist
+ein Cron-Job-Service: zwischen den planmäßigen Läufen existiert **kein
+laufender Container** (`status: created`). Drei CLI-Wege wurden real
+getestet, keiner funktioniert zwischen den Ticks:
 
-Live-Zugriff auf einzelne Dateien: `railway run -- cat /data/_holding/
-FIX.md` (bzw. der jeweilige Pfad) - genau der Mechanismus, den `CLAUDE.md`
-für `FIX.md` (Kapitel 7.4) als Standing-Instruction für zukünftige
-Claude-Code-Sessions festhält, hier nochmal referenziert statt nur dort
-dokumentiert.
+- `railway run -- cat /data/...` läuft **lokal** mit injizierten Railway-
+  Env-Vars, nicht remote - `/data` existiert auf der lokalen Maschine
+  schlicht nicht, das Scheitern hat nichts mit dem Inhalt der Datei zu tun.
+- `railway ssh` scheitert explizit mit `"Your service's container is not
+  running (status: created)"`.
+- `railway service files list/download` (auf den ersten Blick ein
+  vielversprechender Kandidat für direkten Volume-Zugriff ohne
+  Live-Container) scheitert ebenfalls, mit `Failed to initialize SFTP
+  session / Timeout` - nutzt laut Test denselben Live-Container-Mechanismus
+  wie `ssh`, keinen direkten Block-Storage-Zugriff.
+
+**Es gibt doch einen manuellen Trigger** - anders als hier vorher
+behauptet: `railway restart` (ohne Rebuild) oder `railway redeploy` (bzw.
+im Dashboard "Restart"/"Redeploy", oder Cmd+K "Deploy Latest Commit")
+starten den Service sofort außerhalb des Cron-Plans. Laut Railway-Doku
+gibt es dafür aber keinen separaten "Container nur kurz hochfahren"-
+Mechanismus - es ist derselbe Weg wie ein normales Redeploy und führt den
+echten Start-Befehl (`python crew.py`) aus: ein vollständiger, echter,
+außerplanmäßiger Agenten-Zyklus mit echten Anthropic-API-Kosten und
+echten Seiteneffekten (Telegram-Nachrichten, Approval-Einträge), nicht
+ein kostenloses "kurz reinschauen".
+
+**Praktischer Zugriffsweg:** entweder das kurze Zeitfenster eines
+tatsächlich laufenden planmäßigen Zyklus abpassen (`railway ssh`/`railway
+service files` während der Container aktiv ist), oder - nur nach
+expliziter Rückfrage, da echte Kosten anfallen - bewusst einen
+Extra-Zyklus per `railway restart` auslösen und das kurze Fenster direkt
+danach nutzen. Details, die konkrete Herleitung und Jans Entscheidung
+gegen einen dauerhaften Umbau zu einem Always-on-Worker (der das Problem
+strukturell lösen würde, aber durchgehende statt nur nutzungsbasierte
+Kosten bedeutet): siehe `CLAUDE.md`s `FIX.md`-Abschnitt und
+`OPERATING_MODEL.md` Kapitel 6.
 
 ---
 
@@ -2085,7 +2254,12 @@ Wichtige Eigenschaften:
   ausgeführt (lokal `1.15.9`, produktiv gepinnt `1.15.11`), da mehrere
   crewai-Verhaltensweisen (siehe Kapitel 10.6/10.7) versionsabhängig direkt
   im Quellcode verifiziert wurden statt angenommen.
-- Stand zuletzt: **334 Tests, 334/334 bestanden.** Drei davon
+- Stand zuletzt: **389 Tests, 389/389 bestanden** (2026-08-13). Ein
+  einzelner Test (`test_read_kaizen_actions_and_suggestions_filter_by_since`)
+  ist ein bekannter, vorbestehender Timing-Flake (zwei `datetime.now()`-
+  Zeitstempel dicht beieinander, gelegentlich unter derselben Sekunden-
+  Auflösung) - reproduzierbar bereits auf älteren Commits, keine Regression
+  aus einer der jüngeren Änderungen. Drei weitere Tests
   (`test_search_web_live_real_key_returns_real_results`,
   `test_search_web_then_read_webpage_live_pipeline`,
   `test_payment_propensity_scan_live_reddit_algotrading`) sind echte
@@ -2093,7 +2267,7 @@ Wichtige Eigenschaften:
   selbst sauber (kein Fail/Error), wenn `API-Sentinel-serper` nicht gesetzt
   ist, damit die restliche Suite nie von einem echten externen Key/Budget
   abhängt. Lokal ohne Key: alle drei übersprungen. Per `railway run` mit
-  dem echten Key: alle 334 Tests bestanden, alle drei Live-Tests
+  dem echten Key: alle Tests bestanden, alle drei Live-Tests
   tatsächlich ausgeführt (Real-Serper-Key-Addendum, zuletzt erneut bestätigt
   im FIX.md/Kaizen/Payment-Propensity-Addendum mit dem echten
   r/algotrading-Scan aus Kapitel 5.14). Der eskalierte `claude-opus-5`-
@@ -2186,15 +2360,25 @@ eine Zusammenfassung; Exit-Code `0` nur wenn wirklich alles bestanden hat.
   (eine `spend`-Freigabe) oder manuell gelieferte `metrics_json`-Werte.
 - **`discord_telegram`-Multiplikator in `reach_estimators.json` ist
   ausdrücklich ein unvalidierter Platzhalter** (siehe die `notes` in der
-  Datei selbst) - sollte über `update_reach_multiplier` kalibriert werden,
-  sobald genug echte Datenpunkte vorliegen.
+  Datei selbst). **Korrigiert (2026-08-13, Dead-Code-Audit):**
+  `update_reach_multiplier` (`scoring.py`) ist entgegen der vorherigen
+  Formulierung hier von **keinem Agenten aufrufbar** - kein `@tool`,
+  nirgends in `crew.py`s `tools=[...]`-Listen verdrahtet. Eine
+  Rekalibrierung ist damit aktuell nur manuell/außerhalb des Systems
+  möglich (direktes Editieren von `reach_estimators.json`), nicht etwas,
+  das `ceo_agent` selbst tun kann, auch wenn genug Datenpunkte vorlägen.
+  Siehe `OPERATING_MODEL.md` Kapitel 5 für den vollständigen
+  Dead-Code-Befund.
 - **Der `max_iter`-Rollen-Patch (`crewai_patches.py`) ist ein Workaround für
   einen crewai-eigenen Bug, kein Upstream-Fix** - sollte crewai das Verhalten
   irgendwann selbst korrigieren, kann der Patch entfernt werden (er ist
   defensiv geschrieben und würde bei geändertem crewai-Internal einfach
   übersprungen, aber nicht mehr nötig sein).
-- **Kein manuelles "jetzt sofort einen Zyklus auslösen"** über Railway
-  selbst (Kapitel 12.4) - nur der planmäßige 2h-Cron oder ein lokaler Testlauf.
+- **Korrigiert (2026-08-13):** Es gibt doch ein manuelles "jetzt sofort
+  einen Zyklus auslösen" (`railway restart`/`railway redeploy`, Kapitel
+  12.4) - die vorherige Behauptung hier war falsch. Es ist aber kein
+  kostenloser "nur kurz nachschauen"-Mechanismus: es führt den echten
+  `python crew.py`-Zyklus mit echten API-Kosten und Seiteneffekten aus.
 - **Historie: `/data` war lange Zeit kein echtes Volume.** Frühere Versionen
   dieses Dokuments behaupteten unverifiziert, `/data` sei "das persistente
   Railway-Volume" - `railway volume list` zeigte tatsächlich lange Zeit
@@ -2219,7 +2403,13 @@ eine Zusammenfassung; Exit-Code `0` nur wenn wirklich alles bestanden hat.
   Cron-Lauf-Zeitstempeln verifiziert (Audit-Addendum) - sieben
   aufeinanderfolgende Läufe (22:04, 00:04, 02:01, 04:00, 06:03, 08:01, 10:00)
   lagen tatsächlich ~2h auseinander, die Service-Instance-Diskrepanz ist mit
-  dem 2h-Deploy nicht mehr reproduzierbar.
+  dem 2h-Deploy nicht mehr reproduzierbar. **Erneut beobachtet (2026-08-13):**
+  ein späterer `railway status --json`-Check zeigte wieder zwei
+  unterschiedliche Werte in zwei Feldern derselben Antwort (`"0 */6 * * *"`
+  service-seitig vs. `"0 */2 * * *"` in den Deployment-Metadaten) - noch
+  nicht abschließend reproduzierbar/geklärt, siehe `OPERATING_MODEL.md`
+  Kapitel 6 für den aktuellen Stand; ein direkter Dashboard-Check bleibt der
+  zuverlässigste Weg, das zu klären.
 - **Audit-Addendum (Dev/Growth-Limits, Lean-Startup-Tiefe,
   Pricing-Isolation, Idee-Intake):** Statusaudit bestätigte drei
   unabhängige Ursachen für veraltete Zyklus-Reports gleichzeitig: (1) der
