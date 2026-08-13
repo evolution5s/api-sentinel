@@ -112,34 +112,57 @@ global installierte Python-Version.
 - **Alles außerhalb dieses Repos** (andere Projekte, andere Railway-Services,
   E-Mails/Nachrichten an Dritte).
 
-## Regel-Wachstum bei Freigaben
+## Berechtigungsanfragen: geloggt statt einzeln nachgefragt
 
-**Regel-Wachstum bei Freigaben.** Immer wenn eine Aktion eine
-Freigabe-Abfrage auslöst, die noch nicht durch eine `allow`-Regel in
-`.claude/settings.json` abgedeckt ist, und Jan sie genehmigt: nach der
-Genehmigung explizit fragen, ob diese Art von Aktion künftig dauerhaft
-erlaubt werden soll (z.B. "Soll ich `Bash(railway up:*)` dauerhaft
-erlauben?"). Bei Ja: die konkrete Regel sofort zu `.claude/settings.json`
-hinzufügen - als präzises Muster, das genau dem gerade genehmigten Fall
-entspricht, kein zu breiter Auffangposten (z.B. `Bash(railway up:*)`,
-nicht `Bash(*)`) - und diese Änderung committen, damit sie über Sessions
-hinweg bestehen bleibt, ohne dass Jan die Datei selbst manuell pflegen
-muss. Bei Nein: nicht hinzufügen, und beim nächsten Mal erneut fragen -
-ein "Nein" ist keine dauerhafte Ablehnung, nur ein "noch nicht".
+**Ersetzt die frühere "immer inline nachfragen, ob dauerhaft erlaubt
+werden soll"-Regel** (2026-08-13) - dieses inline Nachfragen selbst trug
+zur Interruption-Fatigue bei, weil es aus jeder Genehmigung zwei Prompts
+machte (die Aktion selbst genehmigen, dann separat das Merken davon
+genehmigen) statt einem. Stattdessen: geloggt und gebündelt überprüft.
+
+**Wenn eine Aktion eine Freigabe-Abfrage auslöst, die noch nicht durch
+eine `allow`-Regel in `.claude/settings.json` abgedeckt ist:** die
+einmalige Freigabe für diese Aktion einholen wie bisher, dann - ohne
+zusätzliche Rückfrage, ob das dauerhaft erlaubt werden soll - einen
+Eintrag an `PERMISSION_REQUESTS.md` anhängen (Format dort beschrieben:
+Datum, exaktes Muster, Kontext, Entscheidung, ein konkreter
+Regel-Vorschlag) und mit der eigentlichen Arbeit weitermachen. Bereits
+geloggte, noch nicht überprüfte Muster (noch nicht nach
+`.claude/settings.json` übernommen oder explizit abgelehnt) nicht erneut
+als neuen Eintrag loggen - stattdessen den Wiederholungszähler am
+bestehenden Eintrag hochzählen. Jan überprüft `PERMISSION_REQUESTS.md`
+periodisch, oft in einer separaten Session außerhalb von Claude Code, und
+legt fest, welche Einträge zu dauerhaften `allow`/`deny`-Regeln werden.
+Wenn das passiert: die bestätigten Regeln zu `.claude/settings.json`
+hinzufügen, und die entsprechenden Einträge aus `PERMISSION_REQUESTS.md`
+in eine Archivdatei verschieben (z.B. `PERMISSION_REQUESTS_reviewed_
+<datum>.md`) - dasselbe schlankes-Live-File-mit-Archiv-Muster wie bei
+`FIX.md`, damit die Live-Datei immer nur zeigt, was tatsächlich noch
+aussteht.
+
+**Das ändert nur, WANN eine Regel zur dauerhaften Aufnahme vorgeschlagen
+wird - nicht, wie `deny`-Regeln funktionieren, und nicht, dass Aktionen
+weiterhin echte, augenblickliche Freigabe brauchen, exakt wie zuvor.** Nur
+das "soll das eine Standing-Regel werden"-Gespräch wandert von einer
+inline Unterbrechung zu einer gebündelten Überprüfung. Eine abgelehnte
+Aktion wird als abgelehnt geloggt - nie stillschweigend erneut versucht
+oder eigenmächtig eskaliert.
 
 **Nie über diesen Weg eine `deny`-Regel aufweichen.** Wenn etwas, das Jan
 genehmigt, nur durch das Umgehen eines bestehenden `deny`-Eintrags möglich
-gewesen wäre, nicht anbieten, das als neue `allow`-Regel dauerhaft zu
-machen - das ist eine bewusste Grenze (Force-Push, Secrets,
-Ressourcen-Löschung) und braucht ein eigenes, explizites Gespräch über die
-Grenze selbst, keine beiläufige "soll ich mir das merken"-Nachfrage.
+gewesen wäre, im `PERMISSION_REQUESTS.md`-Eintrag explizit "kein
+Regel-Vorschlag" vermerken statt einen Regel-Vorschlag zu formulieren -
+das ist eine bewusste Grenze (Force-Push, Secrets, Ressourcen-Löschung)
+und braucht ein eigenes, explizites Gespräch über die Grenze selbst, keine
+beiläufige Zeile in einem Batch-Review.
 
-**Präzise Muster statt breiter Kategorien bevorzugen.** Eine Regel sollte
-genau das abdecken, was tatsächlich gemacht wurde, nicht "gleich mal" eine
-größere Kategorie öffnen - die Allow-Liste wächst einen echten,
-beobachteten Bedarf nach dem anderen, dieselbe Disziplin, die an anderer
-Stelle in diesem Repo schon für `stage_justification`/Reasoning-Feld-
-Durchsetzung gilt: verdiente Spezifität, keine spekulative Breite.
+**Präzise Muster statt breiter Kategorien bevorzugen.** Ein
+Regel-Vorschlag im Log sollte genau das abdecken, was tatsächlich gemacht
+wurde, nicht "gleich mal" eine größere Kategorie öffnen - die Allow-Liste
+wächst einen echten, beobachteten Bedarf nach dem anderen, dieselbe
+Disziplin, die an anderer Stelle in diesem Repo schon für
+`stage_justification`/Reasoning-Feld-Durchsetzung gilt: verdiente
+Spezifität, keine spekulative Breite.
 
 ## Warum diese Grenze so gezogen ist
 
