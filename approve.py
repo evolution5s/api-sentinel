@@ -1,9 +1,47 @@
-"""CLI for the board to review and decide on entries in approval_queue.jsonl.
+"""CLI for the Aufsichtsrat (board) to review and decide on entries in
+approval_queue.jsonl - the single human sign-off point for anything this
+system's agents are never allowed to just go do on their own (see
+README chapter 8.1 for the full request_approval/category discipline this
+queue is part of).
 
-Usage:
-    python approve.py                       # list pending requests
+Commands:
+    python approve.py
+        List every currently pending request: id, category, the proposal
+        itself, the agent's reasoning, and when it was filed. Nothing is
+        decided by running this - it's read-only.
     python approve.py approve appr_ab12cd34
+        Mark a request approved. For category='spend', this does NOT set up
+        a payment link itself - reply on Telegram with
+        "payment_link: <id> <url>" separately once a real one exists.
     python approve.py reject appr_ab12cd34 [reason]
+        Mark a request rejected, optionally with a reason (recommended -
+        it's what the agent sees when it later checks this request's
+        status).
+
+What to weigh before approving, by category:
+    spend    - real money or a payment-intent test going out. Confirm the
+               amount/price point is genuinely what was asked for, not a
+               rounder/higher number slipped in.
+    legal    - creates a legal obligation (e.g. ToS, a contract term).
+               Read the actual text, not just the reasoning summary.
+    publish  - becomes publicly visible under this project's name. The
+               proposal is a rigid template (platform/target_url/title/text/
+               footer/hypothesis_id/evidence_stage/is_experiment/
+               success_criterion) rendered verbatim - read the real `text`
+               field itself, it's exactly what gets posted, not a
+               paraphrase.
+    deploy   - a real infrastructure/code change going live.
+    pricing  - a price point being committed to (e.g. shown to real users),
+               not just floated as a planning guess.
+
+Telegram vs. this CLI: the same approval_queue.jsonl is the one source of
+truth either way. Telegram is the fast path for a single reply ("approve"/
+"reject" on the notification message, or "<id> approve"/"<id> reject" typed
+directly - see process_telegram_commands in tools.py). This CLI is for
+reviewing the whole queue at once, working without Telegram open, or
+attaching a longer rejection reason than a quick reply invites. Both write
+to the exact same file; there is no second, separate approval mechanism to
+keep in sync.
 """
 import json
 import sys

@@ -1489,6 +1489,12 @@ python approve.py approve appr_ab12cd34
 python approve.py reject appr_ab12cd34 [grund]
 ```
 
+Vollständige Nutzungshinweise (was jede `category` konkret bedeutet, worauf
+vor einer Genehmigung zu achten ist, und wie sich Telegram-Freigaben zu
+diesem CLI verhalten - dieselbe `approval_queue.jsonl`, kein zweiter
+Mechanismus) stehen als Docstring direkt am Anfang von `approve.py`, nicht
+hier dupliziert.
+
 Andere Tools (`check_approval_status`, `write_channel`, `register_subsidiary`,
 `update_subsidiary_policies`, …) prüfen den echten Status selbst nach, statt
 der Behauptung eines anderen Agenten zu vertrauen.

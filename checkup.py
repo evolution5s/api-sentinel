@@ -46,6 +46,7 @@ def reset_state():
         shutil.rmtree(SCRATCH_DIR)
     SCRATCH_DIR.mkdir(parents=True)
     _seed_testing_channel()
+    _seed_scored_backlog()
 
 
 def _seed_testing_channel(channel_id="reddit"):
@@ -58,6 +59,33 @@ def _seed_testing_channel(channel_id="reddit"):
         "id": channel_id, "name": channel_id.title(), "category": "community_marketing",
         "is_paid": False, "impact_score": 3, "confidence_score": 3, "status": "testing",
     }))
+
+
+def _seed_scored_backlog(n=None, channel_id="reddit"):
+    """Most hypothesis tests promote a new hypothesis to status='active',
+    which write_hypothesis now refuses unless at least
+    tools.MIN_BACKLOG_BEFORE_ACTIVE_PROMOTION genuinely scored backlog
+    candidates exist (item 3, addendum). Called on every reset_state(), same
+    reasoning/pattern as _seed_testing_channel above - real tests for the
+    gate itself (test_write_hypothesis_active_promotion_requires_backlog_*)
+    reset without this seed instead of calling reset_state().
+    Grounds every ICE sub-score on the real channel_id _seed_testing_channel
+    already wrote (a valid grounding id per tools._backlog_grounding_exists),
+    not a fabricated one.
+    """
+    if n is None:
+        n = tools.MIN_BACKLOG_BEFORE_ACTIVE_PROMOTION
+    for i in range(n):
+        tools.write_backlog_candidate.run(candidate=json.dumps({
+            "id": f"backlog_seed_{i:04d}",
+            "statement": f"Seeded test backlog candidate #{i} - a placeholder rationale long enough to "
+                         "clear the real statement-length bar this tool enforces on every candidate.",
+            "source": "checkup: _seed_scored_backlog",
+            "fits_subsidiary_scope": "yes",
+            "impact": 5, "impact_grounding": channel_id,
+            "confidence": 5, "confidence_grounding": channel_id,
+            "ease": 5, "ease_grounding": channel_id,
+        }))
 
 
 def _allow_paid_channels():
@@ -1702,7 +1730,7 @@ def test_log_research_finding_rejects_invalid_type():
 def test_log_research_finding_requires_summary():
     reset_state()
     result = json.loads(tools.log_research_finding.run(
-        hypothesis_id="hyp_x", finding_type="forum_discussion", source="s", summary="  ",
+        hypothesis_id="hyp_x", finding_type="forum_discussion", source="https://example.com/thread", summary="  ",
     ))
     assert "error" in result
 
@@ -1738,7 +1766,7 @@ def test_log_research_finding_rejects_short_summary():
 def test_log_research_finding_rejects_instruction_echo():
     reset_state()
     result = json.loads(tools.log_research_finding.run(
-        hypothesis_id="hyp_x", finding_type="other", source="n/a",
+        hypothesis_id="hyp_x", finding_type="other", source="https://example.com/note",
         summary=(
             "This system is built and operated by AI agents, so it typically costs this system a few "
             "dollars in tokens rather than old-economy market-rate thinking about human developer/agency/"
@@ -3804,7 +3832,7 @@ def test_usage_headline_is_first_line_in_cycle_summary():
     original_send = crew.send_telegram_message
     original_metrics = crew.crew.usage_metrics
     try:
-        crew.send_telegram_message = lambda text, parse_mode=None: captured.append((text, parse_mode))
+        crew.send_telegram_message = lambda text, parse_mode=None, label=None: captured.append((text, parse_mode))
         crew.crew.usage_metrics = type("U", (), {
             "total_tokens": 999, "prompt_tokens": 900, "completion_tokens": 99,
             "cached_prompt_tokens": 0, "cache_creation_tokens": 0, "successful_requests": 3,
@@ -4312,10 +4340,22 @@ def test_spare_capacity_produced_nothing_false_when_state_changed():
 
 def _real_research_finding_id(hypothesis_id="hyp_backlog_ground"):
     result = json.loads(tools.log_research_finding.run(
-        hypothesis_id=hypothesis_id, finding_type="forum_discussion", source="reddit",
+        hypothesis_id=hypothesis_id, finding_type="forum_discussion",
+        source="https://reddit.com/r/algotrading/comments/backlog_ground",
         summary=_SUBSTANTIVE_SUMMARY,
     ))
     return result["id"]
+
+def _exclude_seeded_backlog(entries):
+    """reset_state() now seeds tools.MIN_BACKLOG_BEFORE_ACTIVE_PROMOTION real
+    backlog candidates (ids prefixed backlog_seed_) so hypothesis-promotion
+    tests don't each need their own backlog setup - tests that assert on the
+    exact shape/order/count of read_backlog()'s own output filter those back
+    out first, same reasoning as _seed_testing_channel not affecting channel-
+    roster assertions elsewhere.
+    """
+    return [e for e in entries if not str(e.get("id", "")).startswith("backlog_seed_")]
+
 
 BACKLOG_STATEMENT = (
     "Several r/algotrading threads this month mention wanting a simple webhook-based alert for "
@@ -4401,7 +4441,7 @@ def test_write_backlog_candidate_create_and_read_roundtrip():
     })))
     assert result == {"ok": True, "id": "bl_roundtrip"}
 
-    backlog = json.loads(tools.read_backlog.run())
+    backlog = _exclude_seeded_backlog(json.loads(tools.read_backlog.run()))
     assert len(backlog) == 1
     entry = backlog[0]
     assert entry["status"] == "candidate"
@@ -4439,11 +4479,11 @@ def test_read_backlog_filters_by_status_and_sorts_descending():
             "confidence": 5, "confidence_grounding": finding_id,
             "ease": 5, "ease_grounding": finding_id,
         }))
-    ranked = json.loads(tools.read_backlog.run())
+    ranked = _exclude_seeded_backlog(json.loads(tools.read_backlog.run()))
     assert [e["id"] for e in ranked] == ["bl_high", "bl_low"]
 
     tools.write_backlog_candidate.run(candidate=json.dumps({"id": "bl_high", "status": "promoted"}))
-    only_candidates = json.loads(tools.read_backlog.run(status="candidate"))
+    only_candidates = _exclude_seeded_backlog(json.loads(tools.read_backlog.run(status="candidate")))
     assert [e["id"] for e in only_candidates] == ["bl_low"]
 
 
@@ -4465,7 +4505,7 @@ def test_backlog_impact_staleness_flips_across_strategic_direction():
         "confidence": 5, "confidence_grounding": finding_id,
         "ease": 5, "ease_grounding": finding_id,
     }))
-    before = json.loads(tools.read_backlog.run())[0]
+    before = next(e for e in json.loads(tools.read_backlog.run()) if e["id"] == "bl_stale")
     assert before["impact_stale"] is False
     assert before["ice_score"] == 8 * 5 * 5
 
@@ -4473,14 +4513,14 @@ def test_backlog_impact_staleness_flips_across_strategic_direction():
         subsidiary_id="api-sentinel", focus_area="paid B2B tier instead", reasoning="market shift",
     ))["filed"]
     assert dir_b != dir_a
-    after_direction_change = json.loads(tools.read_backlog.run())[0]
+    after_direction_change = next(e for e in json.loads(tools.read_backlog.run()) if e["id"] == "bl_stale")
     assert after_direction_change["impact_stale"] is True, "must flag stale, not silently keep the old number"
     assert after_direction_change["impact"] == 8, "must NOT eagerly mass-recompute - the raw number is unchanged"
 
     tools.write_backlog_candidate.run(candidate=json.dumps({
         "id": "bl_stale", "impact": 3, "impact_grounding": finding_id,
     }))
-    after_rescore = json.loads(tools.read_backlog.run())[0]
+    after_rescore = next(e for e in json.loads(tools.read_backlog.run()) if e["id"] == "bl_stale")
     assert after_rescore["impact_stale"] is False
     assert after_rescore["ice_score"] == 3 * 5 * 5
     assert after_rescore["ice_score"] != before["ice_score"], "same idea, genuinely different score under a new direction"
@@ -4667,7 +4707,7 @@ def test_build_top_hypotheses_block_keeps_active_and_backlog_separate():
     top_backlog_ids = [c["id"] for c in block["top_backlog"]]
     assert top_backlog_ids == ["bl_a", "bl_b"], top_backlog_ids  # ice_scores: 225, 175, 50 - ranked purely by score
     assert hyp["id"] not in top_backlog_ids, "an active hypothesis must never appear in the backlog ranking"
-    new_ids = {c["id"] for c in block["new_this_cycle"]}
+    new_ids = {c["id"] for c in block["new_this_cycle"] if not c["id"].startswith("backlog_seed_")}
     assert new_ids == {"bl_c"}, new_ids  # bl_c is the only real record not already shown in active/top_backlog
     assert block["active"][0]["is_new"] is True, "first-ever report - nothing to compare against, everything is new"
 
@@ -4752,7 +4792,7 @@ def test_send_cycle_summary_flags_anti_stagnation_in_business_report():
     captured = []
     original_send = crew.send_telegram_message
     try:
-        crew.send_telegram_message = lambda text, parse_mode=None: captured.append(text)
+        crew.send_telegram_message = lambda text, parse_mode=None, label=None: captured.append(text)
         crew.send_cycle_summary(subsidiary_id="api-sentinel", spare_capacity_produced_nothing=True)
         message_b = captured[1]
         assert "--- Anti-Stagnation-Hinweis ---" in message_b

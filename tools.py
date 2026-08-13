@@ -17,6 +17,7 @@ Locally/in tests, STATE_DIR is just an ordinary directory, no volume
 involved - override via the STATE_DIR env var.
 """
 import base64
+import difflib
 import json
 import os
 import re
@@ -45,6 +46,13 @@ PUBLISH_TEMPLATE_FIELDS = {
     "platform", "target_url", "title", "text", "footer",
     "hypothesis_id", "evidence_stage", "is_experiment", "success_criterion",
 }
+# Duplicate-publish-approval guard (addendum, item 1): a near-identical
+# publish request for the same hypothesis+platform filed while an earlier
+# one is still pending, or was decided recently, gets skipped instead of
+# queued again. "Near-identical" is a normalized similarity ratio, not byte
+# equality, since agents re-file with minor wording tweaks.
+PUBLISH_DEDUP_SIMILARITY_THRESHOLD = 0.85
+PUBLISH_DEDUP_RECENT_DECISION_HOURS = 24
 #
 # Structural-rebuild addendum (section 2): fields are now required based on
 # reversibility, not a single flat checklist. research/community_engagement
@@ -92,6 +100,16 @@ HYPOTHESIS_STATUSES = {"active", "evaluated", "buried"}
 # too many hypotheses at once is the more common failure than picking the
 # wrong one first (four-fixes addendum, point 4).
 MAX_ACTIVE_HYPOTHESES = 3
+# Jan's explicit mandate (addendum, item 3): a hypothesis backlog with fewer
+# than 10 genuinely scored, grounded candidates isn't broad enough to trust
+# that the one being promoted is actually the best available option, not
+# just the only one anyone bothered to write down. Applies only to a
+# transition INTO status='active' from something else (new hypothesis, or
+# an existing one being re-activated) - a hypothesis that is already active
+# continuing to be active on an unrelated update never re-triggers this, so
+# the one hypothesis active before this rule existed (hyp_research_001) is
+# grandfathered in and keeps running; only the *next* promotion is gated.
+MIN_BACKLOG_BEFORE_ACTIVE_PROMOTION = 10
 # Evidence-stage ladder: ordered from cheapest/weakest to most expensive/
 # strongest signal. Every hypothesis now declares one (BASE_REQUIRED_
 # HYPOTHESIS_FIELDS) from the start. research/community_engagement are
@@ -783,6 +801,54 @@ def read_state() -> str:
     return json.dumps(state, ensure_ascii=False)
 
 
+def _normalize_publish_text(text: str) -> str:
+    return re.sub(r"\s+", " ", text.strip().lower())
+
+
+def _find_duplicate_publish_approval(template: dict, approvals: list) -> dict | None:
+    """Return the existing approval_queue.jsonl record this template
+    duplicates (same hypothesis_id+platform, near-identical text, still
+    pending or decided within PUBLISH_DEDUP_RECENT_DECISION_HOURS), or None.
+    """
+    target_hyp = template.get("hypothesis_id")
+    target_platform = template.get("platform")
+    target_text = _normalize_publish_text(str(template.get("text") or ""))
+    now = datetime.now(timezone.utc)
+    for existing in approvals:
+        if existing.get("category") != "publish":
+            continue
+        try:
+            existing_template = json.loads(existing.get("proposal") or "")
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(existing_template, dict):
+            continue
+        if existing_template.get("hypothesis_id") != target_hyp:
+            continue
+        if existing_template.get("platform") != target_platform:
+            continue
+        status = existing.get("status")
+        if status == "pending":
+            pass
+        elif status in ("approved", "rejected"):
+            decided_at = existing.get("decided_at")
+            if not decided_at:
+                continue
+            try:
+                decided_dt = datetime.fromisoformat(decided_at)
+            except ValueError:
+                continue
+            if (now - decided_dt) > timedelta(hours=PUBLISH_DEDUP_RECENT_DECISION_HOURS):
+                continue
+        else:
+            continue
+        existing_text = _normalize_publish_text(str(existing_template.get("text") or ""))
+        similarity = difflib.SequenceMatcher(None, target_text, existing_text).ratio()
+        if similarity >= PUBLISH_DEDUP_SIMILARITY_THRESHOLD:
+            return existing
+    return None
+
+
 @tool("request_approval")
 def request_approval(category: str, proposal: str, reasoning: str) -> str:
     """File a request in the human approval queue instead of acting directly.
@@ -816,6 +882,14 @@ def request_approval(category: str, proposal: str, reasoning: str) -> str:
     noetig", never omit it). Rendered verbatim in the Telegram notification
     (notify_new_pending_approvals) using these exact structured fields,
     never reflowed into prose.
+
+    category='publish' is deduplicated automatically: if an existing
+    approval_queue.jsonl entry already covers the same hypothesis_id and
+    platform with substantially similar text (still pending, or decided
+    within the last 24h), this call returns {"skipped": ..., "duplicate_of":
+    <id>} instead of filing a new entry. Log that as a Kaizen
+    selbst_umsetzbar finding ("duplicate draft avoided") rather than
+    retrying with reworded text.
     """
     if category not in APPROVAL_CATEGORIES:
         return json.dumps({
@@ -839,6 +913,14 @@ def request_approval(category: str, proposal: str, reasoning: str) -> str:
                 return json.dumps({"error": f"publish template field '{_field}' must not be empty"})
         if not isinstance(template.get("is_experiment"), bool):
             return json.dumps({"error": "publish template field 'is_experiment' must be a boolean (true/false)"})
+        duplicate = _find_duplicate_publish_approval(template, _read_global_jsonl("approval_queue.jsonl"))
+        if duplicate is not None:
+            return json.dumps({
+                "skipped": True,
+                "reason": "near-identical publish approval already exists for this hypothesis_id+platform",
+                "duplicate_of": duplicate.get("id"),
+                "duplicate_status": duplicate.get("status"),
+            })
 
     record = {
         "id": f"appr_{uuid.uuid4().hex[:8]}",
@@ -1056,6 +1138,15 @@ def write_hypothesis(hypothesis: str) -> str:
     request_approval(category='spend') entry once a real payment-intent
     (pre-order/deposit) test has been requested for it - see task_ceo
     guidance for when that's warranted.
+
+    Promoting into status="active" from anything else (a brand-new
+    hypothesis, or re-activating an existing one) requires at least
+    MIN_BACKLOG_BEFORE_ACTIVE_PROMOTION scored, grounded candidates in
+    read_backlog(status="candidate") first - not counting the one being
+    promoted (pass backlog_candidate_id so it's excluded from its own
+    count). An already-active hypothesis being updated is unaffected. Use
+    write_backlog_candidate to grow the backlog before attempting a
+    promotion that's currently blocked by this.
     """
     try:
         patch = json.loads(hypothesis)
@@ -1089,6 +1180,31 @@ def write_hypothesis(hypothesis: str) -> str:
     existing_record = hyps[existing_index] if existing_index is not None else {}
     prior_stage = existing_record.get("evidence_stage")
     effective_stage = patch.get("evidence_stage", prior_stage)
+    prior_status = existing_record.get("status")
+    effective_status = patch.get("status", prior_status if existing_index is not None else "active")
+
+    # Item 3 (Jan's explicit mandate): promoting INTO active status requires
+    # a backlog of at least MIN_BACKLOG_BEFORE_ACTIVE_PROMOTION genuinely
+    # scored (impact/confidence/ease all set - write_backlog_candidate
+    # already enforces grounding on every score field) candidates at that
+    # moment, not counting the one being promoted here via
+    # backlog_candidate_id. A hypothesis that's already active and stays
+    # active on this update is exempt - this only gates NEW promotions.
+    if effective_status == "active" and prior_status != "active":
+        _promoting_candidate_id = patch.get("backlog_candidate_id", existing_record.get("backlog_candidate_id"))
+        _scored_backlog_count = sum(
+            1 for c in _read_jsonl("hypothesis_backlog.jsonl")
+            if c.get("status") == "candidate"
+            and c.get("id") != _promoting_candidate_id
+            and c.get("impact") is not None and c.get("confidence") is not None and c.get("ease") is not None
+        )
+        if _scored_backlog_count < MIN_BACKLOG_BEFORE_ACTIVE_PROMOTION:
+            return json.dumps({
+                "error": f"only {_scored_backlog_count} genuinely scored backlog candidates exist "
+                         f"(need {MIN_BACKLOG_BEFORE_ACTIVE_PROMOTION} before promoting any hypothesis to "
+                         "status='active') - write_backlog_candidate more candidates with real impact/"
+                         "confidence/ease scores and grounding first, per Jan's explicit instruction"
+            })
 
     # Section 5: reasoning fields must be this hypothesis's own, not reused
     # instruction/incident-template phrasing - checked before anything else
@@ -2395,6 +2511,16 @@ def read_webpage(url: str) -> str:
 # --------------------------------------------------------------------------
 
 RESEARCH_FINDING_TYPES = {"competitor_product", "forum_discussion", "own_question_post_replies", "other"}
+# Item 6 (addendum): a citation like "GitHub Issue #11957" with no URL isn't
+# retrievable by a human reader - source must carry the real link, or
+# honestly say why none exists, same "keiner"-with-reasoning discipline as
+# other required-but-sometimes-genuinely-absent fields in this system.
+_URL_PATTERN = re.compile(r"https?://\S+")
+NO_URL_SOURCE_PREFIX = "kein link:"
+
+
+def _has_real_url(text: str) -> bool:
+    return bool(_URL_PATTERN.search(text or ""))
 
 
 @tool("log_research_finding")
@@ -2423,10 +2549,24 @@ def log_research_finding(hypothesis_id: str, finding_type: str, source: str, sum
     past 'research'. Also rejected if summary echoes known instruction/
     incident template phrasing rather than this hypothesis's own findings
     (section 5).
+
+    source must contain the actual retrievable http(s):// URL of what's
+    being cited - "GitHub Issue #11957" or a bare platform name isn't
+    something a human reader can follow. If no URL genuinely exists for
+    this source (e.g. an in-person conversation, a private DM), start
+    source with "kein Link:" followed by why, same discipline as other
+    fields in this system that require an honest reason instead of a
+    placeholder when the real thing genuinely isn't available.
     """
     if finding_type not in RESEARCH_FINDING_TYPES:
         return json.dumps({
             "error": f"invalid finding_type '{finding_type}', must be one of {sorted(RESEARCH_FINDING_TYPES)}"
+        })
+    if not _has_real_url(source) and not source.strip().lower().startswith(NO_URL_SOURCE_PREFIX):
+        return json.dumps({
+            "error": f"source must include a real http(s):// URL to the actual thread/post/page cited - "
+                     f"a bare label like 'GitHub Issue #123' isn't retrievable by a human reader. If no URL "
+                     f"genuinely exists here, start source with '{NO_URL_SOURCE_PREFIX}' followed by why"
         })
     if len(summary.strip()) < RESEARCH_FINDING_MIN_LENGTH:
         return json.dumps({
@@ -2667,15 +2807,64 @@ def get_account_stats(platform: str) -> str:
 # --------------------------------------------------------------------------
 
 TELEGRAM_MAX_MESSAGE_LENGTH = 4096
+# Real headroom under Telegram's actual 4096-char limit (item 5 addendum) -
+# a numbering prefix ("Business Update (1/3)\n\n") added below eats into
+# the budget, so chunks are built against a slightly smaller target and
+# only the raw fallback slice (see _split_message_at_boundaries) ever gets
+# close to the true limit.
+TELEGRAM_SAFE_CHUNK_LENGTH = 4000
 
 
-def send_telegram_message(text: str, parse_mode: str = None) -> None:
+def _split_message_at_boundaries(text: str, max_length: int = TELEGRAM_SAFE_CHUNK_LENGTH) -> list:
+    """Split text into chunks no longer than max_length, preferring a real
+    boundary - a '---' section separator first, then a blank line/paragraph
+    break, then any line break - over a mid-word/mid-sentence cut. Falls
+    back to a hard slice only when a single run has no boundary at all
+    within max_length (rare - this system's reports are line-oriented).
+
+    Item 5 (duplicate-approval/backlog-enforcement addendum): this replaces
+    the previous plain text[i:i+N] range-slicing, which is exactly why
+    long reports used to visibly cut off mid-word at each 4096-char
+    boundary even though every character technically still arrived in the
+    next message - a human reading Telegram just never noticed the
+    continuation was a separate message. Splitting on boundaries makes each
+    chunk read as a complete unit on its own.
+    """
+    if len(text) <= max_length:
+        return [text]
+    chunks = []
+    remaining = text
+    while len(remaining) > max_length:
+        window = remaining[:max_length]
+        split_at = None
+        for sep in ("\n---\n", "\n\n", "\n", " "):
+            idx = window.rfind(sep)
+            if idx > 0:
+                split_at = idx + len(sep)
+                break
+        if split_at is None:
+            split_at = max_length
+        chunks.append(remaining[:split_at].rstrip())
+        remaining = remaining[split_at:].lstrip("\n")
+    if remaining:
+        chunks.append(remaining)
+    return chunks
+
+
+def send_telegram_message(text: str, parse_mode: str = None, label: str = None) -> None:
     """Send a message via a Telegram bot to a fixed chat, split across
-    multiple messages if it exceeds Telegram's 4096-char limit. Needs
+    multiple messages at real section/paragraph/line boundaries (never mid-
+    word/mid-sentence) if it exceeds Telegram's 4096-char limit. Needs
     TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID in the environment; prints a
     clear warning and returns quietly if either is missing or the send
     fails - a missing/failed notification must never crash the crew run
     that already completed successfully.
+
+    label, when given and the message actually needs more than one chunk,
+    prefixes each chunk with "{label} (i/n)" so a reader isn't left
+    wondering whether they've seen the whole thing (e.g. label="Business
+    Update" -> "Business Update (1/2)"). Omit it for short, single-chunk
+    operator-command confirmations where numbering would never trigger.
 
     parse_mode (e.g. "Markdown") enables formatting (used for the fixed-
     width token/cost table, see crew.py's _format_usage_table). If a
@@ -2690,8 +2879,10 @@ def send_telegram_message(text: str, parse_mode: str = None) -> None:
         print("[telegram] TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID not set - skipping cycle summary notification.")
         return
 
-    for i in range(0, len(text), TELEGRAM_MAX_MESSAGE_LENGTH):
-        chunk = text[i:i + TELEGRAM_MAX_MESSAGE_LENGTH]
+    chunks = _split_message_at_boundaries(text)
+    for i, chunk in enumerate(chunks, 1):
+        if label and len(chunks) > 1:
+            chunk = f"{label} ({i}/{len(chunks)})\n\n{chunk}"
         payload = {"chat_id": chat_id, "text": chunk}
         if parse_mode:
             payload["parse_mode"] = parse_mode
@@ -2758,7 +2949,11 @@ def build_hypothesis_overview() -> list:
             (f for f in findings if f.get("hypothesis_id") == hyp_id),
             key=lambda f: f.get("created_at") or "",
         )
-        latest_finding = own_findings[-1]["summary"][:140] if own_findings else "keine Erkenntnis geloggt"
+        if own_findings:
+            _latest = own_findings[-1]
+            latest_finding = f"{_latest['summary'][:140]} (Quelle: {_latest.get('source') or '?'})"
+        else:
+            latest_finding = "keine Erkenntnis geloggt"
         open_orders = sorted(
             (o for o in orders if o.get("hypothesis_id") == hyp_id and o.get("status") == "open"),
             key=lambda o: o.get("created_at") or "",

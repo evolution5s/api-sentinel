@@ -1568,7 +1568,23 @@ task_ceo = ConditionalTask(
 task_main_ceo_review = ConditionalTask(
     condition=_within_cycle_budget,
     description=(
-        "Run the holding's governance review for this cycle:\n"
+        "Run the holding's governance review for this cycle. Ground truth "
+        "over assertion means trusting this role's OWN tool reads "
+        "(read_status_reports, assess_subsidiary_trajectory, "
+        "search_research_archive, read_ideas, etc.) over a Sub-CEO's "
+        "free-text narrative when the two disagree - it does NOT mean "
+        "pausing this review to first adjudicate whether the Sub-CEO's own "
+        "persisted records are 'real'. Every hypotheses.jsonl/research_"
+        "findings.jsonl/etc. entry the Sub-CEO's tools returned this cycle "
+        "already IS the real, persisted state - there is no separate more-"
+        "authoritative source to cross-check it against, and questioning "
+        "whether already-persisted state actually happened is not this "
+        "role's job or a productive use of a cycle. If something in a "
+        "status report's narrative still looks inconsistent with what this "
+        "role's own tool calls return, note that one discrepancy plainly as "
+        "a line in this cycle's own report and keep going - never let it "
+        "block or replace steps 0-8 below, all of which still run every "
+        "cycle regardless:\n"
         "0) Call read_ideas(status='pending'). For each: decide whether it "
         "belongs in an existing active subsidiary (route_idea with "
         "decision='existing_subsidiary' and target_subsidiary_id, then "
@@ -1719,7 +1735,10 @@ task_dev = ConditionalTask(
         "Call read_task_orders(to_role='dev', status='open') first - these "
         "are the Sub-CEO's fixed asks, not something to infer from the "
         "report above. An empty list means nothing was ordered this cycle - "
-        "do nothing and say so, don't act on the free-text report alone. "
+        "say so in ONE line (e.g. 'No open task orders this cycle.') and "
+        "stop there - not a paragraph justifying or narrating what an empty "
+        "list means, the fact itself is the whole report. Don't act on the "
+        "free-text report alone. "
         "For each open order: if it's tied to a hypothesis_id whose outcome "
         "is 'build', call check_approval_status on the approval the order "
         "references (read it from the order's context/task_description) "
@@ -1755,12 +1774,31 @@ crew = Crew(
     process=Process.sequential,
 )
 
-def _task_summary(task: Task) -> str:
+# Item 5 (duplicate-approval/backlog-enforcement addendum): these used to be
+# fixed [:2500]/[:1000]/[:400] slices applied silently to each task's raw
+# output at the call site - a hard, mid-word/mid-sentence cut that happened
+# BEFORE the text ever reached send_telegram_message, completely independent
+# of both the model's own max_tokens and Telegram's real 4096-char limit.
+# That's the confirmed real cause of "Main-CEO mitten im Wort, Dev mitten im
+# Satz" - not a token-budget shortfall (the earlier 5x max_tokens increase
+# genuinely helped the model finish generating; it just then had its own
+# finished output chopped by these slices regardless). Raised well above
+# what a normal cycle's output needs and, when a genuine outlier still
+# exceeds it, marked visibly rather than silently - real overflow beyond
+# that is handled by send_telegram_message's own boundary-aware splitting
+# into multiple sequential Telegram messages, never by cutting content.
+TASK_SUMMARY_MAX_CHARS = 6000
+
+
+def _task_summary(task: Task, max_chars: int = TASK_SUMMARY_MAX_CHARS) -> str:
     try:
         output = task.output
-        return output.raw if output and output.raw else "(kein Output)"
+        text = output.raw if output and output.raw else "(kein Output)"
     except Exception as exc:
         return f"(Output nicht lesbar: {exc})"
+    if len(text) <= max_chars:
+        return text
+    return text[:max_chars] + f"\n[... gekuerzt, {max_chars} von {len(text)} Zeichen gezeigt ...]"
 
 
 def _compute_cycle_usage() -> dict:
@@ -2119,9 +2157,47 @@ def _top_hypotheses_lines(block: dict) -> list:
     return lines
 
 
+def _auto_escalate_spare_capacity(subsidiary_id: str) -> str:
+    """Item 2 (addendum): the anti-stagnation instruction in ceo_agent's own
+    backstory already tells the model, in order of preference, to pull the
+    top backlog candidate into active testing, advance backlog grooming, or
+    propose_idea as a last resort - but that's still just a prompt the model
+    can skip, and scoring.spare_capacity_produced_nothing only ever detects
+    the miss AFTER the cycle already ran, too late to influence it. Genuine
+    auto-promotion isn't safely constructible here: a backlog candidate
+    (write_backlog_candidate) carries a statement/ICE score, not the
+    research plan, channel, evidence_stage, or economics fields a real
+    write_hypothesis call needs - fabricating those mechanically would be
+    worse than not acting. So this closes the gap at the one step that IS
+    safe to take deterministically: if the cycle had spare capacity, did
+    nothing, and never even escalated itself (checked by __main__ via
+    read_ideas.run(status="pending") before/after kickoff), file the
+    last-resort propose_idea call itself, in code, so the escalation this
+    cycle's own instructions call for actually happens rather than staying
+    theoretical. Returns the filed idea's id.
+    """
+    backlog_count = len(json.loads(read_backlog.run(status="candidate")))
+    reasoning = (
+        f"Automated: this cycle had unused active-testing capacity (active hypotheses < "
+        f"tools.MAX_ACTIVE_HYPOTHESES) and persisted no new state at all (scoring."
+        f"spare_capacity_produced_nothing), and did not itself file a propose_idea escalation "
+        f"despite the anti-stagnation instruction's own last-resort step. {backlog_count} scored "
+        f"backlog candidate(s) currently exist (tools.MIN_BACKLOG_BEFORE_ACTIVE_PROMOTION="
+        f"{tools.MIN_BACKLOG_BEFORE_ACTIVE_PROMOTION} required before any promotion to active). "
+        "Filed mechanically, not by an agent's own judgment - review and route/reject accordingly."
+    )
+    result = json.loads(propose_idea.run(
+        summary=f"{subsidiary_id}: spare test capacity went unused this cycle with no escalation",
+        source=f"{subsidiary_id}: automated anti-stagnation fallback (crew.py _auto_escalate_spare_capacity)",
+        reasoning=reasoning,
+    ))
+    return result.get("filed")
+
+
 def send_cycle_summary(
     subsidiary_id: str, kickoff_error: Exception = None, telegram_action_log: list = None,
     persistence_warning: str = None, spare_capacity_produced_nothing: bool = False,
+    auto_escalated_idea_id: str = None,
 ) -> None:
     """Post two sequential Telegram messages for this cycle (cycle-
     reporting/backlog addendum, Part 1.1): Message A, a short technical
@@ -2140,7 +2216,12 @@ def send_cycle_summary(
     2, section 2.4 - computed in __main__ via scoring.spare_capacity_
     produced_nothing) is flagged plainly in Message B as its own finding
     when true, a stronger and more immediate signal than the existing
-    3-cycle zero_state_streak check.
+    3-cycle zero_state_streak check. auto_escalated_idea_id (item 2 of the
+    duplicate-approval/backlog-enforcement addendum), when set, means
+    __main__ itself had to file the anti-stagnation instruction's own
+    last-resort propose_idea step in code because this cycle didn't do it -
+    surfaced explicitly rather than silently, since it means the model
+    skipped its own instructed fallback.
     """
     try:
         notify_new_pending_approvals()
@@ -2175,7 +2256,7 @@ def send_cycle_summary(
             "--- Hypothesen-Uebersicht ---",
         ]
         lines_b += _format_hypothesis_overview(build_hypothesis_overview())
-        lines_b += ["", _task_summary(task_ceo)[:2500]]
+        lines_b += ["", _task_summary(task_ceo)]
         lines_b += _top_hypotheses_lines(build_top_hypotheses_block())
         lines_b += _kaizen_business_lines(subsidiary_id, since_iso)
         lines_b += approvals_lines
@@ -2189,13 +2270,18 @@ def send_cycle_summary(
                 "Content-Draft, keine Task-Order) - das ist selbst ein Befund, siehe Backlog-Addendum "
                 "Abschnitt 2.4.",
             ]
+            if auto_escalated_idea_id:
+                lines_b.append(
+                    f"Zyklus hat auch die eigene Eskalations-Anweisung (propose_idea als letzte Stufe) "
+                    f"nicht selbst ausgefuehrt - mechanisch nachgeholt: {auto_escalated_idea_id}."
+                )
         lines_b += [
             "",
             "--- Main-CEO: Holding-Review ---",
-            _task_summary(task_main_ceo_review)[:1000],
+            _task_summary(task_main_ceo_review),
             "",
             "--- Dev ---",
-            _task_summary(task_dev)[:400],
+            _task_summary(task_dev),
         ]
         lines_b += _aufsichtsrat_lines(
             len(current_approval_ids), duration_policy, pending_stage_skips, stagnation_escalations,
@@ -2204,8 +2290,8 @@ def send_cycle_summary(
         lines_b += ["", f"Naechster Schritt: {next_step}"]
         message_b = "\n".join(lines_b)
 
-        send_telegram_message(message_a)
-        send_telegram_message(message_b)
+        send_telegram_message(message_a, label="Technischer Status")
+        send_telegram_message(message_b, label="Business Update")
         save_cycle_note(message_b[:3000])
         save_business_report(next_step=next_step, reported_approval_ids=current_approval_ids)
     except Exception as exc:
@@ -2263,26 +2349,37 @@ if __name__ == "__main__":
             # unlike holding.check_zero_state_streak's 3-cycle window.
             pre_active_count = len(json.loads(read_hypotheses.run(status="active")))
             cycle_start_counts = snapshot_state_counts()
+            # Item 2 (addendum): ideas.jsonl is holding-level/global, not
+            # part of snapshot_state_counts (that stays subsidiary-scoped by
+            # design, same reasoning as tools.py never importing holding.py
+            # back) - tracked separately here so a cycle that DID escalate
+            # via propose_idea itself isn't double-escalated below.
+            pre_pending_idea_count = len(json.loads(read_ideas.run(status="pending")))
+
+            def _finish_cycle(kickoff_exc: Exception = None):
+                run_fix_checks_for_subsidiary(sub_id)
+                spare_capacity_nothing = scoring.spare_capacity_produced_nothing(
+                    pre_active_count, tools.MAX_ACTIVE_HYPOTHESES, cycle_start_counts, snapshot_state_counts(),
+                )
+                auto_escalated_idea_id = None
+                if spare_capacity_nothing:
+                    post_pending_idea_count = len(json.loads(read_ideas.run(status="pending")))
+                    if post_pending_idea_count <= pre_pending_idea_count:
+                        try:
+                            auto_escalated_idea_id = _auto_escalate_spare_capacity(sub_id)
+                        except Exception as escalation_exc:
+                            print(f"[api-sentinel] auto-escalation failed for '{sub_id}': {escalation_exc}")
+                send_cycle_summary(
+                    subsidiary_id=sub_id, kickoff_error=kickoff_exc, telegram_action_log=telegram_action_log,
+                    persistence_warning=persistence["warning"],
+                    spare_capacity_produced_nothing=spare_capacity_nothing,
+                    auto_escalated_idea_id=auto_escalated_idea_id,
+                )
+
             try:
                 crew.kickoff(inputs={"subsidiary_id": sub_id})
                 print(f"[api-sentinel] Execution finished for '{sub_id}'.")
-                run_fix_checks_for_subsidiary(sub_id)
-                spare_capacity_produced_nothing = scoring.spare_capacity_produced_nothing(
-                    pre_active_count, tools.MAX_ACTIVE_HYPOTHESES, cycle_start_counts, snapshot_state_counts(),
-                )
-                send_cycle_summary(
-                    subsidiary_id=sub_id, telegram_action_log=telegram_action_log,
-                    persistence_warning=persistence["warning"],
-                    spare_capacity_produced_nothing=spare_capacity_produced_nothing,
-                )
+                _finish_cycle()
             except Exception as exc:
                 print(f"[api-sentinel] crew.kickoff() failed for '{sub_id}': {exc}")
-                run_fix_checks_for_subsidiary(sub_id)
-                spare_capacity_produced_nothing = scoring.spare_capacity_produced_nothing(
-                    pre_active_count, tools.MAX_ACTIVE_HYPOTHESES, cycle_start_counts, snapshot_state_counts(),
-                )
-                send_cycle_summary(
-                    subsidiary_id=sub_id, kickoff_error=exc, telegram_action_log=telegram_action_log,
-                    persistence_warning=persistence["warning"],
-                    spare_capacity_produced_nothing=spare_capacity_produced_nothing,
-                )
+                _finish_cycle(exc)
