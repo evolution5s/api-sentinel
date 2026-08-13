@@ -2681,6 +2681,13 @@ def test_classify_command_live():
     assert tools._classify_command("live:", "") is None
 
 
+def test_classify_command_wipe_state_and_confirm():
+    assert tools._classify_command("wipe_state: api-sentinel", "") == ("wipe_state", "api-sentinel")
+    assert tools._classify_command("wipe_confirm: api-sentinel", "") == ("wipe_confirm", "api-sentinel")
+    assert tools._classify_command("wipe_state:", "") is None
+    assert tools._classify_command("wipe_confirm:  ", "") is None
+
+
 def test_classify_command_posted():
     assert tools._classify_command("posted: draft_ab12cd34 https://reddit.com/r/x/y", "") == (
         "posted", ("draft_ab12cd34", "https://reddit.com/r/x/y")
@@ -5468,6 +5475,230 @@ def test_payment_propensity_scan_live_reddit_algotrading():
     stored = json.loads(tools.read_knowledge_base.run(channel="reddit_algotrading"))
     assert len(stored) == 1
     print(f"    r/algotrading payment-propensity live scan: {takeaway[:400]}")
+
+
+# --------------------------------------------------------------------------
+# Full state wipe (competitor-research addendum, item 6) - two-phase,
+# Telegram-gated: prepare_state_wipe (archive + preview, no deletion) then
+# execute_confirmed_wipe (only clears if a matching, unexpired pending wipe
+# exists).
+# --------------------------------------------------------------------------
+
+def _seed_wipeable_state(subsidiary_id="api-sentinel"):
+    """Puts real, non-trivial data into every file the wipe touches, both
+    subsidiary-scoped and the subsidiary-filtered slice of holding-level
+    files - so a wipe test can assert on genuinely real before/after
+    counts, not just "still runs."
+    """
+    tools.write_hypothesis.run(hypothesis=json.dumps(SAMPLE_HYP))
+    finding_id = _real_research_finding_id()
+    tools.write_backlog_candidate.run(candidate=json.dumps({
+        "id": "bl_wipe_test", "statement": BACKLOG_STATEMENT, "source": "growth",
+        "fits_subsidiary_scope": "yes",
+        "impact": 5, "impact_grounding": finding_id,
+        "confidence": 5, "confidence_grounding": finding_id,
+        "ease": 5, "ease_grounding": finding_id,
+    }))
+    tools.draft_content.run(**_draft_kwargs())
+    tools.file_task_order.run(to_role="growth", task_description="do x", context="c", hypothesis_id="")
+    tools.write_knowledge_entry.run(
+        topic="competitor scan", confidence="low", source_hypothesis_ids=json.dumps([SAMPLE_HYP["id"]]),
+        takeaway="no clear competitor found - a genuine negative result",
+    )
+    tools.save_business_report(next_step="ship it", reported_approval_ids=[])
+    tools.save_cycle_note("last cycle went fine")
+    tools.request_approval.run(category="deploy", proposal="p", reasoning="r")
+    holding.propose_idea.run(summary="s", source=f"{subsidiary_id}: growth", reasoning="r")
+    holding.set_strategic_direction.run(subsidiary_id=subsidiary_id, focus_area="test focus", reasoning="r")
+    holding.file_kaizen_report.run(subsidiary_id=subsidiary_id, kaizen_report=json.dumps({
+        "selbst_umsetzbar": [{"action": "a", "grounding": "reddit", "status": "acted"}],
+        "fuer_aufsichtsrat": [{"suggestion": "s", "grounding": "reddit"}],
+    }))
+    entry_id = "fix_wipetest01"
+    holding.append_fix_md(entry_id, "technisch", "Test headline", "Test body.")
+    holding.record_fix_entry(entry_id, "technisch", "Test headline", subsidiary_id, "zero_state_streak")
+
+
+def test_prepare_state_wipe_computes_real_counts_and_archives_without_deleting():
+    reset_state()
+    holding.read_subsidiaries.run()
+    _seed_wipeable_state()
+
+    pre_channels = len(json.loads(tools.read_channels.run()))
+    pre_backlog = len(json.loads(tools.read_backlog.run()))
+    assert pre_channels >= 1 and pre_backlog >= 11  # 10 seeded by reset_state() + 1 from _seed_wipeable_state
+
+    result = tools.prepare_state_wipe("api-sentinel")
+    assert result["subsidiary_id"] == "api-sentinel"
+    counts = result["counts"]
+    assert counts["hypotheses.jsonl"] == 1
+    assert counts["hypothesis_backlog.jsonl"] == pre_backlog
+    assert counts["content_drafts.jsonl"] == 1
+    assert counts["task_orders.jsonl"] == 1
+    assert counts["knowledge_base.jsonl"] == 1
+    assert counts["research_findings.jsonl"] == 1
+    assert counts["business_reports.jsonl"] == 1
+    assert counts["channels.jsonl"] == pre_channels
+    assert counts["last_cycle_note.txt"] == 1
+    assert counts["approval_queue.jsonl"] == 1
+    assert counts["ideas.jsonl"] == 1
+    assert counts["strategic_directions.jsonl"] == 1
+    assert counts["kaizen_suggestions.jsonl"] == 1
+    assert counts["kaizen_actions.jsonl"] == 1
+    assert counts["fix_entries.jsonl (unresolved)"] == 1
+
+    # Nothing was actually cleared yet - this is a dry run.
+    assert len(json.loads(tools.read_hypotheses.run())) == 1
+    assert len(json.loads(tools.read_backlog.run())) == pre_backlog
+    assert len(tools._read_global_jsonl("approval_queue.jsonl")) == 1
+    assert len(holding._read("ideas.jsonl")) == 1
+    assert "fix_wipetest01" in holding.HOLDING_DIR.joinpath("FIX.md").read_text(encoding="utf-8")
+
+    # Real archive files exist with the real content.
+    archive_dir = Path(result["archive_dir"])
+    assert archive_dir.exists()
+    archived_hyps = tools.read_jsonl(archive_dir, "hypotheses.jsonl")
+    assert len(archived_hyps) == 1 and archived_hyps[0]["id"] == SAMPLE_HYP["id"]
+    assert (archive_dir / "FIX.md").exists()
+    assert "fix_wipetest01" in (archive_dir / "FIX.md").read_text(encoding="utf-8")
+
+    # Pending-wipe marker written for phase 2.
+    pending = tools._read_pending_wipe()
+    assert pending["subsidiary_id"] == "api-sentinel"
+    assert pending["counts"] == counts
+
+
+def test_execute_confirmed_wipe_without_pending_wipe_errors_and_clears_nothing():
+    reset_state()
+    holding.read_subsidiaries.run()
+    _seed_wipeable_state()
+    result = tools.execute_confirmed_wipe("api-sentinel")
+    assert "error" in result
+    assert len(json.loads(tools.read_hypotheses.run())) == 1, "must not clear anything without a pending wipe"
+
+
+def test_execute_confirmed_wipe_wrong_subsidiary_id_errors():
+    reset_state()
+    holding.read_subsidiaries.run()
+    _seed_wipeable_state()
+    tools.prepare_state_wipe("api-sentinel")
+    result = tools.execute_confirmed_wipe("some-other-co")
+    assert "error" in result
+    assert len(json.loads(tools.read_hypotheses.run())) == 1
+
+
+def test_execute_confirmed_wipe_expired_pending_wipe_errors():
+    reset_state()
+    holding.read_subsidiaries.run()
+    _seed_wipeable_state()
+    tools.prepare_state_wipe("api-sentinel")
+    pending = tools._read_pending_wipe()
+    pending["requested_at"] = (
+        datetime.now(timezone.utc) - timedelta(hours=tools.WIPE_CONFIRMATION_EXPIRY_HOURS + 1)
+    ).isoformat()
+    tools._write_pending_wipe(pending)
+
+    result = tools.execute_confirmed_wipe("api-sentinel")
+    assert "error" in result
+    assert "expired" in result["error"]
+    assert len(json.loads(tools.read_hypotheses.run())) == 1
+    assert tools._read_pending_wipe() == {}, "an expired pending wipe should be cleared, not left dangling"
+
+
+def test_execute_confirmed_wipe_clears_everything_after_prepare():
+    reset_state()
+    holding.read_subsidiaries.run()
+    _seed_wipeable_state()
+    prepared = tools.prepare_state_wipe("api-sentinel")
+
+    result = tools.execute_confirmed_wipe("api-sentinel")
+    assert "error" not in result, result
+    assert result["archive_dir"] == prepared["archive_dir"]
+
+    assert json.loads(tools.read_hypotheses.run()) == []
+    assert json.loads(tools.read_backlog.run()) == []
+    assert json.loads(tools.read_content_drafts.run()) == []
+    assert json.loads(tools.read_task_orders.run(to_role="growth", status="")) == []
+    assert json.loads(tools.read_knowledge_base.run()) == []
+    assert json.loads(tools.read_research_findings.run()) == []
+    assert tools.read_last_business_report() is None
+    assert json.loads(tools.read_channels.run()) == [], "channel roster is fully wiped, not just reset to not_tested"
+    assert tools._subsidiary_dir().joinpath("last_cycle_note.txt").exists() is False
+    assert tools._read_global_jsonl("approval_queue.jsonl") == []
+    assert holding._read("ideas.jsonl") == []
+    assert holding._read("strategic_directions.jsonl") == []
+    assert holding._read("kaizen_suggestions.jsonl") == []
+    assert holding._read("kaizen_actions.jsonl") == []
+    unresolved_fix = [e for e in holding._read("fix_entries.jsonl") if not e.get("resolved")]
+    assert unresolved_fix == []
+    assert "fix_wipetest01" not in holding.HOLDING_DIR.joinpath("FIX.md").read_text(encoding="utf-8")
+
+    # Archived data survives the wipe intact.
+    archive_dir = Path(prepared["archive_dir"])
+    assert len(tools.read_jsonl(archive_dir, "hypotheses.jsonl")) == 1
+    assert "fix_wipetest01" in (archive_dir / "FIX.md").read_text(encoding="utf-8")
+
+    # Pending-wipe marker consumed - a second confirm attempt must fail cleanly.
+    second = tools.execute_confirmed_wipe("api-sentinel")
+    assert "error" in second
+
+
+def test_state_wipe_only_touches_the_named_subsidiary():
+    reset_state()
+    holding.read_subsidiaries.run()
+    _seed_wipeable_state("api-sentinel")
+    # An idea and a strategic direction for a DIFFERENT subsidiary must
+    # survive an api-sentinel wipe untouched.
+    holding.propose_idea.run(summary="other subsidiary's idea", source="second-co: ceo", reasoning="r")
+    holding.set_strategic_direction.run(subsidiary_id="second-co", focus_area="other focus", reasoning="r")
+
+    tools.prepare_state_wipe("api-sentinel")
+    tools.execute_confirmed_wipe("api-sentinel")
+
+    remaining_ideas = holding._read("ideas.jsonl")
+    assert len(remaining_ideas) == 1 and "second-co" in remaining_ideas[0]["source"]
+    remaining_directions = holding._read("strategic_directions.jsonl")
+    assert len(remaining_directions) == 1 and remaining_directions[0]["subsidiary_id"] == "second-co"
+
+
+def test_apply_telegram_commands_wipe_state_then_confirm_full_flow():
+    reset_state()
+    holding.read_subsidiaries.run()
+    _seed_wipeable_state()
+    had_token = os.environ.pop("TELEGRAM_BOT_TOKEN", None)
+    had_chat = os.environ.pop("TELEGRAM_CHAT_ID", None)
+    try:
+        log = tools._apply_telegram_commands([{"text": "wipe_state: api-sentinel", "reply_to_text": ""}])
+        assert any("vorbereitet" in entry for entry in log)
+        assert len(json.loads(tools.read_hypotheses.run())) == 1, "dry run must not clear anything"
+        assert tools._read_pending_wipe()["subsidiary_id"] == "api-sentinel"
+
+        log = tools._apply_telegram_commands([{"text": "wipe_confirm: api-sentinel", "reply_to_text": ""}])
+        assert any("durchgefuehrt" in entry for entry in log)
+        assert json.loads(tools.read_hypotheses.run()) == []
+        assert tools._read_pending_wipe() == {}
+    finally:
+        if had_token is not None:
+            os.environ["TELEGRAM_BOT_TOKEN"] = had_token
+        if had_chat is not None:
+            os.environ["TELEGRAM_CHAT_ID"] = had_chat
+
+
+def test_apply_telegram_commands_wipe_confirm_without_prior_state_is_a_no_op():
+    reset_state()
+    holding.read_subsidiaries.run()
+    _seed_wipeable_state()
+    had_token = os.environ.pop("TELEGRAM_BOT_TOKEN", None)
+    had_chat = os.environ.pop("TELEGRAM_CHAT_ID", None)
+    try:
+        log = tools._apply_telegram_commands([{"text": "wipe_confirm: api-sentinel", "reply_to_text": ""}])
+        assert log == [], "nothing should be logged as applied when there's no pending wipe to confirm"
+        assert len(json.loads(tools.read_hypotheses.run())) == 1
+    finally:
+        if had_token is not None:
+            os.environ["TELEGRAM_BOT_TOKEN"] = had_token
+        if had_chat is not None:
+            os.environ["TELEGRAM_CHAT_ID"] = had_chat
 
 
 def main():

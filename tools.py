@@ -117,9 +117,14 @@ MAX_ACTIVE_HYPOTHESES = 3
 # just the only one anyone bothered to write down. Applies only to a
 # transition INTO status='active' from something else (new hypothesis, or
 # an existing one being re-activated) - a hypothesis that is already active
-# continuing to be active on an unrelated update never re-triggers this, so
-# the one hypothesis active before this rule existed (hyp_research_001) is
-# grandfathered in and keeps running; only the *next* promotion is gated.
+# continuing to be active on an unrelated update never re-triggers this,
+# which is what grandfathered in the one hypothesis (hyp_research_001) that
+# was already active before this rule existed - no special-case code for
+# it anywhere, purely an emergent consequence of only gating NEW
+# transitions. Moot after the full state wipe (competitor-research
+# addendum, item 6): with no pre-existing active hypothesis left, this
+# rule now applies cleanly to the very first promotion, no exception ever
+# exercised.
 MIN_BACKLOG_BEFORE_ACTIVE_PROMOTION = 10
 # Evidence-stage ladder: ordered from cheapest/weakest to most expensive/
 # strongest signal. Every hypothesis now declares one (BASE_REQUIRED_
@@ -3207,6 +3212,198 @@ _FIX_THRESHOLD_ORDER = (
     "repeated_pivot_streak", "stale_approval_hours",
 )
 
+# --------------------------------------------------------------------------
+# Full state wipe (competitor-research addendum, item 6) - a deliberate,
+# Jan-decided full reset for one subsidiary, executed only after items 1-3
+# of that same addendum were confirmed fixed: every hypothesis, backlog
+# entry, research finding, draft, task order, knowledge-base entry,
+# business report, channel, and this subsidiary's own holding-level
+# records (strategic direction, Kaizen suggestions/actions, unresolved
+# FIX.md entries) - archived first, never a pure destructive delete, same
+# discipline as every other consequential change this session.
+#
+# Two-phase, Telegram-gated, never agent-triggered (no @tool decorator -
+# only reachable via _apply_telegram_commands, same tier as
+# fix_resolved:/stagnation_ack:): "wipe_state: <id>" computes real live
+# counts, archives everything verbatim, and reports back - nothing is
+# cleared yet. "wipe_confirm: <id>" only then actually clears the live
+# files, and only if a matching, not-yet-expired pending wipe exists - a
+# stale/forgotten dry-run can't be confirmed long after state has moved on.
+# --------------------------------------------------------------------------
+
+WIPE_CONFIRMATION_EXPIRY_HOURS = 24
+_PENDING_WIPE_FILE = "pending_wipe.json"
+_WIPE_SUBSIDIARY_JSONL_FILES = (
+    "hypotheses.jsonl", "hypothesis_backlog.jsonl", "content_drafts.jsonl",
+    "task_orders.jsonl", "knowledge_base.jsonl", "research_findings.jsonl",
+    "business_reports.jsonl", "channels.jsonl",
+)
+
+
+def _read_pending_wipe() -> dict:
+    path = STATE_DIR / _PENDING_WIPE_FILE
+    if not path.exists():
+        return {}
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def _write_pending_wipe(data: dict) -> None:
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    (STATE_DIR / _PENDING_WIPE_FILE).write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _clear_pending_wipe() -> None:
+    path = STATE_DIR / _PENDING_WIPE_FILE
+    if path.exists():
+        path.unlink()
+
+
+def prepare_state_wipe(subsidiary_id: str) -> dict:
+    """Phase 1 ("wipe_state: <id>"): read every real, currently-live record
+    this wipe would touch, archive it verbatim to STATE_DIR/_archive/
+    <subsidiary_id>_<date>/, and return a summary (real counts per file) -
+    never deletes or clears anything itself. Writes the pending-wipe
+    marker phase 2 (execute_confirmed_wipe) requires to actually proceed.
+
+    approval_queue.jsonl and ideas.jsonl are real, confirmed schema gaps:
+    neither carries a structured subsidiary_id field on its records today
+    (approval_queue.jsonl has none at all; ideas.jsonl only has a
+    free-text `source` convention, per propose_idea's own docstring).
+    With exactly one subsidiary existing, every record in both is
+    unambiguously this subsidiary's, so treating "all of them"/"source
+    contains this id" as the match is correct today - but this would need
+    a real per-record subsidiary_id field before a second subsidiary
+    exists, to avoid this wipe touching another subsidiary's entries.
+    """
+    import holding  # local import: avoids a circular import (holding.py imports from tools)
+
+    archive_dir = STATE_DIR / "_archive" / f"{subsidiary_id}_{datetime.now(timezone.utc).date().isoformat()}"
+    counts = {}
+    sub_dir = STATE_DIR / subsidiary_id
+
+    for filename in _WIPE_SUBSIDIARY_JSONL_FILES:
+        records = read_jsonl(sub_dir, filename)
+        write_jsonl(archive_dir, filename, records)
+        counts[filename] = len(records)
+
+    note_path = sub_dir / "last_cycle_note.txt"
+    note_text = note_path.read_text(encoding="utf-8") if note_path.exists() else ""
+    counts["last_cycle_note.txt"] = 1 if note_text.strip() else 0
+    if note_text:
+        archive_dir.mkdir(parents=True, exist_ok=True)
+        (archive_dir / "last_cycle_note.txt").write_text(note_text, encoding="utf-8")
+
+    approvals = _read_global_jsonl("approval_queue.jsonl")
+    write_jsonl(archive_dir, "approval_queue.jsonl", approvals)
+    counts["approval_queue.jsonl"] = len(approvals)
+
+    ideas = holding._read("ideas.jsonl")
+    matching_ideas = [i for i in ideas if subsidiary_id in (i.get("source") or "")]
+    write_jsonl(archive_dir, "ideas.jsonl", matching_ideas)
+    counts["ideas.jsonl"] = len(matching_ideas)
+
+    strategic_directions = holding._read("strategic_directions.jsonl")
+    matching_directions = [d for d in strategic_directions if d.get("subsidiary_id") == subsidiary_id]
+    write_jsonl(archive_dir, "strategic_directions.jsonl", matching_directions)
+    counts["strategic_directions.jsonl"] = len(matching_directions)
+
+    kaizen_suggestions = holding._read("kaizen_suggestions.jsonl")
+    matching_kaizen_suggestions = [k for k in kaizen_suggestions if k.get("subsidiary_id") == subsidiary_id]
+    write_jsonl(archive_dir, "kaizen_suggestions.jsonl", matching_kaizen_suggestions)
+    counts["kaizen_suggestions.jsonl"] = len(matching_kaizen_suggestions)
+
+    kaizen_actions = holding._read("kaizen_actions.jsonl")
+    matching_kaizen_actions = [k for k in kaizen_actions if k.get("subsidiary_id") == subsidiary_id]
+    write_jsonl(archive_dir, "kaizen_actions.jsonl", matching_kaizen_actions)
+    counts["kaizen_actions.jsonl"] = len(matching_kaizen_actions)
+
+    fix_entries = holding._read("fix_entries.jsonl")
+    matching_fix_entries = [
+        e for e in fix_entries if e.get("subsidiary_id") == subsidiary_id and not e.get("resolved")
+    ]
+    write_jsonl(archive_dir, "fix_entries.jsonl", matching_fix_entries)
+    counts["fix_entries.jsonl (unresolved)"] = len(matching_fix_entries)
+    fix_md_path = holding.HOLDING_DIR / "FIX.md"
+    if fix_md_path.exists():
+        archive_dir.mkdir(parents=True, exist_ok=True)
+        (archive_dir / "FIX.md").write_text(fix_md_path.read_text(encoding="utf-8"), encoding="utf-8")
+
+    _write_pending_wipe({
+        "subsidiary_id": subsidiary_id,
+        "requested_at": datetime.now(timezone.utc).isoformat(),
+        "archive_dir": str(archive_dir),
+        "counts": counts,
+    })
+
+    return {"subsidiary_id": subsidiary_id, "archive_dir": str(archive_dir), "counts": counts}
+
+
+def execute_confirmed_wipe(subsidiary_id: str) -> dict:
+    """Phase 2 ("wipe_confirm: <id>") - only clears live state if a
+    matching, not-yet-expired pending wipe (from prepare_state_wipe) exists
+    for this exact subsidiary_id. Returns {"error": ...} and clears nothing
+    if there's no matching pending wipe or it expired
+    (WIPE_CONFIRMATION_EXPIRY_HOURS) - never clears anything on a guess.
+    """
+    import holding  # local import: avoids a circular import (holding.py imports from tools)
+
+    pending = _read_pending_wipe()
+    if not pending or pending.get("subsidiary_id") != subsidiary_id:
+        return {"error": f"no pending wipe found for '{subsidiary_id}' - run 'wipe_state: {subsidiary_id}' first"}
+    requested_at = pending.get("requested_at")
+    try:
+        age_hours = (datetime.now(timezone.utc) - datetime.fromisoformat(requested_at)).total_seconds() / 3600
+    except (TypeError, ValueError):
+        age_hours = None
+    if age_hours is None or age_hours > WIPE_CONFIRMATION_EXPIRY_HOURS:
+        _clear_pending_wipe()
+        return {
+            "error": f"pending wipe for '{subsidiary_id}' expired ({WIPE_CONFIRMATION_EXPIRY_HOURS}h) - "
+                     f"run 'wipe_state: {subsidiary_id}' again for a fresh one"
+        }
+
+    sub_dir = STATE_DIR / subsidiary_id
+    for filename in _WIPE_SUBSIDIARY_JSONL_FILES:
+        write_jsonl(sub_dir, filename, [])
+    note_path = sub_dir / "last_cycle_note.txt"
+    if note_path.exists():
+        note_path.unlink()
+
+    _write_global_jsonl("approval_queue.jsonl", [])
+
+    ideas = holding._read("ideas.jsonl")
+    holding._write("ideas.jsonl", [i for i in ideas if subsidiary_id not in (i.get("source") or "")])
+
+    strategic_directions = holding._read("strategic_directions.jsonl")
+    holding._write(
+        "strategic_directions.jsonl",
+        [d for d in strategic_directions if d.get("subsidiary_id") != subsidiary_id],
+    )
+
+    kaizen_suggestions = holding._read("kaizen_suggestions.jsonl")
+    holding._write(
+        "kaizen_suggestions.jsonl",
+        [k for k in kaizen_suggestions if k.get("subsidiary_id") != subsidiary_id],
+    )
+    kaizen_actions = holding._read("kaizen_actions.jsonl")
+    holding._write(
+        "kaizen_actions.jsonl",
+        [k for k in kaizen_actions if k.get("subsidiary_id") != subsidiary_id],
+    )
+
+    fix_entries = holding._read("fix_entries.jsonl")
+    for entry in fix_entries:
+        if entry.get("subsidiary_id") == subsidiary_id and not entry.get("resolved"):
+            holding.resolve_fix_entry(entry["id"])
+
+    archive_dir = pending.get("archive_dir")
+    counts = pending.get("counts")
+    _clear_pending_wipe()
+    return {"ok": True, "subsidiary_id": subsidiary_id, "archive_dir": archive_dir, "counts": counts}
+
 
 def is_system_paused() -> tuple[bool, str]:
     """Whether the system is currently paused via a Telegram 'stop' command,
@@ -3325,6 +3522,10 @@ def _classify_command(text: str, reply_to_text: str):
     - "stagnation_ack": payload is the subsidiary_id - a human acknowledging
       a persistent stagnation escalation (section 3), clearing it from the
       "Fuer den Aufsichtsrat" section until it would genuinely re-trigger.
+    - "wipe_state"/"wipe_confirm": payload is the subsidiary_id - the
+      two-phase full state wipe (competitor-research addendum, item 6):
+      "wipe_state: <id>" archives and previews, "wipe_confirm: <id>"
+      actually clears. See prepare_state_wipe/execute_confirmed_wipe.
 
     Two ways to approve/reject: reply directly to the notification message
     that announced the pending approval (matched via the appr_... id in
@@ -3445,6 +3646,18 @@ def _classify_command(text: str, reply_to_text: str):
                     return None
             return ("fix_thresholds_set", values)
         return None
+
+    # Full state wipe (competitor-research addendum, item 6) - deliberately
+    # typed-out commands, not a reply/short-word shortcut like approve/
+    # reject, since this is the most consequential Telegram command in the
+    # system.
+    if normalized.startswith("wipe_state:"):
+        subsidiary_id = text.split(":", 1)[1].strip()
+        return ("wipe_state", subsidiary_id) if subsidiary_id else None
+
+    if normalized.startswith("wipe_confirm:"):
+        subsidiary_id = text.split(":", 1)[1].strip()
+        return ("wipe_confirm", subsidiary_id) if subsidiary_id else None
 
     return None
 
@@ -3615,6 +3828,34 @@ def _apply_telegram_commands(messages: list) -> list:
             holding.write_fix_thresholds(confirmed)
             log.append("FIX-Thresholds gesetzt und bestaetigt (Telegram)")
             send_telegram_message(f"FIX-Thresholds gesetzt und bestaetigt: {values}")
+            continue
+
+        if action == "wipe_state":
+            subsidiary_id = target_id
+            result = prepare_state_wipe(subsidiary_id)
+            counts_lines = "\n".join(f"  - {k}: {v}" for k, v in result["counts"].items())
+            log.append(f"{subsidiary_id}: State-Wipe vorbereitet, archiviert nach {result['archive_dir']} (Telegram)")
+            send_telegram_message(
+                f"State-Wipe fuer '{subsidiary_id}' vorbereitet und vollstaendig archiviert nach:\n"
+                f"{result['archive_dir']}\n\n"
+                f"Wird bei Bestaetigung geloescht (echte aktuelle Zahlen):\n{counts_lines}\n\n"
+                f"Antworte 'wipe_confirm: {subsidiary_id}' zum tatsaechlichen Loeschen (Bestaetigung verfaellt "
+                f"nach {WIPE_CONFIRMATION_EXPIRY_HOURS}h) - oder ignoriere diese Nachricht, um abzubrechen. "
+                "Nichts wurde bisher geloescht."
+            )
+            continue
+
+        if action == "wipe_confirm":
+            subsidiary_id = target_id
+            result = execute_confirmed_wipe(subsidiary_id)
+            if "error" in result:
+                send_telegram_message(f"State-Wipe fuer '{subsidiary_id}' nicht bestaetigt: {result['error']}")
+                continue
+            log.append(f"{subsidiary_id}: State-Wipe durchgefuehrt (Telegram)")
+            send_telegram_message(
+                f"State-Wipe fuer '{subsidiary_id}' durchgefuehrt - vollstaendig archiviert unter "
+                f"{result['archive_dir']}, alle betroffenen Dateien geleert. Naechster Zyklus startet bei null."
+            )
             continue
 
         # action in ("approve", "reject") from here - reject's payload is

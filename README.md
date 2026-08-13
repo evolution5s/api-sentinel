@@ -1768,11 +1768,51 @@ verarbeiteten Update (`telegram_update_offset.txt`) und wertet sie aus
 | `fix_resolved: <entry_id>` | `FIX.md`-Eintrag als gelöst markieren, Abschnitt in `FIX_resolved_<datum>.md` archivieren (Kapitel 7.4) |
 | `fix_thresholds: confirm` | Vorgeschlagene FIX.md-Check-Schwellen unverändert bestätigen (Kapitel 7.4) |
 | `fix_thresholds: <zero_state> <malformed> <bury_streak> <pivot_streak> <stale_hours>` | Eigene Schwellenwerte setzen und in einem Schritt bestätigen (Kapitel 7.4) |
+| `wipe_state: <subsidiary_id>` | Phase 1 eines vollständigen State-Wipes: archiviert alles, löscht nichts (Kapitel 8.3) |
+| `wipe_confirm: <subsidiary_id>` | Phase 2: löscht die live archivierten Daten tatsächlich (Kapitel 8.3) |
 
 Alle anderen Nachrichten werden stillschweigend ignoriert (der Operator darf
 einfach chatten, das ist kein Fehler). Ein Telegram-/Netzwerkfehler darf nie
 einen Cron-Zyklus blockieren oder crashen - alle Telegram-Funktionen fangen
 ihre eigenen Fehler ab.
+
+### 8.3 Vollständiger State-Wipe (`wipe_state:`/`wipe_confirm:`)
+
+Zweiphasig, ausschließlich über Telegram auslösbar (kein `@tool`, kein
+Agent kann das je selbst aufrufen) - der folgenreichste Befehl im ganzen
+System, deshalb bewusst als ausgeschriebenes Kommando statt eines kurzen
+Reply-Worts wie bei `approve`/`reject`.
+
+**Phase 1, `wipe_state: <subsidiary_id>`** (`tools.prepare_state_wipe`):
+liest die echten, aktuell live vorhandenen Daten für jede betroffene Datei,
+archiviert sie wörtlich nach `STATE_DIR/_archive/<subsidiary_id>_<datum>/`
+und schickt eine Zusammenfassung mit echten Zählungen per Telegram - **löscht
+noch nichts**. Betroffen: `hypotheses.jsonl`, `hypothesis_backlog.jsonl`,
+`content_drafts.jsonl`, `task_orders.jsonl`, `knowledge_base.jsonl`,
+`research_findings.jsonl`, `business_reports.jsonl`, `channels.jsonl`
+(kompletter Roster-Wipe, keine Identitäten erhalten - Jans explizite
+Entscheidung), `last_cycle_note.txt`, plus der subsidiary-gefilterte
+Ausschnitt globaler/Holding-Dateien: `approval_queue.jsonl`,
+`ideas.jsonl`, `strategic_directions.jsonl`, `kaizen_suggestions.jsonl`,
+`kaizen_actions.jsonl`, unaufgelöste `fix_entries.jsonl`-Einträge (samt
+deren `FIX.md`-Abschnitten, archiviert wie bei `resolve_fix_entry`).
+
+**Bekannte Schema-Lücke, ehrlich offengelegt statt stillschweigend
+umgangen:** `approval_queue.jsonl` und `ideas.jsonl` tragen aktuell **kein**
+strukturiertes `subsidiary_id`-Feld auf ihren Records (`ideas.jsonl` nur
+eine freitextliche `source`-Konvention). Bei genau einer existierenden
+Subsidiary ist "alles" bzw. "Source enthält die id als Substring" korrekt
+- bräuchte aber ein echtes `subsidiary_id`-Feld, sobald eine zweite
+Subsidiary existiert, um deren Einträge nicht versehentlich mitzulöschen.
+
+**Phase 2, `wipe_confirm: <subsidiary_id>`** (`tools.execute_confirmed_wipe`):
+löscht nur, wenn eine passende, noch nicht abgelaufene Phase-1-Anfrage
+vorliegt (`WIPE_CONFIRMATION_EXPIRY_HOURS = 24`) - sonst Fehlermeldung,
+nichts wird angefasst. Eine falsche `subsidiary_id` oder ein zweiter
+Bestätigungsversuch nach bereits erfolgtem Wipe schlägt ebenfalls sauber
+fehl, statt etwas zu tun. Bei Erfolg: alle oben genannten Dateien werden
+geleert (bzw. subsidiary-gefiltert neu geschrieben), das bereits
+archivierte Backup bleibt unangetastet erhalten.
 
 ---
 
