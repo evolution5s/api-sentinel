@@ -45,11 +45,30 @@ global installierte Python-Version.
 - **Kleinere, offensichtliche Eigenentscheidungen** bei mehrdeutigen
   Anweisungen treffen und im Nachhinein kurz begründen, statt vorher zu fragen.
 - **Wenn nach `FIX.md` gefragt wird:** zuerst den echten, aktuellen Inhalt
-  direkt vom Railway-Volume holen (`railway run -- python -c "import
-  pathlib,os; print(pathlib.Path(os.environ.get('STATE_DIR', '/data')) /
-  '_holding' / 'FIX.md')"` liefert den exakten Pfad; typischerweise
-  `railway run -- cat /data/_holding/FIX.md`) - nie eine lokale Kopie
-  annehmen, es gibt keine, `FIX.md` lebt ausschließlich auf dem Volume.
+  direkt vom Railway-Volume holen - nie eine lokale Kopie annehmen, es gibt
+  keine, `FIX.md` lebt ausschließlich auf dem Volume. **Wichtig, empirisch
+  bestätigt (2026-08-13):** `api-sentinel` ist ein Cron-Job-Service ohne
+  laufenden Container zwischen den geplanten Läufen (`status: created`
+  zwischen Ticks). Weder `railway run -- cat /data/...` (läuft lokal mit
+  injizierten Env-Vars, kein echter Remote-Zugriff - `/data` existiert auf
+  der lokalen Maschine schlicht nicht) noch `railway ssh` ("container is
+  not running") noch `railway service files list/download` (scheitert mit
+  SFTP-Timeout - nutzt laut Test denselben Live-Container-Mechanismus wie
+  `ssh`, kein direkter Volume-Zugriff) funktionieren zwischen den Cron-
+  Ticks. Echter Zugriff ist aktuell nur während eines tatsächlich laufenden
+  Cron-Ausführungsfensters möglich (`railway ssh`/`railway service files`
+  während der Container kurz aktiv ist), oder durch einen bewussten,
+  manuell ausgelösten Extra-Zyklus (kostet echte API-Tokens - vorher
+  fragen, fällt unter dieselbe Rückfrage-Pflicht wie andere kostenpflichtige
+  Aktionen). Die frühere Formulierung, `railway run -- cat
+  /data/_holding/FIX.md` liefere "den exakten Pfad", war falsch und ist
+  hiermit korrigiert - siehe `OPERATING_MODEL.md` Abschnitt 6 für die volle
+  Herleitung. Eine dauerhafte Lösung (Umbau von Cron-Job zu einem
+  durchlaufenden Worker-Service mit interner Sleep-Loop-Schedule) ist
+  möglich, aber ein echter Architektur-/Kosten-Wechsel (bezahlt dauerhaft
+  statt nur pro Cron-Ausführung) - das braucht Jans explizite Zustimmung,
+  genau wie die Sonnet/Haiku-Profilentscheidung, nicht stillschweigend
+  umsetzen.
   Jeden gefundenen Abschnitt als eigene Addendum-artige Aufgabe bearbeiten,
   mit derselben Sorgfalt wie ein direkt von Jan eingefügtes Addendum. Nach
   Umsetzung im Commit/Summary explizit nennen, welche `FIX.md`-Einträge

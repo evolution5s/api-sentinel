@@ -464,20 +464,35 @@ validate against an actual cycle.
   cadences (every 6h vs. every 2h) read from two different fields of the
   same API response. Not resolved in this session - worth a direct
   dashboard check rather than trusting either field blindly.
-- **`railway run` does not provide remote filesystem access**, contrary to
-  what `CLAUDE.md`'s documented `FIX.md`-fetching procedure assumes. It
-  runs a command *locally* with the linked environment's variables injected
-  - on a machine without an actual `/data` mount, `railway run -- cat
-  /data/_holding/FIX.md` fails locally, not because `FIX.md` doesn't exist
-  remotely. Genuine remote file access needs `railway ssh` (which itself
-  only works while the service's container is actually running - a cron
-  job sits at `status: created` between scheduled runs, so `railway ssh`
-  fails there too, with a clear "container is not running" message rather
-  than a misleading empty result). This session could not complete the
-  addendum's requested live-queue audit (item 1's "audit the current live
-  `approval_queue.jsonl`...") for exactly this reason. Worth fixing the
-  `CLAUDE.md` instructions to either note this limitation or describe the
-  `railway ssh`-during-an-active-run workaround explicitly.
+- **No CLI path currently gives real volume access between cron ticks -
+  confirmed empirically, three ways tried, all three fail** (session of
+  2026-08-13). `railway run -- cat /data/_holding/FIX.md` runs *locally*
+  with the linked environment's variables injected, not remotely - on a
+  machine without an actual `/data` mount it fails locally, not because
+  `FIX.md` doesn't exist on the volume. `railway ssh` fails with an
+  explicit `"Your service's container is not running (status: created)"` -
+  this is a cron job, which by design has no running container between
+  scheduled executions (confirmed against Railway's own cron-jobs docs:
+  "expected to execute a task, and terminate as soon as that task is
+  finished, leaving no open resources"). `railway service files list
+  /list` / `download` was tried specifically because it looked like it
+  might read the volume's persistent storage directly rather than the
+  running container - it does not: it fails with `Failed to initialize
+  SFTP session / Timeout`, the same underlying "needs a live container"
+  mechanism as `ssh`, just a less legible error message. **`CLAUDE.md` has
+  been corrected** to state this plainly rather than the previous (wrong)
+  claim that `railway run -- cat` "liefert den exakten Pfad." Real access
+  is currently only possible (a) during an actual scheduled cron execution
+  window (`ssh`/`service files` while the container is briefly up), or (b)
+  by deliberately triggering an extra, out-of-cycle run (real API-token
+  cost, needs sign-off first, same as any other spend-adjacent action). A
+  permanent fix - converting this service from a Railway cron job to an
+  always-on worker with an internal sleep-loop schedule - was evaluated and
+  explicitly NOT implemented: it trades "billed only for actual cron
+  execution time" for "billed continuously for an idle container," a real,
+  ongoing cost/architecture change on the same footing as the Sonnet/Haiku
+  profile decision (section 0) - it needs Jan's explicit go-ahead, not a
+  silent conversion.
 - **`testing` agent profile is live in production** (section 0) - every
   cycle currently runs on Haiku with a quarter of the intended token
   budget. Nothing mechanically reminds anyone to switch back to `normal`.
