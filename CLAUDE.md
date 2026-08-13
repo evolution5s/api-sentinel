@@ -59,31 +59,36 @@ global installierte Python-Version.
   Cron-Ausführungsfensters möglich (`railway ssh`/`railway service files`
   während der Container kurz aktiv ist).
 
-  **Geprüfter manueller Trigger - inzwischen per `deny`-Regel gesperrt,
-  nicht nur zustimmungspflichtig (2026-08-13).** `railway restart` (ohne
-  Rebuild) oder `railway redeploy` (bzw. im Dashboard "Restart"/"Redeploy",
-  oder Cmd+K "Deploy Latest Commit") starten den Service sofort außerhalb
-  des Cron-Plans - laut Railway-Doku gibt es dafür keinen separaten
-  "Container nur kurz für SSH hochfahren"-Mechanismus, es ist derselbe Weg
-  wie ein normales Redeploy. Das führt also den echten Start-Befehl
-  (`python crew.py`) aus: ein vollständiger, echter, außerplanmäßiger
-  Agenten-Zyklus mit echten Anthropic-API-Kosten und echten Seiteneffekten
-  (mögliche Telegram-Nachrichten, Approval-Einträge, Zustandsänderungen) -
-  nicht ein harmloses "kurz reinschauen". Ursprünglich hier als "nur nach
-  Rückfrage nutzbar" dokumentiert - dann fiel auf, dass `Bash(railway
-  service restart:*)`/`Bash(railway service redeploy:*)` zwar in
-  `.claude/settings.json`s `deny`-Liste standen, die funktional identischen
-  Top-Level-Aliasse `railway restart`/`railway redeploy` aber nicht (eine
-  echte Lücke, in `PERMISSION_REQUESTS_reviewed_2026-08-13.md`
-  dokumentiert). Jan hat die Lücke sofort geschlossen, nicht erst bei der
-  nächsten Durchsicht: beide Schreibweisen stehen jetzt in `deny`. Damit
-  ist dieser Weg für Claude Code **aktuell gar nicht ausführbar**, auch
-  nicht nach Rückfrage - eine `deny`-Regel kann nicht per Prompt umgangen
-  werden. Für den seltenen Fall, dass echter Live-Zugriff nötig wird,
-  müsste Jan die `deny`-Regel selbst befristet lockern oder den Befehl
-  selbst ausführen; das kurze Zeitfenster ab Container-Start würde dann
-  für `railway ssh`/`railway service files` genutzt, bevor der Zyklus
-  durchläuft und der Container wieder terminiert.
+  **Geprüfter manueller Trigger - bewusst weder `allow` noch `deny`,
+  jedes Mal einzelne Rückfrage (Stand 2026-08-13).** `railway restart`
+  (ohne Rebuild) oder `railway redeploy` (bzw. im Dashboard "Restart"/
+  "Redeploy", oder Cmd+K "Deploy Latest Commit") starten den Service sofort
+  außerhalb des Cron-Plans - laut Railway-Doku gibt es dafür keinen
+  separaten "Container nur kurz für SSH hochfahren"-Mechanismus, es ist
+  derselbe Weg wie ein normales Redeploy. Das führt also den echten
+  Start-Befehl (`python crew.py`) aus: ein vollständiger, echter,
+  außerplanmäßiger Agenten-Zyklus mit echten Anthropic-API-Kosten und
+  echten Seiteneffekten (mögliche Telegram-Nachrichten, Approval-Einträge,
+  Zustandsänderungen) - nicht ein harmloses "kurz reinschauen". Kurze
+  Historie, damit die Entscheidung nachvollziehbar bleibt: ursprünglich als
+  "nur nach Rückfrage nutzbar" dokumentiert - dann fiel auf, dass
+  `.claude/settings.json`s `deny`-Einträge für `railway service restart`/
+  `railway service redeploy` die funktional identischen Top-Level-Aliasse
+  `railway restart`/`railway redeploy` gar nicht abdeckten (eine echte
+  Lücke). Als Sofortmaßnahme wurden beide Schreibweisen komplett in `deny`
+  aufgenommen - das ging über das Ziel hinaus: eine `deny`-Regel lässt sich
+  nicht per Rückfrage umgehen, der Trigger war damit für Claude Code gar
+  nicht mehr nutzbar, auch nicht mit Zustimmung. **Korrigiert:** alle vier
+  Schreibweisen (`railway restart`, `railway redeploy`, `railway service
+  restart`, `railway service redeploy`) wieder aus `deny` entfernt und
+  bewusst ungelistet gelassen - dieselbe Kategorie wie `railway ssh`: weder
+  pauschal erlaubt noch pauschal verboten, sondern bei jeder Nutzung eine
+  echte, einzelne Rückfrage. Das erhält die vorgesehene Rückfrage-Pflicht,
+  ohne den Weg komplett zu sperren. Volle Historie in
+  `PERMISSION_REQUESTS_reviewed_2026-08-13.md`. Das kurze Zeitfenster ab
+  Container-Start (nach einer genehmigten Nutzung) wird für `railway ssh`/
+  `railway service files` genutzt, bevor der Zyklus durchläuft und der
+  Container wieder terminiert.
 
   Die frühere Formulierung, `railway run -- cat
   /data/_holding/FIX.md` liefere "den exakten Pfad", war falsch und ist

@@ -51,10 +51,6 @@
       "Bash(railway variable delete:*)",
       "Bash(railway variable set:*)",
       "Bash(railway service delete:*)",
-      "Bash(railway service restart:*)",
-      "Bash(railway service redeploy:*)",
-      "Bash(railway restart:*)",
-      "Bash(railway redeploy:*)",
       "Bash(railway volume delete:*)",
       "Bash(railway volume add:*)"
     ]

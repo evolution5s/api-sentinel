@@ -7,7 +7,7 @@ for the workflow this is part of.
 
 ---
 
-[2026-08-13] `Bash(railway restart:*)` / `Bash(railway redeploy:*)` - **resolved: added to `deny`**
+[2026-08-13] `Bash(railway restart:*)` / `Bash(railway redeploy:*)` - **resolved: left unlisted, per-use confirmation (final)**
 
 Context: investigating whether Railway offers a manual "run this cron job
 now" trigger, as a workaround for volume access between scheduled ticks.
@@ -24,8 +24,20 @@ same destructive/cost-triggering action, different literal string. This
 session's `settings.local.json` showed the top-level form had in fact
 been separately approved once already, confirming the gap was real, not
 theoretical.
-**Resolution (2026-08-13, Jan):** close the gap immediately, don't wait
-for a batch review - `Bash(railway restart:*)` and `Bash(railway
-redeploy:*)` added to `.claude/settings.json`'s `deny` list alongside
-their `railway service` equivalents. Both spellings of the same action are
-now denied consistently.
+
+**Resolution, step 1 (2026-08-13, Jan):** close the gap immediately,
+don't wait for a batch review - `Bash(railway restart:*)` and
+`Bash(railway redeploy:*)` added to `.claude/settings.json`'s `deny` list
+alongside their `railway service` equivalents. Both spellings of the same
+action denied consistently.
+
+**Resolution, step 2 (2026-08-13, Jan, same day):** that overshot the
+actual intent - a `deny` rule can't be bypassed by asking at all, which
+made the manual trigger completely unusable rather than just gated behind
+a real confirmation each time (the originally intended behavior). Final
+state: all four spellings (`railway restart`, `railway redeploy`,
+`railway service restart`, `railway service redeploy`) removed from
+`deny` again and left deliberately unlisted - same category as `railway
+ssh`: neither blanket-allowed nor blanket-denied, a genuine per-use
+approval prompt every time. This preserves the intended confirmation
+requirement without blocking the action outright.
