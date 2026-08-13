@@ -4793,6 +4793,21 @@ def test_file_kaizen_report_persists_selbst_umsetzbar_actions():
     assert len(suggestions) == 1
 
 
+def _monotonic_iso(n: int) -> str:
+    """Deterministic ISO timestamp for tests that need guaranteed strict
+    ordering between records written moments apart. Real wall-clock
+    timestamps are NOT a reliable ordering basis at this resolution - two
+    back-to-back datetime.now() calls can land in either order (confirmed
+    via a real, reproducible race: ~3/8 failures across repeated runs of
+    the previous wall-clock version of this test, both on this commit and
+    on a pre-session baseline commit, so genuinely timing-based, not caused
+    by any particular change). Callers pass any strictly increasing
+    integer sequence (0, 1, 2, ...); the returned timestamps are always in
+    that same order, independent of real execution speed.
+    """
+    return (datetime(2020, 1, 1, tzinfo=timezone.utc) + timedelta(microseconds=n)).isoformat()
+
+
 def test_read_kaizen_actions_and_suggestions_filter_by_since():
     reset_state()
     holding.read_subsidiaries.run()
@@ -4800,11 +4815,30 @@ def test_read_kaizen_actions_and_suggestions_filter_by_since():
         "selbst_umsetzbar": [{"action": "first", "grounding": "reddit", "status": "acted"}],
         "fuer_aufsichtsrat": [{"suggestion": "first", "grounding": "reddit"}],
     }))
-    cutoff = datetime.now(timezone.utc).isoformat()
+    # Pin the "first" report's real, wall-clock created_at onto a
+    # deterministic sequence position instead of trusting it to have
+    # landed strictly before the cutoff/second call below - see
+    # _monotonic_iso's docstring for why that trust is misplaced.
+    actions = holding._read("kaizen_actions.jsonl")
+    suggestions = holding._read("kaizen_suggestions.jsonl")
+    actions[-1]["created_at"] = _monotonic_iso(0)
+    suggestions[-1]["created_at"] = _monotonic_iso(0)
+    holding._write("kaizen_actions.jsonl", actions)
+    holding._write("kaizen_suggestions.jsonl", suggestions)
+
+    cutoff = _monotonic_iso(1)
+
     holding.file_kaizen_report.run(subsidiary_id="api-sentinel", kaizen_report=json.dumps({
         "selbst_umsetzbar": [{"action": "second", "grounding": "reddit", "status": "acted"}],
         "fuer_aufsichtsrat": [{"suggestion": "second", "grounding": "reddit"}],
     }))
+    actions = holding._read("kaizen_actions.jsonl")
+    suggestions = holding._read("kaizen_suggestions.jsonl")
+    actions[-1]["created_at"] = _monotonic_iso(2)
+    suggestions[-1]["created_at"] = _monotonic_iso(2)
+    holding._write("kaizen_actions.jsonl", actions)
+    holding._write("kaizen_suggestions.jsonl", suggestions)
+
     since_actions = holding.read_kaizen_actions("api-sentinel", since_iso=cutoff)
     assert [a["action"] for a in since_actions] == ["second"]
     since_suggestions = holding.read_kaizen_suggestions("api-sentinel", since_iso=cutoff)

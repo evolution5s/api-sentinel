@@ -2267,12 +2267,18 @@ Wichtige Eigenschaften:
   ausgeführt (lokal `1.15.9`, produktiv gepinnt `1.15.11`), da mehrere
   crewai-Verhaltensweisen (siehe Kapitel 10.6/10.7) versionsabhängig direkt
   im Quellcode verifiziert wurden statt angenommen.
-- Stand zuletzt: **389 Tests, 389/389 bestanden** (2026-08-13). Ein
-  einzelner Test (`test_read_kaizen_actions_and_suggestions_filter_by_since`)
-  ist ein bekannter, vorbestehender Timing-Flake (zwei `datetime.now()`-
-  Zeitstempel dicht beieinander, gelegentlich unter derselben Sekunden-
-  Auflösung) - reproduzierbar bereits auf älteren Commits, keine Regression
-  aus einer der jüngeren Änderungen. Drei weitere Tests
+- Stand zuletzt: **389 Tests, 389/389 bestanden, konsistent über mehrere
+  volle Läufe** (2026-08-13). `test_read_kaizen_actions_and_suggestions_
+  filter_by_since` war ein echter, reproduzierbarer Timing-Flake (zwei
+  `datetime.now()`-Zeitstempel dicht beieinander - ~3 von 8 Läufen
+  schlugen fehl, real gemessen; bestätigt bereits auf einem Commit vor
+  dieser Session vorhanden, also keine Regression aus einer der jüngeren
+  Änderungen). **Behoben:** der Test pinnt jetzt die `created_at`-Werte
+  seiner beiden Kaizen-Reports über `holding._read`/`_write` auf ein
+  deterministisches, monoton steigendes Sequenzfeld (`_monotonic_iso`)
+  statt sich auf die reale Wall-Clock-Nähe zweier Schreibvorgänge zu
+  verlassen - 10/10 Läufe in genau der zuvor fehlschlagenden Sequenz
+  bestätigt deterministisch. Drei weitere Tests
   (`test_search_web_live_real_key_returns_real_results`,
   `test_search_web_then_read_webpage_live_pipeline`,
   `test_payment_propensity_scan_live_reddit_algotrading`) sind echte
