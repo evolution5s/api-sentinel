@@ -2212,16 +2212,24 @@ außerplanmäßiger Agenten-Zyklus mit echten Anthropic-API-Kosten und
 echten Seiteneffekten (Telegram-Nachrichten, Approval-Einträge), nicht
 ein kostenloses "kurz reinschauen".
 
-**Praktischer Zugriffsweg:** entweder das kurze Zeitfenster eines
-tatsächlich laufenden planmäßigen Zyklus abpassen (`railway ssh`/`railway
-service files` während der Container aktiv ist), oder - nur nach
-expliziter Rückfrage, da echte Kosten anfallen - bewusst einen
-Extra-Zyklus per `railway restart` auslösen und das kurze Fenster direkt
-danach nutzen. Details, die konkrete Herleitung und Jans Entscheidung
-gegen einen dauerhaften Umbau zu einem Always-on-Worker (der das Problem
-strukturell lösen würde, aber durchgehende statt nur nutzungsbasierte
-Kosten bedeutet): siehe `CLAUDE.md`s `FIX.md`-Abschnitt und
-`OPERATING_MODEL.md` Kapitel 6.
+**Per `deny`-Regel gesperrt, nicht nur zustimmungspflichtig
+(korrigiert 2026-08-13).** `railway restart`/`railway redeploy` standen
+zunächst nur als "nur nach Rückfrage nutzbar" dokumentiert - dann fiel
+auf, dass `.claude/settings.json`s bestehende `deny`-Einträge für
+`railway service restart`/`railway service redeploy` diese
+funktional identischen Top-Level-Aliasse gar nicht abdeckten (eine echte
+Lücke, siehe `PERMISSION_REQUESTS_reviewed_2026-08-13.md`). Jan hat das
+sofort korrigiert: beide Schreibweisen stehen jetzt konsistent in `deny`.
+Der manuelle Trigger ist für Claude Code damit aktuell **nicht ausführbar**
+- eine `deny`-Regel lässt sich nicht per Rückfrage umgehen. Praktischer
+Zugriffsweg bleibt daher nur, das kurze Zeitfenster eines tatsächlich
+laufenden planmäßigen Zyklus abzupassen (`railway ssh`/`railway service
+files` während der Container aktiv ist), oder Jan müsste die `deny`-Regel
+selbst befristet lockern bzw. den Befehl selbst ausführen. Details, die
+konkrete Herleitung und Jans Entscheidung gegen einen dauerhaften Umbau zu
+einem Always-on-Worker (der das Problem strukturell lösen würde, aber
+durchgehende statt nur nutzungsbasierte Kosten bedeutet): siehe
+`CLAUDE.md`s `FIX.md`-Abschnitt und `OPERATING_MODEL.md` Kapitel 6.
 
 ---
 

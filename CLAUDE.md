@@ -59,20 +59,31 @@ global installierte Python-Version.
   Cron-Ausführungsfensters möglich (`railway ssh`/`railway service files`
   während der Container kurz aktiv ist).
 
-  **Geprüfter manueller Trigger, kein kostenloser Workaround:**
-  `railway restart` (ohne Rebuild) oder `railway redeploy` (bzw. im
-  Dashboard "Restart"/"Redeploy", oder Cmd+K "Deploy Latest Commit")
-  starten den Service sofort außerhalb des Cron-Plans - laut Railway-Doku
-  gibt es dafür keinen separaten "Container nur kurz für SSH hochfahren"-
-  Mechanismus, es ist derselbe Weg wie ein normales Redeploy. Das führt
-  also den echten Start-Befehl (`python crew.py`) aus: ein vollständiger,
-  echter, außerplanmäßiger Agenten-Zyklus mit echten Anthropic-API-Kosten
-  und echten Seiteneffekten (mögliche Telegram-Nachrichten, Approval-
-  Einträge, Zustandsänderungen) - nicht ein harmloses "kurz reinschauen".
-  Deshalb: **nur nach expliziter Zustimmung von Jan einsetzen**, genau wie
-  jede andere kostenpflichtige Aktion - danach das kurze Zeitfenster ab
-  Container-Start für `railway ssh`/`railway service files` nutzen, bevor
-  der Zyklus durchläuft und der Container wieder terminiert.
+  **Geprüfter manueller Trigger - inzwischen per `deny`-Regel gesperrt,
+  nicht nur zustimmungspflichtig (2026-08-13).** `railway restart` (ohne
+  Rebuild) oder `railway redeploy` (bzw. im Dashboard "Restart"/"Redeploy",
+  oder Cmd+K "Deploy Latest Commit") starten den Service sofort außerhalb
+  des Cron-Plans - laut Railway-Doku gibt es dafür keinen separaten
+  "Container nur kurz für SSH hochfahren"-Mechanismus, es ist derselbe Weg
+  wie ein normales Redeploy. Das führt also den echten Start-Befehl
+  (`python crew.py`) aus: ein vollständiger, echter, außerplanmäßiger
+  Agenten-Zyklus mit echten Anthropic-API-Kosten und echten Seiteneffekten
+  (mögliche Telegram-Nachrichten, Approval-Einträge, Zustandsänderungen) -
+  nicht ein harmloses "kurz reinschauen". Ursprünglich hier als "nur nach
+  Rückfrage nutzbar" dokumentiert - dann fiel auf, dass `Bash(railway
+  service restart:*)`/`Bash(railway service redeploy:*)` zwar in
+  `.claude/settings.json`s `deny`-Liste standen, die funktional identischen
+  Top-Level-Aliasse `railway restart`/`railway redeploy` aber nicht (eine
+  echte Lücke, in `PERMISSION_REQUESTS_reviewed_2026-08-13.md`
+  dokumentiert). Jan hat die Lücke sofort geschlossen, nicht erst bei der
+  nächsten Durchsicht: beide Schreibweisen stehen jetzt in `deny`. Damit
+  ist dieser Weg für Claude Code **aktuell gar nicht ausführbar**, auch
+  nicht nach Rückfrage - eine `deny`-Regel kann nicht per Prompt umgangen
+  werden. Für den seltenen Fall, dass echter Live-Zugriff nötig wird,
+  müsste Jan die `deny`-Regel selbst befristet lockern oder den Befehl
+  selbst ausführen; das kurze Zeitfenster ab Container-Start würde dann
+  für `railway ssh`/`railway service files` genutzt, bevor der Zyklus
+  durchläuft und der Container wieder terminiert.
 
   Die frühere Formulierung, `railway run -- cat
   /data/_holding/FIX.md` liefere "den exakten Pfad", war falsch und ist

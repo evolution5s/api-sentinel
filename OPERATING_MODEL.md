@@ -495,10 +495,24 @@ validate against an actual cycle.
   free/side-effect-free way to get an SSH window. **Decision (2026-08-13,
   Jan):** do not convert to an always-on worker - the permanent
   continuous-billing cost is disproportionate to how rarely live volume
-  access is actually needed. Use the restart/redeploy trigger instead when
-  genuinely needed, but only after explicit sign-off each time, same as
-  any other spend-adjacent action (see `CLAUDE.md`'s `FIX.md` section for
-  the current wording) - not a standing autopilot permission.
+  access is actually needed.
+
+  **Update, same day:** the manual restart/redeploy trigger was initially
+  documented as "usable after explicit sign-off each time." Turned out
+  `.claude/settings.json`'s existing `deny` entries for `railway service
+  restart`/`railway service redeploy` did not cover the functionally
+  identical top-level `railway restart`/`railway redeploy` aliases - a
+  real gap, not a theoretical one (this session's `settings.local.json`
+  showed the top-level form had already been separately approved once).
+  Logged to `PERMISSION_REQUESTS.md` and immediately resolved by Jan
+  rather than deferred to a batch review (see
+  `PERMISSION_REQUESTS_reviewed_2026-08-13.md`): both spellings are now in
+  `deny`. This means the manual-trigger workaround is currently **not
+  executable by Claude Code at all** - a `deny` rule cannot be bypassed by
+  asking, unlike the spend-adjacent actions elsewhere in this system that
+  route through a genuine approval prompt. Genuine live access now
+  requires either catching an actual scheduled cron window, or Jan
+  loosening the `deny` rule himself/running the command himself.
 - **`testing` agent profile is live in production** (section 0) - every
   cycle currently runs on Haiku with a quarter of the intended token
   budget. Nothing mechanically reminds anyone to switch back to `normal`.
