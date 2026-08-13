@@ -484,15 +484,21 @@ validate against an actual cycle.
   claim that `railway run -- cat` "liefert den exakten Pfad." Real access
   is currently only possible (a) during an actual scheduled cron execution
   window (`ssh`/`service files` while the container is briefly up), or (b)
-  by deliberately triggering an extra, out-of-cycle run (real API-token
-  cost, needs sign-off first, same as any other spend-adjacent action). A
-  permanent fix - converting this service from a Railway cron job to an
-  always-on worker with an internal sleep-loop schedule - was evaluated and
-  explicitly NOT implemented: it trades "billed only for actual cron
-  execution time" for "billed continuously for an idle container," a real,
-  ongoing cost/architecture change on the same footing as the Sonnet/Haiku
-  profile decision (section 0) - it needs Jan's explicit go-ahead, not a
-  silent conversion.
+  by deliberately triggering an extra, out-of-cycle run via `railway
+  restart`/`railway redeploy` (or the dashboard's Restart/Redeploy button,
+  or Cmd+K "Deploy Latest Commit"). Checked against Railway's own docs:
+  there is no separate "start the container without running the start
+  command" trigger for a cron-configured service - restart/redeploy runs
+  the real `python crew.py` entrypoint, i.e. a genuine, complete,
+  out-of-schedule agent cycle with real Anthropic API cost and real side
+  effects (Telegram messages, possible approval-queue writes), not a
+  free/side-effect-free way to get an SSH window. **Decision (2026-08-13,
+  Jan):** do not convert to an always-on worker - the permanent
+  continuous-billing cost is disproportionate to how rarely live volume
+  access is actually needed. Use the restart/redeploy trigger instead when
+  genuinely needed, but only after explicit sign-off each time, same as
+  any other spend-adjacent action (see `CLAUDE.md`'s `FIX.md` section for
+  the current wording) - not a standing autopilot permission.
 - **`testing` agent profile is live in production** (section 0) - every
   cycle currently runs on Haiku with a quarter of the intended token
   budget. Nothing mechanically reminds anyone to switch back to `normal`.

@@ -57,18 +57,35 @@ global installierte Python-Version.
   `ssh`, kein direkter Volume-Zugriff) funktionieren zwischen den Cron-
   Ticks. Echter Zugriff ist aktuell nur während eines tatsächlich laufenden
   Cron-Ausführungsfensters möglich (`railway ssh`/`railway service files`
-  während der Container kurz aktiv ist), oder durch einen bewussten,
-  manuell ausgelösten Extra-Zyklus (kostet echte API-Tokens - vorher
-  fragen, fällt unter dieselbe Rückfrage-Pflicht wie andere kostenpflichtige
-  Aktionen). Die frühere Formulierung, `railway run -- cat
+  während der Container kurz aktiv ist).
+
+  **Geprüfter manueller Trigger, kein kostenloser Workaround:**
+  `railway restart` (ohne Rebuild) oder `railway redeploy` (bzw. im
+  Dashboard "Restart"/"Redeploy", oder Cmd+K "Deploy Latest Commit")
+  starten den Service sofort außerhalb des Cron-Plans - laut Railway-Doku
+  gibt es dafür keinen separaten "Container nur kurz für SSH hochfahren"-
+  Mechanismus, es ist derselbe Weg wie ein normales Redeploy. Das führt
+  also den echten Start-Befehl (`python crew.py`) aus: ein vollständiger,
+  echter, außerplanmäßiger Agenten-Zyklus mit echten Anthropic-API-Kosten
+  und echten Seiteneffekten (mögliche Telegram-Nachrichten, Approval-
+  Einträge, Zustandsänderungen) - nicht ein harmloses "kurz reinschauen".
+  Deshalb: **nur nach expliziter Zustimmung von Jan einsetzen**, genau wie
+  jede andere kostenpflichtige Aktion - danach das kurze Zeitfenster ab
+  Container-Start für `railway ssh`/`railway service files` nutzen, bevor
+  der Zyklus durchläuft und der Container wieder terminiert.
+
+  Die frühere Formulierung, `railway run -- cat
   /data/_holding/FIX.md` liefere "den exakten Pfad", war falsch und ist
   hiermit korrigiert - siehe `OPERATING_MODEL.md` Abschnitt 6 für die volle
   Herleitung. Eine dauerhafte Lösung (Umbau von Cron-Job zu einem
-  durchlaufenden Worker-Service mit interner Sleep-Loop-Schedule) ist
-  möglich, aber ein echter Architektur-/Kosten-Wechsel (bezahlt dauerhaft
-  statt nur pro Cron-Ausführung) - das braucht Jans explizite Zustimmung,
-  genau wie die Sonnet/Haiku-Profilentscheidung, nicht stillschweigend
-  umsetzen.
+  durchlaufenden Worker-Service mit interner Sleep-Loop-Schedule) wurde
+  geprüft und bewusst NICHT umgesetzt (2026-08-13, Jans Entscheidung) - der
+  Kostensprung von "nur pro Ausführung abgerechnet" zu "durchgehend
+  abgerechnet" steht in keinem Verhältnis zum seltenen Bedarf an Live-
+  Volume-Zugriff; der obige manuelle Trigger (mit Rückfrage) deckt den
+  Bedarf bei Bedarf ab. Nicht erneut vorschlagen, außer der Bedarf ändert
+  sich grundlegend (z.B. deutlich häufigerer Live-Debugging-Bedarf).
+
   Jeden gefundenen Abschnitt als eigene Addendum-artige Aufgabe bearbeiten,
   mit derselben Sorgfalt wie ein direkt von Jan eingefügtes Addendum. Nach
   Umsetzung im Commit/Summary explizit nennen, welche `FIX.md`-Einträge
