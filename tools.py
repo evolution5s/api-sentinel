@@ -805,6 +805,65 @@ def _normalize_publish_text(text: str) -> str:
     return re.sub(r"\s+", " ", text.strip().lower())
 
 
+def _extract_community_token(url: str) -> str:
+    """Best-effort community/subreddit name pulled from a target_url, e.g.
+    'algotrading' from 'https://reddit.com/r/algotrading/...', or the last
+    non-empty path segment for a non-Reddit URL. Empty string if nothing
+    recognizable - callers treat that as "unknown", never as a false match.
+    """
+    match = re.search(r"/r/([A-Za-z0-9_]+)", url or "", re.IGNORECASE)
+    if match:
+        return match.group(1).lower()
+    match = re.search(r"([A-Za-z0-9_]+)/?$", (url or "").strip().rstrip("/"))
+    return match.group(1).lower() if match else ""
+
+
+def _same_community(token: str, target_community: str) -> bool:
+    token = (token or "").strip().lower()
+    other = (target_community or "").strip().lower().removeprefix("r/")
+    return bool(token) and bool(other) and token == other
+
+
+def _find_similar_posted_content(template: dict) -> list:
+    """Item 1b (duplicate-approval/publish-history addendum): compare
+    template['text'] against every content_drafts.jsonl entry actually
+    CONFIRMED POSTED (status='posted' - a human's real "posted: <id> <url>"
+    Telegram reply, not just an approved-but-maybe-never-posted approval)
+    across this subsidiary's entire history, not a recent window. Returns
+    every near-duplicate match (similarity >= PUBLISH_DEDUP_SIMILARITY_
+    THRESHOLD), most-similar first, each tagged same_community (best-effort
+    platform+community match - a miss just means the flag can't confirm
+    it's the same forum, never a false claim that it's a different one).
+    """
+    target_text = _normalize_publish_text(str(template.get("text") or ""))
+    if not target_text:
+        return []
+    target_platform = template.get("platform")
+    target_token = _extract_community_token(str(template.get("target_url") or ""))
+    matches = []
+    for draft in _read_jsonl("content_drafts.jsonl"):
+        if draft.get("status") != "posted":
+            continue
+        existing_text = _normalize_publish_text(str(draft.get("text") or ""))
+        similarity = difflib.SequenceMatcher(None, target_text, existing_text).ratio()
+        if similarity < PUBLISH_DEDUP_SIMILARITY_THRESHOLD:
+            continue
+        matches.append({
+            "draft_id": draft.get("id"),
+            "platform": draft.get("platform"),
+            "target_community": draft.get("target_community"),
+            "posted_at": draft.get("posted_at"),
+            "post_url": draft.get("post_url"),
+            "similarity": round(similarity, 2),
+            "same_community": (
+                draft.get("platform") == target_platform
+                and _same_community(target_token, draft.get("target_community"))
+            ),
+        })
+    matches.sort(key=lambda m: m["similarity"], reverse=True)
+    return matches
+
+
 def _find_duplicate_publish_approval(template: dict, approvals: list) -> dict | None:
     """Return the existing approval_queue.jsonl record this template
     duplicates (same hypothesis_id+platform, near-identical text, still
@@ -883,13 +942,27 @@ def request_approval(category: str, proposal: str, reasoning: str) -> str:
     (notify_new_pending_approvals) using these exact structured fields,
     never reflowed into prose.
 
-    category='publish' is deduplicated automatically: if an existing
-    approval_queue.jsonl entry already covers the same hypothesis_id and
-    platform with substantially similar text (still pending, or decided
-    within the last 24h), this call returns {"skipped": ..., "duplicate_of":
-    <id>} instead of filing a new entry. Log that as a Kaizen
-    selbst_umsetzbar finding ("duplicate draft avoided") rather than
-    retrying with reworded text.
+    category='publish' is deduplicated automatically, two layers (item 1,
+    duplicate-approval/publish-history addendum):
+    a) Within the pending queue: if an existing approval_queue.jsonl entry
+       already covers the same hypothesis_id and platform with
+       substantially similar text (still pending, or decided within the
+       last 24h), this call returns {"skipped": ..., "duplicate_of": <id>}
+       instead of filing a new entry.
+    b) Against everything ever actually POSTED (content_drafts.jsonl
+       status='posted', this subsidiary's entire history, not a recent
+       window - approval alone never means it went live): substantially
+       similar text already posted to the SAME forum/community is skipped
+       the same way ({"skipped": ..., "duplicate_of_draft": <id>}). Similar
+       text posted to a DIFFERENT forum/community is NOT blocked - posting
+       the same content across multiple communities is a known anti-spam
+       signal and worth a human's judgment, not a mechanical block - but
+       every such match is attached to the filed record's
+       similar_prior_posts field and rendered in the Telegram notification
+       so a reviewer sees the cross-forum pattern before approving, not
+       after several near-identical posts have already gone out.
+    Log either as a Kaizen selbst_umsetzbar finding ("duplicate draft
+    avoided") rather than retrying with reworded text.
     """
     if category not in APPROVAL_CATEGORIES:
         return json.dumps({
@@ -921,6 +994,16 @@ def request_approval(category: str, proposal: str, reasoning: str) -> str:
                 "duplicate_of": duplicate.get("id"),
                 "duplicate_status": duplicate.get("status"),
             })
+        similar_posted = _find_similar_posted_content(template)
+        same_community_post = next((m for m in similar_posted if m["same_community"]), None)
+        if same_community_post is not None:
+            return json.dumps({
+                "skipped": True,
+                "reason": "substantially similar content was already posted to this same forum/community",
+                "duplicate_of_draft": same_community_post["draft_id"],
+                "posted_at": same_community_post["posted_at"],
+                "post_url": same_community_post["post_url"],
+            })
 
     record = {
         "id": f"appr_{uuid.uuid4().hex[:8]}",
@@ -930,6 +1013,11 @@ def request_approval(category: str, proposal: str, reasoning: str) -> str:
         "reasoning": reasoning,
         "status": "pending",
     }
+    if category == "publish" and similar_posted:
+        # Cross-forum near-duplicates only (same-community ones were
+        # already skipped above) - surfaced to the human reviewer instead
+        # of silently allowed, per item 1's cross-forum-pattern concern.
+        record["similar_prior_posts"] = similar_posted
     _append_global_jsonl("approval_queue.jsonl", record)
     return json.dumps({"queued": record["id"]})
 
@@ -3515,6 +3603,17 @@ def notify_new_pending_approvals() -> None:
             if record.get("category") == "publish"
             else f"Antrag: {record.get('proposal')}"
         )
+        similar_prior_posts = record.get("similar_prior_posts") or []
+        if similar_prior_posts:
+            similar_lines = "\n".join(
+                f"  - {m.get('platform')}/{m.get('target_community')} am {m.get('posted_at')} "
+                f"(Aehnlichkeit {m.get('similarity')}, {m.get('post_url') or 'keine URL hinterlegt'})"
+                for m in similar_prior_posts
+            )
+            proposal_text += (
+                "\n\nWARNUNG - aehnlicher Inhalt wurde bereits in ANDEREN Foren gepostet "
+                f"(Cross-Forum-Muster, Item 1 Addendum - vor Freigabe pruefen):\n{similar_lines}"
+            )
         send_telegram_message(
             f"Neue Freigabe angefragt: {record['id']}\n"
             f"Kategorie: {record.get('category')}\n"

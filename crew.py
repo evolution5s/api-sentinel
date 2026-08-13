@@ -725,17 +725,47 @@ _limit_hits: list[str] = []
 _task_usage_log: list[dict] = []
 _last_cumulative_tokens = 0
 
+# Item 8 (duplicate-approval/backlog-enforcement addendum): task_dev's own
+# "empty task-order list -> ONE line, not a paragraph" rule is prompt-text
+# only, and has already been observed skipped once (a full paragraph for a
+# genuinely empty list). Fixing that mechanically needs to know whether the
+# list was actually empty BEFORE task_dev ran - task_main_ceo_review is the
+# task immediately preceding task_dev in this Process.sequential crew, so
+# its own watchdog callback (fired synchronously right after that task
+# completes, right before task_dev begins) is the correct, cheap place to
+# snapshot it. None means "not captured this run" (e.g. task_main_ceo_review
+# itself was skipped by its budget gate) - _enforce_dev_one_liner treats
+# that as "don't override", same as any other uncertain case.
+_pre_dev_task_open_order_ids: set | None = None
+
 
 def _make_iteration_watchdog(agent: Agent, label: str):
     def _watchdog(_output):
-        global _last_cumulative_tokens
+        global _last_cumulative_tokens, _pre_dev_task_open_order_ids
         executor = agent.agent_executor
         if executor is not None and executor.iterations >= agent.max_iter:
             _limit_hits.append(f"{label}: max_iter-Kappe ({agent.max_iter}) erreicht, finale Antwort erzwungen")
         total_now = crew.calculate_usage_metrics().total_tokens
         _task_usage_log.append({"task": label, "tokens": total_now - _last_cumulative_tokens})
         _last_cumulative_tokens = total_now
+        if agent is main_ceo_agent:
+            _pre_dev_task_open_order_ids = {
+                o["id"] for o in json.loads(read_task_orders.run(to_role="dev", status="open"))
+            }
     return _watchdog
+
+
+def _enforce_dev_one_liner(raw_text: str) -> str:
+    """Item 8: mechanical backstop for Dev's report, not just the prompt
+    instruction. If read_task_orders(to_role='dev', status='open') was
+    genuinely empty right before task_dev ran (captured by the watchdog
+    above), there is nothing real for a longer report to describe - force
+    the canonical one-liner regardless of what the model actually wrote,
+    rather than trusting the instruction to have been followed.
+    """
+    if _pre_dev_task_open_order_ids is not None and len(_pre_dev_task_open_order_ids) == 0:
+        return "No open task orders this cycle."
+    return raw_text
 
 
 # --------------------------------------------------------------------------
@@ -1703,6 +1733,18 @@ task_main_ceo_review = ConditionalTask(
         "cycle just to have done it - most cycles should set no additional "
         "direction beyond an already-established baseline, and that's a "
         "completely valid outcome too.\n"
+        "6.5) Call read_stage_skip_requests(status='pending') - the Sub-CEO's "
+        "requests to skip straight to landing_page/build/community_"
+        "engagement without the normal artifact-backed history (structural-"
+        "rebuild addendum, section 4; this role's own backstory already "
+        "describes this responsibility, this step is what actually runs it "
+        "every cycle rather than leaving it implicit). For each: push back "
+        "by default - only decide='approved' via decide_stage_skip_request "
+        "when the reasoning genuinely shows skipping applies to this "
+        "specific hypothesis (e.g. research truly isn't relevant to this "
+        "specific question), 'rejected' otherwise, sending it back to earn "
+        "the stage properly. An empty list is a normal, valid outcome - "
+        "don't invent a request to decide.\n"
         "7) Never call register_subsidiary without an already-approved "
         "request_approval backing it - the tool enforces this, but don't "
         "attempt it prematurely either.\n"
@@ -1721,7 +1763,8 @@ task_main_ceo_review = ConditionalTask(
         "(monetization stated as a required filter, not the goal) if this "
         "was the first time for that subsidiary, or an additional one on "
         "top and why, or explicitly none beyond the baseline and why not. "
-        "Any request_approval filed for board sign-off. One consolidated "
+        "Any pending stage-skip requests decided, with reasoning. Any "
+        "request_approval filed for board sign-off. One consolidated "
         "file_kaizen_report per active subsidiary, both buckets shown, with "
         "what was actually acted on this cycle under selbst_umsetzbar "
         "versus deferred and why."
@@ -2281,7 +2324,7 @@ def send_cycle_summary(
             _task_summary(task_main_ceo_review),
             "",
             "--- Dev ---",
-            _task_summary(task_dev),
+            _enforce_dev_one_liner(_task_summary(task_dev)),
         ]
         lines_b += _aufsichtsrat_lines(
             len(current_approval_ids), duration_policy, pending_stage_skips, stagnation_escalations,
@@ -2342,6 +2385,7 @@ if __name__ == "__main__":
             _limit_hits.clear()
             _task_usage_log.clear()
             _malformed_tool_calls.clear()
+            _pre_dev_task_open_order_ids = None
             # Anti-stagnation addendum, Part 2 section 2.4: snapshot BEFORE
             # kickoff() so send_cycle_summary can tell whether this cycle had
             # unused active-testing capacity at the start AND produced no

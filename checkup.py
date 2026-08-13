@@ -549,6 +549,100 @@ def test_format_publish_proposal_renders_structured_fields():
     assert "Erfolgskriterium: >=5 substantive replies within 7 days = confirmed signal" in rendered
 
 
+# --- tools.py: publish-approval dedup, both layers (item 1, duplicate- -----
+# approval/publish-history addendum) - a) within the pending queue itself,
+# b) against everything ever actually posted (content_drafts.jsonl).
+
+def _mark_posted(draft_id, post_url="https://reddit.com/r/algotrading/comments/already_live"):
+    drafts = tools._read_jsonl("content_drafts.jsonl")
+    idx = next(i for i, d in enumerate(drafts) if d["id"] == draft_id)
+    drafts[idx]["status"] = "posted"
+    drafts[idx]["post_url"] = post_url
+    tools._write_jsonl("content_drafts.jsonl", drafts)
+
+
+def test_request_approval_publish_dedup_skips_near_identical_pending():
+    reset_state()
+    first = json.loads(tools.request_approval.run(category="publish", proposal=json.dumps(_PUBLISH_TEMPLATE), reasoning="r"))
+    assert "queued" in first, first
+    reworded = {**_PUBLISH_TEMPLATE, "text": "Ran into that exact same API timeout issue just last week."}
+    second = json.loads(tools.request_approval.run(category="publish", proposal=json.dumps(reworded), reasoning="r2"))
+    assert second.get("skipped") is True, second
+    assert second["duplicate_of"] == first["queued"]
+    assert len(tools._read_global_jsonl("approval_queue.jsonl")) == 1
+
+
+def test_request_approval_publish_dedup_allows_different_platform():
+    reset_state()
+    tools.request_approval.run(category="publish", proposal=json.dumps(_PUBLISH_TEMPLATE), reasoning="r")
+    other_platform = {**_PUBLISH_TEMPLATE, "platform": "discord", "target_url": "https://discord.com/channels/x/y"}
+    result = json.loads(tools.request_approval.run(category="publish", proposal=json.dumps(other_platform), reasoning="r2"))
+    assert "queued" in result, result
+    assert len(tools._read_global_jsonl("approval_queue.jsonl")) == 2
+
+
+def test_request_approval_publish_dedup_ignores_old_decided_entry():
+    reset_state()
+    first = json.loads(tools.request_approval.run(category="publish", proposal=json.dumps(_PUBLISH_TEMPLATE), reasoning="r"))
+    queue = tools._read_global_jsonl("approval_queue.jsonl")
+    queue[0]["status"] = "rejected"
+    queue[0]["decided_at"] = (datetime.now(timezone.utc) - timedelta(hours=48)).isoformat()
+    tools._write_global_jsonl("approval_queue.jsonl", queue)
+    result = json.loads(tools.request_approval.run(category="publish", proposal=json.dumps(_PUBLISH_TEMPLATE), reasoning="r2"))
+    assert "queued" in result, result
+    assert result["queued"] != first["queued"]
+
+
+def test_request_approval_publish_blocks_when_already_posted_to_same_community():
+    reset_state()
+    tools.write_hypothesis.run(hypothesis=json.dumps(SAMPLE_HYP))
+    drafted = json.loads(tools.draft_content.run(**_draft_kwargs(
+        target_community="r/algotrading", text="Ran into the same API timeout issue last week.",
+    )))
+    _mark_posted(drafted["id"])
+    result = json.loads(tools.request_approval.run(category="publish", proposal=json.dumps(_PUBLISH_TEMPLATE), reasoning="r"))
+    assert result.get("skipped") is True, result
+    assert result["duplicate_of_draft"] == drafted["id"]
+    assert tools._read_global_jsonl("approval_queue.jsonl") == []
+
+
+def test_request_approval_publish_flags_but_allows_cross_forum_similar_post():
+    reset_state()
+    tools.write_hypothesis.run(hypothesis=json.dumps(SAMPLE_HYP))
+    drafted = json.loads(tools.draft_content.run(**_draft_kwargs(
+        target_community="r/quantfinance", text="Ran into the same API timeout issue last week.",
+    )))
+    _mark_posted(drafted["id"], post_url="https://reddit.com/r/quantfinance/comments/already_live")
+    result = json.loads(tools.request_approval.run(category="publish", proposal=json.dumps(_PUBLISH_TEMPLATE), reasoning="r"))
+    assert "queued" in result, result
+    stored = tools._read_global_jsonl("approval_queue.jsonl")[0]
+    assert stored["similar_prior_posts"][0]["draft_id"] == drafted["id"]
+    assert stored["similar_prior_posts"][0]["same_community"] is False
+
+
+def test_notify_new_pending_approvals_surfaces_cross_forum_warning():
+    reset_state()
+    had_token = os.environ.pop("TELEGRAM_BOT_TOKEN", None)
+    captured = []
+    original_send = tools.send_telegram_message
+    try:
+        tools.write_hypothesis.run(hypothesis=json.dumps(SAMPLE_HYP))
+        drafted = json.loads(tools.draft_content.run(**_draft_kwargs(
+            target_community="r/quantfinance", text="Ran into the same API timeout issue last week.",
+        )))
+        _mark_posted(drafted["id"], post_url="https://reddit.com/r/quantfinance/comments/already_live")
+        tools.request_approval.run(category="publish", proposal=json.dumps(_PUBLISH_TEMPLATE), reasoning="r")
+        tools.send_telegram_message = lambda text, parse_mode=None, label=None: captured.append(text)
+        tools.notify_new_pending_approvals()
+        assert len(captured) == 1
+        assert "Cross-Forum-Muster" in captured[0]
+        assert "r/quantfinance" in captured[0]
+    finally:
+        tools.send_telegram_message = original_send
+        if had_token is not None:
+            os.environ["TELEGRAM_BOT_TOKEN"] = had_token
+
+
 def test_format_publish_proposal_falls_back_on_non_json():
     assert tools._format_publish_proposal("not json at all") == "not json at all"
 
@@ -2317,6 +2411,93 @@ def test_send_telegram_message_degrades_gracefully_on_bad_token():
     try:
         tools.send_telegram_message("test")  # real network call, bad token -> must not raise
     finally:
+        os.environ.pop("TELEGRAM_BOT_TOKEN", None)
+        os.environ.pop("TELEGRAM_CHAT_ID", None)
+
+
+# --- tools.py: Telegram message splitting at real boundaries (item 5, -----
+# duplicate-approval/backlog-enforcement addendum) - the confirmed fix for
+# reports getting cut off mid-word/mid-sentence: split at a real boundary
+# instead of a hard text[i:i+N] range slice.
+
+def test_split_message_at_boundaries_returns_single_chunk_when_short():
+    assert tools._split_message_at_boundaries("short text") == ["short text"]
+
+
+def test_split_message_at_boundaries_splits_at_section_separator():
+    section_a, section_b = "A" * 3000, "B" * 3000
+    chunks = tools._split_message_at_boundaries(f"{section_a}\n---\n{section_b}", max_length=4000)
+    assert len(chunks) == 2
+    # split lands right at the "\n---\n" divider, not mid-word - the divider
+    # itself may trail onto chunk 1 (cosmetic, not content loss); chunk 2 is
+    # clean since lstrip only needs to drop a leading newline, not "---".
+    assert chunks[0].startswith(section_a) and section_b not in chunks[0]
+    assert chunks[1] == section_b
+    assert all(len(c) <= 4000 for c in chunks)
+
+
+def test_split_message_at_boundaries_splits_at_paragraph_when_no_section_separator():
+    para_a, para_b = "A" * 3000, "B" * 3000
+    chunks = tools._split_message_at_boundaries(f"{para_a}\n\n{para_b}", max_length=4000)
+    assert chunks == [para_a, para_b]
+
+
+def test_split_message_at_boundaries_splits_at_word_when_no_larger_boundary():
+    text = " ".join(f"word{i}" for i in range(2000))
+    chunks = tools._split_message_at_boundaries(text, max_length=100)
+    assert len(chunks) > 1
+    assert all(len(c) <= 100 for c in chunks)
+    assert all(not c.startswith(" ") and not c.endswith(" ") for c in chunks)
+    assert " ".join(chunks).split() == text.split(), "no word lost or reordered across the split"
+
+
+def test_split_message_at_boundaries_hard_slice_when_no_boundary_exists():
+    text = "x" * 500
+    chunks = tools._split_message_at_boundaries(text, max_length=100)
+    assert len(chunks) == 5
+    assert all(len(c) == 100 for c in chunks)
+    assert "".join(chunks) == text, "no character lost even in the no-boundary fallback"
+
+
+def test_send_telegram_message_splits_long_text_into_labeled_chunks_under_real_limit():
+    os.environ["TELEGRAM_BOT_TOKEN"] = "fake-token-for-checkup"
+    os.environ["TELEGRAM_CHAT_ID"] = "12345"
+    captured = []
+    original_post = tools.requests.post
+    try:
+        def fake_post(url, json=None, timeout=None):
+            captured.append(json["text"])
+            return type("R", (), {"raise_for_status": lambda self: None})()
+        tools.requests.post = fake_post
+        long_text = "\n\n".join(f"paragraph {i} " + ("word " * 200) for i in range(10))
+        tools.send_telegram_message(long_text, label="Business Update")
+        assert len(captured) > 1, "fixture text must actually exceed one chunk to test splitting at all"
+        for i, sent in enumerate(captured, 1):
+            assert sent.startswith(f"Business Update ({i}/{len(captured)})\n\n")
+            assert len(sent) <= tools.TELEGRAM_MAX_MESSAGE_LENGTH
+        combined = "\n".join(captured)
+        for i in range(10):
+            assert f"paragraph {i} " in combined, f"paragraph {i} lost across the split"
+    finally:
+        tools.requests.post = original_post
+        os.environ.pop("TELEGRAM_BOT_TOKEN", None)
+        os.environ.pop("TELEGRAM_CHAT_ID", None)
+
+
+def test_send_telegram_message_no_label_when_single_chunk():
+    os.environ["TELEGRAM_BOT_TOKEN"] = "fake-token-for-checkup"
+    os.environ["TELEGRAM_CHAT_ID"] = "12345"
+    captured = []
+    original_post = tools.requests.post
+    try:
+        def fake_post(url, json=None, timeout=None):
+            captured.append(json["text"])
+            return type("R", (), {"raise_for_status": lambda self: None})()
+        tools.requests.post = fake_post
+        tools.send_telegram_message("short report", label="Business Update")
+        assert captured == ["short report"], "a single-chunk message must not carry a pointless (1/1) label"
+    finally:
+        tools.requests.post = original_post
         os.environ.pop("TELEGRAM_BOT_TOKEN", None)
         os.environ.pop("TELEGRAM_CHAT_ID", None)
 
@@ -4784,6 +4965,59 @@ def test_approvals_business_lines_splits_new_vs_known():
     assert f"Neu seit letztem Report (1): {appr_2}" in joined2
     assert f"Bereits bekannt, weiter offen (1): {appr_1}" in joined2
     assert set(current_ids2) == {appr_1, appr_2}
+
+
+def test_enforce_dev_one_liner_overrides_when_pre_snapshot_empty():
+    original = crew._pre_dev_task_open_order_ids
+    try:
+        crew._pre_dev_task_open_order_ids = set()
+        result = crew._enforce_dev_one_liner(
+            "Es gab zwar keine offenen Task-Orders, aber lass mich trotzdem drei Absaetze "
+            "darueber schreiben, was das bedeuten koennte und welche Optionen es gaebe..."
+        )
+        assert result == "No open task orders this cycle."
+    finally:
+        crew._pre_dev_task_open_order_ids = original
+
+
+def test_enforce_dev_one_liner_leaves_text_alone_when_orders_existed():
+    original = crew._pre_dev_task_open_order_ids
+    try:
+        crew._pre_dev_task_open_order_ids = {"order_1"}
+        raw = "PR https://github.com/example/pr/1 opened for order_1."
+        assert crew._enforce_dev_one_liner(raw) == raw
+    finally:
+        crew._pre_dev_task_open_order_ids = original
+
+
+def test_enforce_dev_one_liner_leaves_text_alone_when_snapshot_not_captured():
+    original = crew._pre_dev_task_open_order_ids
+    try:
+        crew._pre_dev_task_open_order_ids = None
+        raw = "some raw output from a run where task_main_ceo_review's own watchdog never fired"
+        assert crew._enforce_dev_one_liner(raw) == raw
+    finally:
+        crew._pre_dev_task_open_order_ids = original
+
+
+def test_iteration_watchdog_snapshots_pre_dev_open_orders_after_main_ceo_task():
+    from crewai import Crew as _Crew
+    reset_state()
+    tools.file_task_order.run(to_role="dev", task_description="do x", context="c", hypothesis_id="")
+    original = crew._pre_dev_task_open_order_ids
+    original_calc = _Crew.calculate_usage_metrics
+    original_cumulative = crew._last_cumulative_tokens
+    try:
+        crew._pre_dev_task_open_order_ids = None
+        crew._last_cumulative_tokens = 0
+        _Crew.calculate_usage_metrics = lambda self: type("U", (), {"total_tokens": 0})()
+        crew._make_iteration_watchdog(crew.main_ceo_agent, "Main-CEO")(None)
+        assert crew._pre_dev_task_open_order_ids is not None
+        assert len(crew._pre_dev_task_open_order_ids) == 1
+    finally:
+        crew._pre_dev_task_open_order_ids = original
+        _Crew.calculate_usage_metrics = original_calc
+        crew._last_cumulative_tokens = original_cumulative
 
 
 def test_send_cycle_summary_flags_anti_stagnation_in_business_report():
