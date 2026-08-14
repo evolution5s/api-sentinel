@@ -6008,6 +6008,112 @@ def test_backlog_gate_reopens_once_ten_real_candidates_exist():
     assert "error" not in reopened, reopened
 
 
+# --------------------------------------------------------------------------
+# One-time hyp_research_001 migration (Part B addendum, item 2)
+# --------------------------------------------------------------------------
+
+def _seed_active_hyp_research_001():
+    tools.write_hypothesis.run(hypothesis=json.dumps({
+        "id": "hyp_research_001", "statement": "silent API failures in trading bots", "category": "value",
+        "landing_page_variant_id": "v1", "failure_rate": 0.5, "success_rate": 0.5, "duration_days": 14,
+        "channel": "reddit", "hypothesis_type": "value", "impact_score": 7, "confidence_score": 6,
+        "evidence_stage": "research", "research_objective": "o", "research_confirming_criteria": "c",
+        "research_disconfirming_criteria": "d", "primary_variable_tested": "audience",
+    }))
+    return _real_research_finding_id("hyp_research_001")
+
+
+def _seed_hyp_research_001_approvals():
+    tools._write_global_jsonl("approval_queue.jsonl", tools._read_global_jsonl("approval_queue.jsonl") + [
+        {
+            "id": "appr_52dbb9d5", "category": "publish", "proposal": "post to r/algotrading",
+            "reasoning": "r", "status": "pending", "subsidiary_id": "api-sentinel",
+        },
+        {
+            "id": "appr_018963dc", "category": "publish", "proposal": "post to r/quantfinance",
+            "reasoning": "r", "status": "pending", "subsidiary_id": "api-sentinel",
+        },
+    ])
+
+
+def test_classify_command_migrate_hyp_research_001():
+    assert tools._classify_command("migrate_hyp_research_001: api-sentinel", "") == (
+        "migrate_hyp_research_001", "api-sentinel",
+    )
+    assert tools._classify_command("migrate_hyp_research_001:", "") is None
+
+
+def test_migrate_hyp_research_001_to_backlog_skips_when_not_found():
+    reset_state()
+    result = tools.migrate_hyp_research_001_to_backlog("api-sentinel")
+    assert "skipped" in result
+
+
+def test_migrate_hyp_research_001_to_backlog_skips_when_already_resolved():
+    reset_state()
+    _seed_active_hyp_research_001()
+    tools.write_hypothesis.run(hypothesis=json.dumps({
+        "id": "hyp_research_001", "status": "evaluated", "next_step": "already resolved earlier",
+    }))
+    result = tools.migrate_hyp_research_001_to_backlog("api-sentinel")
+    assert "skipped" in result
+
+
+def test_migrate_hyp_research_001_to_backlog_full_flow():
+    reset_state()
+    _seed_active_hyp_research_001()
+    _seed_hyp_research_001_approvals()
+
+    result = tools.migrate_hyp_research_001_to_backlog("api-sentinel")
+    assert result.get("ok") is True, result
+    assert result["backlog_candidate_id"] == "backlog_from_hyp_research_001"
+    assert sorted(result["approvals_withdrawn"]) == ["appr_018963dc", "appr_52dbb9d5"]
+
+    candidates = {c["id"]: c for c in json.loads(tools.read_backlog.run(status="candidate"))}
+    assert "backlog_from_hyp_research_001" in candidates
+    cand = candidates["backlog_from_hyp_research_001"]
+    assert cand["impact"] == 7 and cand["confidence"] == 6
+
+    hyps = {h["id"]: h for h in json.loads(tools.read_hypotheses.run())}
+    assert hyps["hyp_research_001"]["status"] == "evaluated"
+
+    approvals = {a["id"]: a for a in tools._read_global_jsonl("approval_queue.jsonl")}
+    assert approvals["appr_52dbb9d5"]["status"] == "withdrawn"
+    assert approvals["appr_018963dc"]["status"] == "withdrawn"
+
+    # Idempotent: a second call is a clean no-op, not a duplicate/error.
+    second = tools.migrate_hyp_research_001_to_backlog("api-sentinel")
+    assert "skipped" in second
+
+
+def test_migrate_hyp_research_001_to_backlog_requires_grounding():
+    reset_state()
+    tools.write_hypothesis.run(hypothesis=json.dumps({
+        "id": "hyp_research_001", "statement": "silent API failures in trading bots", "category": "value",
+        "landing_page_variant_id": "v1", "failure_rate": 0.5, "success_rate": 0.5, "duration_days": 14,
+        "channel": "reddit", "hypothesis_type": "value", "impact_score": 7, "confidence_score": 6,
+        "evidence_stage": "research", "research_objective": "o", "research_confirming_criteria": "c",
+        "research_disconfirming_criteria": "d", "primary_variable_tested": "audience",
+    }))
+    # No research_findings logged for it this time - must refuse rather than
+    # fabricate a candidate with no real grounding.
+    result = tools.migrate_hyp_research_001_to_backlog("api-sentinel")
+    assert "error" in result
+
+
+def test_apply_telegram_commands_migrate_hyp_research_001_dispatch():
+    reset_state()
+    _seed_active_hyp_research_001()
+    _seed_hyp_research_001_approvals()
+
+    log = tools._apply_telegram_commands([
+        {"text": "migrate_hyp_research_001: api-sentinel", "reply_to_text": ""},
+    ])
+    assert any("hyp_research_001 migriert" in entry for entry in log), log
+    hyps = {h["id"]: h for h in json.loads(tools.read_hypotheses.run())}
+    assert hyps["hyp_research_001"]["status"] == "evaluated"
+
+
 def main():
     tests = sorted(
         (name, fn) for name, fn in globals().items()

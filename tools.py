@@ -362,6 +362,11 @@ def _write_global_jsonl(filename: str, records: list) -> None:
     write_jsonl(STATE_DIR, filename, records)
 
 
+def _global_jsonl_lock(filename: str):
+    """Hold across a _read_global_jsonl()->mutate->_write_global_jsonl() span - see jsonl_store.locked()."""
+    return locked(STATE_DIR, filename)
+
+
 # --------------------------------------------------------------------------
 # Evidence-stage artifact gates (structural-rebuild addendum, sections 3-4).
 # Crossing into community_engagement or landing_page/build requires a real,
@@ -1120,18 +1125,23 @@ def withdraw_approval(approval_id: str, reason: str) -> str:
     """
     if not reason.strip():
         return json.dumps({"error": "reason must not be empty - explain why this is no longer relevant right now"})
-    approvals = _read_global_jsonl("approval_queue.jsonl")
-    idx = next((i for i, a in enumerate(approvals) if a.get("id") == approval_id), None)
-    if idx is None:
-        return json.dumps({"error": f"no approval request with id '{approval_id}'"})
-    if approvals[idx].get("status") != "pending":
-        return json.dumps({
-            "error": f"'{approval_id}' is already '{approvals[idx].get('status')}', not touching it"
-        })
-    approvals[idx]["status"] = "withdrawn"
-    approvals[idx]["decided_at"] = datetime.now(timezone.utc).isoformat()
-    approvals[idx]["decision_reason"] = reason
-    _write_global_jsonl("approval_queue.jsonl", approvals)
+    # A hypothesis being paused often has several pending approvals to
+    # withdraw at once - crewai can run those withdraw_approval calls
+    # concurrently, so lock the whole read->mutate->write span (see
+    # write_backlog_candidate's comment for why).
+    with _global_jsonl_lock("approval_queue.jsonl"):
+        approvals = _read_global_jsonl("approval_queue.jsonl")
+        idx = next((i for i, a in enumerate(approvals) if a.get("id") == approval_id), None)
+        if idx is None:
+            return json.dumps({"error": f"no approval request with id '{approval_id}'"})
+        if approvals[idx].get("status") != "pending":
+            return json.dumps({
+                "error": f"'{approval_id}' is already '{approvals[idx].get('status')}', not touching it"
+            })
+        approvals[idx]["status"] = "withdrawn"
+        approvals[idx]["decided_at"] = datetime.now(timezone.utc).isoformat()
+        approvals[idx]["decision_reason"] = reason
+        _write_global_jsonl("approval_queue.jsonl", approvals)
     return json.dumps({"ok": True, "id": approval_id, "status": "withdrawn"})
 
 
@@ -3507,6 +3517,114 @@ def execute_confirmed_wipe(subsidiary_id: str) -> dict:
     return {"ok": True, "subsidiary_id": subsidiary_id, "archive_dir": archive_dir, "counts": counts}
 
 
+# --------------------------------------------------------------------------
+# One-time retroactive migration (Part B addendum, item 2): hyp_research_001
+# was exempted from the 10-backlog-rule gate under a grandfather clause that
+# has since been removed entirely and retroactively - Jan's original rule
+# was unambiguous, at least 10 scored backlog candidates before any
+# validation happens, full stop, no exception. This converts hyp_research_
+# 001's real gathered evidence into a properly ICE-scored backlog candidate,
+# halts its special-cased active status so it goes through the same ranking
+# as every other candidate, and withdraws its own still-pending publish
+# approvals - the cleanup the addendum called for.
+#
+# Deliberately named after this one hypothesis, and deliberately NOT an
+# @tool: this is a one-time, human-triggered migration in the same tier as
+# wipe_state:/fix_resolved: (only reachable via _apply_telegram_commands),
+# not ongoing agent-facing logic - the "no single-hypothesis hardcoding"
+# principle (competitor-research addendum) is about business logic/prompts
+# an agent acts on every cycle, not an auditable one-off cleanup a human
+# explicitly triggers once. Idempotent: checked against real live state
+# (hyp_research_001's actual current status), not a one-shot flag, so it's
+# harmless to trigger more than once by mistake.
+# --------------------------------------------------------------------------
+
+def migrate_hyp_research_001_to_backlog(subsidiary_id: str) -> dict:
+    """Telegram command 'migrate_hyp_research_001: <subsidiary_id>' - see
+    module comment above for why this exists and why it's scoped to this
+    one hypothesis id.
+    """
+    previous_subsidiary = _active_subsidiary_id
+    set_active_subsidiary(subsidiary_id)
+    try:
+        hyp = next((h for h in _read_jsonl("hypotheses.jsonl") if h.get("id") == "hyp_research_001"), None)
+        if hyp is None:
+            return {"skipped": f"no hypothesis 'hyp_research_001' found for subsidiary '{subsidiary_id}'"}
+        if hyp.get("status") != "active":
+            return {
+                "skipped": f"hyp_research_001 status is already '{hyp.get('status')}', not 'active' - "
+                           "already migrated (or never was active), nothing to do"
+            }
+
+        findings = [f for f in _read_jsonl("research_findings.jsonl") if f.get("hypothesis_id") == "hyp_research_001"]
+        if not findings:
+            return {"error": "hyp_research_001 has no research_findings.jsonl entries to ground a backlog candidate in - cannot migrate without real grounding"}
+        grounding_id = findings[0]["id"]
+
+        impact = hyp.get("impact_score") or 5
+        confidence = hyp.get("confidence_score") or 5
+        candidate_result = json.loads(write_backlog_candidate.run(candidate=json.dumps({
+            "id": "backlog_from_hyp_research_001",
+            "statement": (
+                f"Retroactive migration of hyp_research_001 under the Part B addendum's removed "
+                f"grandfather clause. Original statement: {(hyp.get('statement') or hyp.get('id'))[:300]} "
+                f"Real gathered evidence: {len(findings)} logged research finding(s) for this "
+                f"hypothesis, first grounded in {grounding_id}. Halted from status='active' so it is "
+                "ranked here like every other backlog candidate instead of staying specially active "
+                "outside the 10-candidate gate."
+            ),
+            "source": "system: hyp_research_001 migration (Part B addendum, item 2)",
+            "fits_subsidiary_scope": "yes",
+            "impact": impact, "impact_grounding": grounding_id,
+            "confidence": confidence, "confidence_grounding": grounding_id,
+            "ease": 5, "ease_grounding": grounding_id,
+        })))
+        if "error" in candidate_result:
+            return {"error": f"backlog candidate write failed: {candidate_result['error']}"}
+
+        hyp_result = json.loads(write_hypothesis.run(hypothesis=json.dumps({
+            "id": "hyp_research_001",
+            "status": "evaluated",
+            "next_step": (
+                "Paused per the Part B addendum (10-backlog-rule, grandfather exception removed "
+                "retroactively) - its real evidence now lives as backlog_from_hyp_research_001, "
+                "ranked against every other candidate. Re-promote via the normal backlog process "
+                "if it wins that ranking."
+            ),
+        })))
+        if "error" in hyp_result:
+            return {
+                "error": f"halting hyp_research_001 failed: {hyp_result['error']}",
+                "backlog_candidate_id": "backlog_from_hyp_research_001",
+            }
+
+        withdrawn = []
+        for approval_id in ("appr_52dbb9d5", "appr_018963dc"):
+            record = next((a for a in _read_global_jsonl("approval_queue.jsonl") if a.get("id") == approval_id), None)
+            if record is None:
+                continue
+            if record.get("status") != "pending":
+                continue
+            w = json.loads(withdraw_approval.run(
+                approval_id=approval_id,
+                reason=(
+                    "paused pending 10-candidate backlog comparison per governance rule (Part B "
+                    "addendum) - hyp_research_001's grandfather exemption was removed retroactively"
+                ),
+            ))
+            if w.get("ok"):
+                withdrawn.append(approval_id)
+
+        return {
+            "ok": True,
+            "backlog_candidate_id": "backlog_from_hyp_research_001",
+            "hypothesis_halted": True,
+            "approvals_withdrawn": withdrawn,
+        }
+    finally:
+        set_active_subsidiary(previous_subsidiary)
+
+
 def is_system_paused() -> tuple[bool, str]:
     """Whether the system is currently paused via a Telegram 'stop' command,
     and the note explaining why. This is durable, cross-cycle state (not
@@ -3761,6 +3879,12 @@ def _classify_command(text: str, reply_to_text: str):
         subsidiary_id = text.split(":", 1)[1].strip()
         return ("wipe_confirm", subsidiary_id) if subsidiary_id else None
 
+    # One-time hyp_research_001 migration (Part B addendum, item 2) - same
+    # tier as wipe_state:/wipe_confirm:, see migrate_hyp_research_001_to_backlog.
+    if normalized.startswith("migrate_hyp_research_001:"):
+        subsidiary_id = text.split(":", 1)[1].strip()
+        return ("migrate_hyp_research_001", subsidiary_id) if subsidiary_id else None
+
     return None
 
 
@@ -3957,6 +4081,23 @@ def _apply_telegram_commands(messages: list) -> list:
             send_telegram_message(
                 f"State-Wipe fuer '{subsidiary_id}' durchgefuehrt - vollstaendig archiviert unter "
                 f"{result['archive_dir']}, alle betroffenen Dateien geleert. Naechster Zyklus startet bei null."
+            )
+            continue
+
+        if action == "migrate_hyp_research_001":
+            subsidiary_id = target_id
+            result = migrate_hyp_research_001_to_backlog(subsidiary_id)
+            if "error" in result:
+                send_telegram_message(f"hyp_research_001-Migration fuer '{subsidiary_id}' fehlgeschlagen: {result['error']}")
+                continue
+            if "skipped" in result:
+                send_telegram_message(f"hyp_research_001-Migration fuer '{subsidiary_id}': {result['skipped']}")
+                continue
+            log.append(f"{subsidiary_id}: hyp_research_001 migriert (Telegram)")
+            send_telegram_message(
+                f"hyp_research_001 migriert: als Backlog-Kandidat '{result['backlog_candidate_id']}' "
+                f"angelegt, Hypothese pausiert (status='evaluated'), Approvals zurueckgezogen: "
+                f"{', '.join(result['approvals_withdrawn']) or '(keine mehr pending)'}."
             )
             continue
 
