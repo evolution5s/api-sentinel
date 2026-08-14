@@ -14,28 +14,37 @@
 
 ## 0. The one fact that changes how you should read everything below
 
-**The live system is currently running on the `testing` agent profile, not
-`normal`** (`agent_profile.json`, `active_profile: "testing"`, printed to
-stdout on every process start: `agent_profile active: 'testing'
-(claude-haiku-4-5)`). Concretely, right now, every cycle:
+**UPDATED 2026-08-14 (budget-starvation addendum, Part A) - the live
+system now runs on the `normal` agent profile, not `testing`**
+(`agent_profile.json`, `active_profile: "normal"`, printed to stdout on
+every process start: `agent_profile active: 'normal' (claude-sonnet-5)`,
+confirmed locally on import; live Railway confirmation pending the next
+real cycle). This is Jan's explicit decision, not a proposal: the system
+now needs Sonnet-level judgment quality, not just mechanical cost
+minimization. Concretely, right now, every cycle:
 
-- All four agents run on **claude-haiku-4-5**, not Sonnet 5 - the profile's
-  own description says this is "not for judging output quality," a
-  functional smoke-test model, not the production-quality model this
-  document's design assumes elsewhere.
-- `CYCLE_TOKEN_BUDGET = 250,000`, a quarter of the `normal` profile's
-  1,000,000.
+- All four agents run on **claude-sonnet-5**, not Haiku.
+- `CYCLE_TOKEN_BUDGET = 1,000,000`, four times the `testing` profile's
+  250,000.
 - Every agent's `max_iter`/`max_tokens`/`max_execution_time` is the
-  `testing` profile's row, not `normal`'s (e.g. Growth: 9 iterations/4,500
-  tokens vs. 30 iterations/3,000 tokens with a much longer time budget on
-  `normal`).
+  `normal` profile's row (e.g. Growth: 30 iterations/3,000 tokens with a
+  much longer time budget vs. `testing`'s 9 iterations/4,500 tokens).
 
-This is a single line to flip (`active_profile` in `agent_profile.json`,
-then redeploy) but nothing in the code enforces switching it back - the
-description field says "Switch active_profile back to 'normal' once done"
-as a comment, not a mechanical reminder. **Every "verified-live" claim in
-section 4 below was, at best, verified live under the `testing` profile,
-never yet under `normal`.**
+**Everything this session verified live before 2026-08-14 was verified
+under `testing` (claude-haiku-4-5), not `normal` (claude-sonnet-5) - a
+different model, different token/iteration ceilings, and a 4x larger
+cycle budget.** Model-behavior-dependent findings (whether an agent
+actually follows a given instruction, whether it runs out of
+iterations/tokens before finishing a task, real per-task token
+consumption) do NOT automatically carry over just because the mechanism
+itself is model-independent code. Section 4 below now marks every
+pre-2026-08-14 entry explicitly as "verified under testing, not yet
+reconfirmed under normal" rather than silently upgrading its status -
+treat those as needing fresh live confirmation, not as settled. Purely
+data-layer/mechanical fixes (e.g. the JSONL durability/locking fix, 2026-
+08-14) are the exception - their root cause and fix are demonstrably
+profile-independent (a filesystem/concurrency issue, not an LLM-behavior
+one), and were live-verified after the profile decision was made anyway.
 
 ---
 
@@ -207,9 +216,10 @@ identical post-processing):**
 | Publish approval dedup, layer b (posting history, cross-forum) | same as above, different community | `request_approval` | **Advisory only** - attached as `similar_prior_posts` on the record, rendered in the Telegram notification, never blocks filing |
 | Content style checks | no markdown headers/bullets, no "in conclusion"/"in summary"/"as an AI"/"I hope this helps", per-post_type length cap (600/500/1500) | `tools.py`, `draft_content` (`_find_style_violations`, `CONTENT_LENGTH_CAPS`) | Hard block |
 | Community risk cooldown signal | ≥2 removals in 30 days → `risk="high"` | `tools.py`, `check_community_risk` | **Advisory only** - surfaced, never blocks a new draft |
-| Cycle token budget | `CYCLE_TOKEN_BUDGET` = 250,000 (`testing` profile, **currently live**) / 1,000,000 (`normal`) | `crew.py`, `_within_cycle_budget` family | Hard block (skips remaining tasks this cycle) |
-| Budget reservation for CEO+Main-CEO | `RESERVE_FRACTION_FOR_CEO_AND_MAIN_CEO = 0.35` | `crew.py:838` | Hard, gates `task_growth`'s own start |
-| Budget reservation for Main-CEO only | `RESERVE_FRACTION_FOR_MAIN_CEO = 0.10` | `crew.py:839` | Hard, gates `task_ceo`'s own start |
+| Cycle token budget | `CYCLE_TOKEN_BUDGET` = 250,000 (`testing`) / 1,000,000 (`normal`, **currently live since 2026-08-14**) | `crew.py`, `_within_cycle_budget` family | Hard block between tasks (skips remaining tasks this cycle); as of 2026-08-14 also a hard mid-task ceiling for Main-CEO's reserved floor specifically, see the budget-reservation rows below |
+| Budget reservation for CEO+Main-CEO | `RESERVE_FRACTION_FOR_CEO_AND_MAIN_CEO = 0.35` | `crew.py:838` | Hard, gates `task_growth`'s own start (between-task check only) |
+| Budget reservation for Main-CEO only | `RESERVE_FRACTION_FOR_MAIN_CEO = 0.10` | `crew.py:839` | Hard, gates `task_ceo`'s own start (between-task check only) |
+| Hard mid-task ceiling for Main-CEO's floor (2026-08-14) | Same `RESERVE_FRACTION_FOR_MAIN_CEO`-derived ceiling, but re-checked after every single agent step, not just between tasks | `crew.py`, `_make_hard_ceiling_step_callback`, attached to `ceo_agent`/`growth_agent` via `Agent.step_callback` | Hard, mid-task - fixes the confirmed real gap where the two rows above alone let a task that had ALREADY started blow straight through them (Main-CEO skipped two consecutive live cycles, 126%/131% over budget) |
 | Per-agent max_iter/max_tokens/max_execution_time | see `agent_profile.json`, varies by profile and agent | `crew.py` `Agent(...)` construction | Hard block (crewai-level) |
 | Stall detection | `STALL_RESOLVED_THRESHOLD = 5` resolved hypotheses, 0 builds | `holding.py:687`, `assess_subsidiary_trajectory` | Advisory (surfaced in Main-CEO's own report) |
 | Stagnation escalation | `STAGNATION_ESCALATION_THRESHOLD = 6` consecutive stalled cycles | `holding.py:702` | Escalation (persists `stagnation_escalated=true`, surfaced every cycle until human `stagnation_ack:` or a real build) |
@@ -310,6 +320,18 @@ else is "implemented, tested in isolation, not yet confirmed live" - that
 is not a criticism, most of this system's mechanics are only cheaply
 testable that way, but the distinction matters for trust calibration.
 
+**Profile-basis caveat (2026-08-14, budget-starvation addendum Part A -
+see section 0):** every row below whose date isn't explicitly marked
+2026-08-14 or later was verified under the `testing` profile
+(claude-haiku-4-5), not `normal` (claude-sonnet-5), which is what's
+actually live now. This matters for anything whose "verified" status
+depends on model BEHAVIOR (does the agent follow an instruction, run out
+of iterations before finishing, etc.) - a different model with different
+token/iteration ceilings is not guaranteed to reproduce it, and that
+reconfirmation has not happened yet for most rows below. Rows that are
+purely data-layer/mechanical (their root cause and fix don't depend on
+which LLM is calling the tool) are the exception and are marked as such.
+
 | Mechanism | Status | Basis |
 |---|---|---|
 | Core Build-Measure-Learn loop (`write_hypothesis`/`evaluate_hypothesis`) | **Verified-live** | Existing `hyp_research_001` is a real, live-created active hypothesis referenced throughout prior addenda and README |
@@ -326,10 +348,14 @@ testable that way, but the distinction matters for trust calibration.
 | Rejection-reason enforcement | **Implemented, not confirmed live** | Brand-new this addendum; `checkup.py` covers both the `approve.py` and Telegram paths, no real cycle has exercised it yet |
 | Full state wipe (`wipe_state:`/`wipe_confirm:`) | **Implemented, deliberately not yet triggered on production** | Item 6 of this addendum, sequenced explicitly after items 1-3 above were confirmed fixed. `checkup.py` covers both phases, subsidiary isolation, expiry, and the full Telegram round-trip against real (test) state. Execution against the real `api-sentinel` production state is Jan's own call, via a real `wipe_state:`/`wipe_confirm:` Telegram exchange whenever he's ready - not something this session executed unilaterally |
 | Task-main-ceo-review "ground truth over assertion" fix | **Implemented, not confirmed live** | The regression it fixes (Main-CEO second-guessing persisted state) was confirmed live; the fix has not yet run a real cycle |
-| `agent_profile.json` `testing` mode | **Verified-live, currently active** | Printed directly to stdout on every process start; confirmed by this session's own test runs |
+| `agent_profile.json` mode | **`testing` was verified-live through 2026-08-14; `normal` is now active (2026-08-14) and confirmed locally on import, live Railway confirmation pending the next real cycle** | Printed directly to stdout on every process start (`agent_profile active: '<name>' (<model>)`); local confirmation this session, see section 0 |
 | `update_reach_multiplier` recalibration | **Not live, not reachable by any agent at all** | See section 5, finding 5 |
-| Stale-direction mechanical override | **Confirmed real-live problem, fix implemented, live verification pending** | Real `dir_ccfb394d` on production twice survived Main-CEO judgment across two separate real cycles - the failure mode itself is confirmed live; the mechanical fix has only run under `checkup.py` so far, pending a live cycle to confirm it actually replaces the real direction |
-| 10-backlog-rule gate (no exception) + `hyp_research_001` backlog conversion | **Gate mechanism implemented and tested; `hyp_research_001`'s conversion into a scored backlog candidate and the withdrawal of its two real pending publish approvals (`appr_52dbb9d5`, `appr_018963dc`) require live production access, not yet executed** | See section 6 for why live access is currently gated behind an explicit manual trigger or a natural cron window |
+| Stale-direction mechanical override | **Confirmed live and working, under `testing`** | Real `dir_ccfb394d` on production twice survived Main-CEO judgment across two separate real cycles under `testing` - confirmed via real pulled Railway logs (`dir_ccfb394d -> dir_7aaa55ca`, 2026-08-14). Needs reconfirmation under `normal` per the profile-basis caveat above, though this mechanism is pure regex/pattern matching (not LLM judgment), so profile-dependence is unlikely |
+| 10-backlog-rule gate (no exception) | **Confirmed live and working, under `testing`** | Real cycle blocked publish approvals while the gate was open, and a real cycle promoted through it once 10 genuinely scored candidates existed (2026-08-14 Railway logs). Needs reconfirmation under `normal` per the caveat above |
+| Backlog-candidate JSONL persistence (durability + concurrent-write locking) | **Confirmed live and working, profile-independent** | Live-discovered 2026-08-14: a burst of `write_backlog_candidate` calls in one cycle lost most writes (root cause: crewai's real `ThreadPoolExecutor` concurrent tool dispatch racing on an unlocked read-modify-write JSONL span, plus non-durable writes). Fixed (commits `8a3b9e6`, `3e803d2`) and confirmed live over a third real cycle with 10/10 consistent `read_backlog` reads. Pure data-layer fix, not model-behavior-dependent - the exception to the profile-basis caveat above |
+| `migrate_hyp_research_001` Telegram command (hyp_research_001 -> scored backlog candidate, halt to `evaluated`, withdraw `appr_52dbb9d5`/`appr_018963dc`) | **Implemented and unit-tested (commit `ce305f3`), not yet triggered live** | Deliberately routed through the existing Telegram-command dispatch (same tier as `wipe_state:`) rather than a manual SSH write, since a manual write during a live cron window would run as a separate OS process racing the container's own cycle - outside what the intra-process lock protects. Awaiting a real `migrate_hyp_research_001: api-sentinel` Telegram message from Jan |
+| Hard per-step budget ceiling for Main-CEO's reserved floor | **Implemented and unit-tested (budget-starvation addendum Part C), not yet confirmed live** | Confirmed real bug: Main-CEO skipped two consecutive live cycles (126%, 131% over `CYCLE_TOKEN_BUDGET`) because the existing gates only check between tasks, not during one - fixed via `Agent.step_callback` forcing crewai's own graceful max-iter stop mid-task. Needs a live cycle under `normal` (where it now runs) to confirm it actually fires under real usage patterns |
+| Next-step ground-truth default + backlog-claim ground-truth warning | **Implemented and unit-tested (budget-starvation addendum Part C), not yet confirmed live** | Distinguishes "task_ceo skipped" from "task_ceo ran but forgot `set_next_step`" via `task_ceo.output`; flags any cycle where `write_backlog_candidate` was called without a later `read_backlog` before the report was built |
 
 ---
 
@@ -544,9 +570,13 @@ validate against an actual cycle.
   back-and-forth in `PERMISSION_REQUESTS_reviewed_2026-08-13.md`. Genuine
   live volume access still requires either catching an actual scheduled
   cron window, or a confirmed one-off use of the restart/redeploy trigger.
-- **`testing` agent profile is live in production** (section 0) - every
-  cycle currently runs on Haiku with a quarter of the intended token
-  budget. Nothing mechanically reminds anyone to switch back to `normal`.
+- ~~`testing` agent profile is live in production~~ **Resolved 2026-08-14**
+  (section 0) - switched to `normal` (Sonnet 5, full token budget), Jan's
+  explicit decision. Nothing mechanically prevented leaving `testing`
+  active indefinitely before this - that structural gap (no automated
+  reminder/enforcement of the intended profile) is itself still real and
+  unaddressed, just no longer live; worth a real fix if this ever needs to
+  flip back to `testing` temporarily and stay flipped back reliably.
 - **One subsidiary in practice, but the known hardcoded-content gap is
   fixed (2026-08-13, competitor-research addendum).** The holding model
   supports many, but every shared agent/task text was audited for

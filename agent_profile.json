@@ -1,8 +1,8 @@
 {
-  "active_profile": "testing",
+  "active_profile": "normal",
   "profiles": {
     "testing": {
-      "description": "Still cheapest-model (Haiku) functional check, not for judging output quality - but token/iteration caps are 5x the original minimal values (2026-08-12, token-starvation addendum step 3) after repeated real evidence of truncation (posts and intermediate reasoning steps cut off, Growth hitting max_iter without completing its task). Switch active_profile back to 'normal' once done.",
+      "description": "Still cheapest-model (Haiku) functional check, not for judging output quality - but token/iteration caps are 5x the original minimal values (2026-08-12, token-starvation addendum step 3) after repeated real evidence of truncation (posts and intermediate reasoning steps cut off, Growth hitting max_iter without completing its task). Switched off 2026-08-14 (Jan's explicit decision, budget-starvation addendum Part A): the system now needs Sonnet-level judgment quality, not just mechanical cost minimization. Kept here for future functional-check use, not deleted.",
       "model": "claude-haiku-4-5",
       "cycle_token_budget": 250000,
       "agents": {

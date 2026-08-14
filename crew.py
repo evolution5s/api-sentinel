@@ -7,7 +7,7 @@ from pathlib import Path
 
 from crewai import Agent, Crew, Process, Task, LLM
 from crewai.events import crewai_event_bus
-from crewai.events.types.tool_usage_events import ToolValidateInputErrorEvent
+from crewai.events.types.tool_usage_events import ToolUsageFinishedEvent, ToolValidateInputErrorEvent
 from crewai.tasks.conditional_task import ConditionalTask
 
 import crewai_patches
@@ -498,7 +498,19 @@ ceo_agent = Agent(
         "which one(s) to promote (up to MAX_ACTIVE_HYPOTHESES) - a real "
         "comparison outcome, never an assumption that whichever hypothesis "
         "was active before automatically resumes by default, even if it "
-        "does end up scoring highest.\n\n"
+        "does end up scoring highest. Confirmed real regression: a real "
+        "cycle's own report once stated the gate was satisfied while its "
+        "own read_backlog() call, sitting in the very same cycle's tool "
+        "log, actually showed one candidate short - the claim had been "
+        "carried over from earlier write_backlog_candidate {\"ok\": true} "
+        "responses rather than checked fresh. Any statement in your report "
+        "about whether the gate is open/closed, or how many candidates "
+        "exist, must be based on a read_backlog(status='candidate') call "
+        "made at that point in THIS cycle - call it again right before "
+        "making the claim if your only read so far was from earlier in the "
+        "cycle (e.g. before this cycle's own write_backlog_candidate "
+        "calls), never state a count from memory or from write responses "
+        "alone.\n\n"
         "Hypothesis backlog + ICE scoring (backlog addendum, Part 2): "
         "MAX_ACTIVE_HYPOTHESES is a genuine work-in-progress limit on how "
         "many hypotheses are being actively TESTED at once - it is not a "
@@ -832,6 +844,33 @@ def _on_tool_validate_input_error(source, event) -> None:
 
 
 # --------------------------------------------------------------------------
+# Ground-truth check on backlog-count claims (budget-starvation addendum).
+# Confirmed real: a live cycle's own report stated "the gate is satisfied"
+# while its OWN structured read_backlog() output, sitting right there in
+# the same tool-call log, showed 9 candidates, not 10 - a genuinely false
+# claim about a mechanically-checkable fact, apparently carried over from
+# write_backlog_candidate's {"ok": true} responses rather than a fresh
+# read. Parsing free-text business-report prose for false claims isn't
+# reliable, but the specific FAILURE MODE observed - asserting a gate
+# status without ever re-reading it - is directly, mechanically
+# detectable via crewai's own ToolUsageFinishedEvent: track whether
+# write_backlog_candidate was called without a read_backlog call
+# afterward to confirm what actually persisted, and flag that plainly in
+# the report if so, rather than trusting the narrative.
+# --------------------------------------------------------------------------
+_backlog_write_without_fresh_read = False
+
+
+@crewai_event_bus.on(ToolUsageFinishedEvent)
+def _on_tool_usage_finished(source, event) -> None:
+    global _backlog_write_without_fresh_read
+    if event.tool_name == "write_backlog_candidate":
+        _backlog_write_without_fresh_read = True
+    elif event.tool_name == "read_backlog":
+        _backlog_write_without_fresh_read = False
+
+
+# --------------------------------------------------------------------------
 # Zyklus-Budget-Schutz: die einzige Grenze oben, die tatsaechlich ueber den
 # GANZEN Zyklus wirkt statt nur pro einzelner Task-Ausfuehrung. Ohne das
 # haette der Bug-Zyklus mit 1,52 Mio. Tokens ungebremst weiterlaufen
@@ -867,11 +906,19 @@ CYCLE_TOKEN_BUDGET = AGENT_PROFILE["cycle_token_budget"]
 # checked). Fixed as a waterfall: each earlier task's gate reserves a
 # fraction of the budget for the tasks after it that matter more, so a
 # task only gets to run if doing so still leaves room for what's reserved
-# below it. This governs whether a task is allowed to START, same as
-# before - it is NOT a hard per-task token cap (max_tokens/max_iter already
-# are that, per agent) and can't retroactively stop a task that's already
-# running from overrunning its reserved slice; it only prevents queuing a
-# lower-priority task once the reserved zone has already been entered.
+# below it. This governs whether a task is allowed to START - it is a
+# per-TASK check (evaluated once, between tasks), not a per-STEP one.
+#
+# 2026-08-14 confirmed real bug (budget-starvation addendum): that gap was
+# real, not theoretical - Main-CEO was skipped two consecutive live cycles
+# (126%, 131% over CYCLE_TOKEN_BUDGET) because task_growth alone, once
+# STARTED, kept iterating (each iteration within its own per-agent
+# max_tokens/max_iter, which bound a single task's own ceiling, not the
+# CYCLE's) until it blew past every reserve on its own, before
+# task_ceo's/task_main_ceo_review's start-of-task gate ever got a chance to
+# run. A per-task start gate cannot catch an overrun that happens INSIDE
+# the task it would have blocked. See _make_hard_ceiling_step_callback
+# below for the real per-STEP hard ceiling that now backs this up.
 RESERVE_FRACTION_FOR_CEO_AND_MAIN_CEO = 0.35
 RESERVE_FRACTION_FOR_MAIN_CEO = 0.10
 
@@ -905,6 +952,58 @@ _within_cycle_budget_reserving_ceo_and_main_ceo = _make_budget_gate(
 _within_cycle_budget_reserving_main_ceo = _make_budget_gate(
     RESERVE_FRACTION_FOR_MAIN_CEO, "Main-CEO"
 )
+
+# --------------------------------------------------------------------------
+# Real hard per-STEP ceiling (budget-starvation addendum, Part C) - fixes
+# the confirmed gap the gates above can't close on their own: they only
+# check between tasks, so a task that overruns AFTER it's already started
+# sails right past them. crewai's Agent.step_callback fires after every
+# single LLM step DURING a task's execution (confirmed by reading the
+# installed crewai source, crew_agent_executor.py - the same source read
+# already confirmed this session's concurrent-tool-dispatch root cause),
+# which is the only hook granular enough to catch an in-progress overrun.
+#
+# Deliberately does NOT raise an exception to abort - that would propagate
+# out of crewai's internal executor loop in a way not designed to be
+# caught cleanly and could crash the whole cycle instead of just this one
+# task. Instead it reuses crewai's own existing, well-tested graceful-stop
+# path: has_reached_max_iterations(executor.iterations, executor.max_iter)
+# is re-checked at the top of every loop iteration (confirmed in
+# crew_agent_executor.py) - forcing executor.max_iter down to the current
+# iteration count makes that check trip on the very next iteration, the
+# exact same code path an agent already takes when it naturally hits its
+# configured max_iter, asking the LLM for one final answer instead of
+# continuing. Bounded overrun (at most one more LLM call past the ceiling)
+# rather than unlimited overrun - a real fix, not a theoretical one.
+#
+# Scoped to Main-CEO's own reserved floor (the specific, confirmed-broken
+# backstop) and attached to every agent whose tasks run before
+# task_main_ceo_review (ceo_agent for task_channel_strategy AND task_ceo,
+# growth_agent for task_growth) - main_ceo_agent itself is what's being
+# protected, so it doesn't need this; task_dev runs after and is out of
+# scope for this specific addendum.
+_HARD_CEILING_RESERVE_TOKENS_FOR_MAIN_CEO = round(CYCLE_TOKEN_BUDGET * RESERVE_FRACTION_FOR_MAIN_CEO)
+_HARD_CEILING_TOKENS_BEFORE_MAIN_CEO = CYCLE_TOKEN_BUDGET - _HARD_CEILING_RESERVE_TOKENS_FOR_MAIN_CEO
+
+
+def _make_hard_ceiling_step_callback(agent: Agent, label: str):
+    def _step_ceiling(_formatted_answer) -> None:
+        executor = agent.agent_executor
+        if executor is None or executor.iterations >= executor.max_iter:
+            return  # already stopping (or stopped) - nothing new to enforce
+        total_now = crew.calculate_usage_metrics().total_tokens
+        if total_now >= _HARD_CEILING_TOKENS_BEFORE_MAIN_CEO:
+            executor.max_iter = executor.iterations
+            _limit_hits.append(
+                f"{label}: harte Main-CEO-Reserve-Grenze "
+                f"({_HARD_CEILING_TOKENS_BEFORE_MAIN_CEO:,} Tokens) MITTEN in der Task erreicht "
+                f"({total_now:,} verbraucht) - zur finalen Antwort gezwungen statt weiterlaufen zu lassen"
+            )
+    return _step_ceiling
+
+
+ceo_agent.step_callback = _make_hard_ceiling_step_callback(ceo_agent, "Sub-CEO")
+growth_agent.step_callback = _make_hard_ceiling_step_callback(growth_agent, "Growth")
 
 
 # Tasks definieren
@@ -2420,7 +2519,25 @@ def send_cycle_summary(
         )
 
         since_iso = (_previous_business_report or {}).get("at") or ""
-        next_step = get_and_clear_pending_next_step(default="(kein naechster Schritt gemeldet)")
+        # Budget-starvation addendum: distinguish WHY no next step was
+        # reported instead of one flat default - task_ceo (the Sub-CEO's
+        # Build-Measure-Learn task, the one with set_next_step in its
+        # tools) either never ran this cycle (budget gate/hard ceiling, an
+        # expected, non-broken outcome) or ran to completion without
+        # calling it (a real, previously-silent gap - ground-truth check on
+        # task_ceo.output, which crewai leaves None/empty for a skipped
+        # ConditionalTask, confirmed by reading crewai's own skip-handling
+        # source, not assumed).
+        task_ceo_ran = task_ceo.output is not None and bool(task_ceo.output.raw)
+        next_step = get_and_clear_pending_next_step(default=None)
+        if next_step is None:
+            next_step = (
+                "(kein naechster Schritt gemeldet - Sub-CEO-Task ist regulaer durchgelaufen, hat aber "
+                "keinen expliziten naechsten Schritt via set_next_step gesetzt - echte Luecke, kein "
+                "Budget-Skip)" if task_ceo_ran else
+                "(kein naechster Schritt gemeldet - Sub-CEO-Task (Build-Measure-Learn) diesen Zyklus "
+                "uebersprungen/vorzeitig abgebrochen, siehe Budget-Grenzen oben)"
+            )
         approvals_lines, current_approval_ids = _approvals_business_lines(
             subsidiary_id, (_previous_business_report or {}).get("reported_approval_ids")
         )
@@ -2432,6 +2549,13 @@ def send_cycle_summary(
         ]
         lines_b += _format_hypothesis_overview(build_hypothesis_overview())
         lines_b += ["", _task_summary(task_ceo)]
+        if _backlog_write_without_fresh_read:
+            lines_b += [
+                "WARNUNG (ground-truth-Regel): write_backlog_candidate wurde diesen Zyklus aufgerufen, "
+                "read_backlog danach nicht mehr - jede Aussage oben ueber den 10-Kandidaten-Gate-Status "
+                "ist NICHT frisch verifiziert, moeglicherweise nur von {\"ok\": true}-Schreibantworten "
+                "abgeleitet statt von einer echten Nachlese.",
+            ]
         lines_b += _top_hypotheses_lines(build_top_hypotheses_block())
         lines_b += _kaizen_business_lines(subsidiary_id, since_iso)
         lines_b += approvals_lines
@@ -2523,6 +2647,7 @@ if __name__ == "__main__":
             _task_usage_log.clear()
             _malformed_tool_calls.clear()
             _pre_dev_task_open_order_ids = None
+            _backlog_write_without_fresh_read = False
             # Anti-stagnation addendum, Part 2 section 2.4: snapshot BEFORE
             # kickoff() so send_cycle_summary can tell whether this cycle had
             # unused active-testing capacity at the start AND produced no

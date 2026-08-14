@@ -4147,6 +4147,89 @@ def test_budget_gate_waterfall_actually_protects_downstream_tasks():
         crew._limit_hits.clear()
 
 
+def test_hard_ceiling_step_callback_wired_to_ceo_and_growth_agents():
+    # Budget-starvation addendum Part C: the soft per-task start gates above
+    # can't catch an overrun that happens INSIDE an already-started task -
+    # confirmed real (Main-CEO skipped two consecutive live cycles, 126%/
+    # 131% over CYCLE_TOKEN_BUDGET). ceo_agent and growth_agent are the two
+    # agents whose tasks run before task_main_ceo_review; main_ceo_agent
+    # itself is what's being protected and doesn't need this.
+    assert crew.ceo_agent.step_callback is not None
+    assert crew.growth_agent.step_callback is not None
+    assert crew.main_ceo_agent.step_callback is None
+    assert crew.dev_agent.step_callback is None
+
+
+class _FakeExecutor:
+    def __init__(self, iterations, max_iter):
+        self.iterations = iterations
+        self.max_iter = max_iter
+
+
+def test_hard_ceiling_step_callback_forces_early_stop_over_ceiling():
+    # Functional test of the actual mechanism, not just wiring: reuses
+    # crewai's own has_reached_max_iterations check (re-evaluated at the
+    # top of every loop iteration, confirmed by reading crewai's installed
+    # source) by forcing executor.max_iter down to the current iteration
+    # count once the hard ceiling is crossed mid-task - the same graceful
+    # stop path an agent already takes when it naturally hits max_iter,
+    # not an exception that could crash the whole cycle.
+    from crewai import Crew
+    crew._limit_hits.clear()
+    original = Crew.calculate_usage_metrics
+    fake_agent = type("A", (), {})()
+    fake_agent.agent_executor = _FakeExecutor(iterations=4, max_iter=30)
+    try:
+        over_ceiling = crew._HARD_CEILING_TOKENS_BEFORE_MAIN_CEO + 1
+        Crew.calculate_usage_metrics = lambda self: type("U", (), {"total_tokens": over_ceiling})()
+        step_cb = crew._make_hard_ceiling_step_callback(fake_agent, "TestAgent")
+        step_cb(None)
+        assert fake_agent.agent_executor.max_iter == 4, "must be forced down to the current iteration count"
+        assert any("harte Main-CEO-Reserve-Grenze" in hit for hit in crew._limit_hits)
+    finally:
+        Crew.calculate_usage_metrics = original
+        crew._limit_hits.clear()
+
+
+def test_hard_ceiling_step_callback_leaves_max_iter_alone_under_ceiling():
+    from crewai import Crew
+    crew._limit_hits.clear()
+    original = Crew.calculate_usage_metrics
+    fake_agent = type("A", (), {})()
+    fake_agent.agent_executor = _FakeExecutor(iterations=4, max_iter=30)
+    try:
+        under_ceiling = crew._HARD_CEILING_TOKENS_BEFORE_MAIN_CEO - 1
+        Crew.calculate_usage_metrics = lambda self: type("U", (), {"total_tokens": under_ceiling})()
+        step_cb = crew._make_hard_ceiling_step_callback(fake_agent, "TestAgent")
+        step_cb(None)
+        assert fake_agent.agent_executor.max_iter == 30, "must not be touched while still under the ceiling"
+        assert crew._limit_hits == []
+    finally:
+        Crew.calculate_usage_metrics = original
+        crew._limit_hits.clear()
+
+
+def test_hard_ceiling_step_callback_does_not_re_fire_once_already_stopping():
+    # Once max_iter has already been forced down to iterations (or the
+    # agent's own natural max_iter was reached some other way), a further
+    # step_callback firing (e.g. the one final forced-answer step) must not
+    # log a second, duplicate _limit_hits entry.
+    from crewai import Crew
+    crew._limit_hits.clear()
+    original = Crew.calculate_usage_metrics
+    fake_agent = type("A", (), {})()
+    fake_agent.agent_executor = _FakeExecutor(iterations=4, max_iter=4)  # already at the cap
+    try:
+        over_ceiling = crew._HARD_CEILING_TOKENS_BEFORE_MAIN_CEO + 1
+        Crew.calculate_usage_metrics = lambda self: type("U", (), {"total_tokens": over_ceiling})()
+        step_cb = crew._make_hard_ceiling_step_callback(fake_agent, "TestAgent")
+        step_cb(None)
+        assert crew._limit_hits == [], "already-stopping executor must be left alone, not re-logged"
+    finally:
+        Crew.calculate_usage_metrics = original
+        crew._limit_hits.clear()
+
+
 def test_all_task_descriptions_and_agent_backstories_interpolate_cleanly():
     # Real-world regression for the 2026-08-11 crash: crewai's own
     # kickoff() calls exactly this method (crew._interpolate_inputs) on the
@@ -5402,6 +5485,88 @@ def test_send_cycle_summary_persists_business_report_for_next_cycle():
         saved = tools.read_last_business_report()
         assert saved["next_step"] == "advance hyp_bootstrap research this cycle"
     finally:
+        if had_token is not None:
+            os.environ["TELEGRAM_BOT_TOKEN"] = had_token
+
+
+def test_send_cycle_summary_next_step_default_distinguishes_skip_from_forgotten():
+    # Budget-starvation addendum: a flat "(kein naechster Schritt gemeldet)"
+    # default doesn't distinguish "task_ceo never ran this cycle" (expected,
+    # not a bug) from "task_ceo ran but forgot to call set_next_step" (a
+    # real, previously-silent gap) - ground-truth check against
+    # task_ceo.output, which crewai leaves None/empty for a skipped
+    # ConditionalTask (confirmed by reading crewai's own skip-handling
+    # source).
+    reset_state()
+    had_token = os.environ.pop("TELEGRAM_BOT_TOKEN", None)
+    original_output = crew.task_ceo.output
+    captured = []
+    original_send = crew.send_telegram_message
+    try:
+        crew.send_telegram_message = lambda text, parse_mode=None, label=None: captured.append(text)
+
+        crew.task_ceo.output = None  # skipped this cycle - normal, expected
+        crew.send_cycle_summary(subsidiary_id="api-sentinel")
+        assert "uebersprungen/vorzeitig abgebrochen" in captured[1]
+        assert "echte Luecke" not in captured[1]
+
+        captured.clear()
+        crew.task_ceo.output = type("FakeOutput", (), {"raw": "real report text"})()  # ran, but no set_next_step
+        crew.send_cycle_summary(subsidiary_id="api-sentinel")
+        assert "echte Luecke" in captured[1]
+        assert "uebersprungen/vorzeitig abgebrochen" not in captured[1]
+    finally:
+        crew.task_ceo.output = original_output
+        crew.send_telegram_message = original_send
+        if had_token is not None:
+            os.environ["TELEGRAM_BOT_TOKEN"] = had_token
+
+
+def test_backlog_ground_truth_tracker_flips_on_write_and_read():
+    # crewai's ToolUsageFinishedEvent handler tracks write_backlog_candidate
+    # without a later read_backlog as the exact confirmed failure mode (a
+    # real cycle claimed "gate satisfied" while its own read_backlog call
+    # showed one candidate short - carried over from write responses,
+    # never re-checked).
+    original = crew._backlog_write_without_fresh_read
+    try:
+        crew._backlog_write_without_fresh_read = False
+        fake_write_event = type("E", (), {"tool_name": "write_backlog_candidate"})()
+        crew._on_tool_usage_finished(None, fake_write_event)
+        assert crew._backlog_write_without_fresh_read is True
+
+        fake_read_event = type("E", (), {"tool_name": "read_backlog"})()
+        crew._on_tool_usage_finished(None, fake_read_event)
+        assert crew._backlog_write_without_fresh_read is False
+
+        fake_other_event = type("E", (), {"tool_name": "read_hypotheses"})()
+        crew._on_tool_usage_finished(None, fake_write_event)
+        crew._on_tool_usage_finished(None, fake_other_event)
+        assert crew._backlog_write_without_fresh_read is True, "an unrelated tool call must not clear the flag"
+    finally:
+        crew._backlog_write_without_fresh_read = original
+
+
+def test_send_cycle_summary_flags_backlog_ground_truth_warning():
+    reset_state()
+    had_token = os.environ.pop("TELEGRAM_BOT_TOKEN", None)
+    original_flag = crew._backlog_write_without_fresh_read
+    captured = []
+    original_send = crew.send_telegram_message
+    try:
+        crew.send_telegram_message = lambda text, parse_mode=None, label=None: captured.append(text)
+
+        crew._backlog_write_without_fresh_read = True
+        crew.send_cycle_summary(subsidiary_id="api-sentinel")
+        assert "WARNUNG (ground-truth-Regel)" in captured[1]
+
+        captured.clear()
+        crew._backlog_write_without_fresh_read = False
+        crew.send_cycle_summary(subsidiary_id="api-sentinel")
+        assert "WARNUNG (ground-truth-Regel)" not in captured[1]
+    finally:
+        crew._backlog_write_without_fresh_read = original_flag
+        crew.send_telegram_message = original_send
         if had_token is not None:
             os.environ["TELEGRAM_BOT_TOKEN"] = had_token
 

@@ -1849,7 +1849,7 @@ sondern in `agent_profile.json` mit zwei benannten Profilen. Umschalten =
 
 ```json
 {
-  "active_profile": "testing",
+  "active_profile": "normal",
   "profiles": {
     "testing": { "model": "claude-haiku-4-5", "cycle_token_budget": 250000, ... },
     "normal":  { "model": "claude-sonnet-5",  "cycle_token_budget": 1000000, ... }
@@ -1859,8 +1859,14 @@ sondern in `agent_profile.json` mit zwei benannten Profilen. Umschalten =
 
 | Profil | Modell | Zweck |
 |---|---|---|
-| `testing` (aktuell aktiv) | `claude-haiku-4-5` | Reiner "läuft der Zyklus End-to-End"-Check, keine Qualitätsprüfung - minimale Kosten während der aktiven Entwicklung |
-| `normal` | `claude-sonnet-5` | Produktionseinstellungen für echte Hypothesenqualität |
+| `testing` | `claude-haiku-4-5` | Reiner "läuft der Zyklus End-to-End"-Check, keine Qualitätsprüfung - minimale Kosten während der aktiven Entwicklung |
+| `normal` (aktuell aktiv, seit 2026-08-14) | `claude-sonnet-5` | Produktionseinstellungen für echte Hypothesenqualität |
+
+**Entschieden, kein offener Punkt mehr (2026-08-14, budget-starvation-Addendum
+Teil A, Jans explizite Entscheidung):** Umschaltung von `testing` auf
+`normal` - das System braucht jetzt Sonnet-Urteilsvermögen, nicht mehr nur
+mechanische Kostenminimierung. `testing` bleibt im File für künftige reine
+Funktionschecks, ist aber nicht mehr aktiv.
 
 Pro Agent (`agents.<rolle>` im aktiven Profil):
 
@@ -2531,11 +2537,15 @@ eine Zusammenfassung; Exit-Code `0` nur wenn wirklich alles bestanden hat.
 
 ## 15. Bekannte Grenzen und offene Punkte
 
-- **`agent_profile.json` steht aktuell auf `"testing"`** (Claude Haiku 4.5,
-  stark reduzierte Limits) - das ist ein bewusster, dateibasierter
-  Temporär-Zustand für die aktive Entwicklungsphase, kein Produktionsbetrieb.
-  Umschalten auf echte Qualität: `active_profile` auf `"normal"` setzen und
-  neu deployen.
+- ~~`agent_profile.json` steht aktuell auf `"testing"`~~ **Entschieden,
+  nicht mehr offen (2026-08-14, budget-starvation-Addendum Teil A):**
+  umgeschaltet auf `"normal"` (Claude Sonnet 5) - Jans explizite
+  Entscheidung, das System braucht jetzt Sonnet-Urteilsvermögen statt
+  mechanischer Kostenminimierung. **Wichtig:** jeder Eintrag in
+  OPERATING_MODEL.md's "live-verifiziert"-Tabelle (Kapitel 4) war bis dahin
+  explizit als "nur unter `testing` verifiziert, nie unter `normal`"
+  qualifiziert - diese Verifikationen gelten NICHT automatisch weiter,
+  siehe dortige Anmerkung.
 - **Nur eine Subsidiary registriert.** Die gesamte Main-CEO/Holding-Ebene
   (Cross-Subsidiary-Requests, Research-Archiv über mehrere Subsidiaries,
   `move_to_subsidiary`-Pivot-Entscheidung) ist funktionsfähig, aber mangels
