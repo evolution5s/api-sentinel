@@ -30,7 +30,7 @@ from bs4 import BeautifulSoup
 from crewai.tools import tool
 
 import scoring
-from jsonl_store import append_jsonl, read_jsonl, write_jsonl
+from jsonl_store import append_jsonl, locked, read_jsonl, write_jsonl
 
 STATE_DIR = Path(os.getenv("STATE_DIR", "/data"))
 
@@ -342,6 +342,11 @@ def _write_jsonl(filename: str, records: list) -> None:
     for record in records:
         record.setdefault("subsidiary_id", _active_subsidiary_id)
     write_jsonl(_subsidiary_dir(), filename, records)
+
+
+def _jsonl_lock(filename: str):
+    """Hold across a read_jsonl()->mutate->write_jsonl() span - see jsonl_store.locked()."""
+    return locked(_subsidiary_dir(), filename)
 
 
 def _append_global_jsonl(filename: str, record: dict) -> None:
@@ -1370,302 +1375,307 @@ def write_hypothesis(hypothesis: str) -> str:
     if patch.get("status") == "buried" and not (patch.get("bury_reasoning") or "").strip():
         return json.dumps({"error": "status='buried' requires a non-empty bury_reasoning"})
 
-    hyps = _read_jsonl("hypotheses.jsonl")
-    existing_index = next((i for i, h in enumerate(hyps) if h.get("id") == patch["id"]), None)
-    existing_record = hyps[existing_index] if existing_index is not None else {}
-    prior_stage = existing_record.get("evidence_stage")
-    effective_stage = patch.get("evidence_stage", prior_stage)
-    prior_status = existing_record.get("status")
-    effective_status = patch.get("status", prior_status if existing_index is not None else "active")
+    # Held across the whole read->mutate->write span (validation
+    # included, since active-count/parallelism checks below must see a
+    # consistent hyps list): see write_backlog_candidate's comment on
+    # why crewai's concurrent tool-call dispatch requires this.
+    with _jsonl_lock("hypotheses.jsonl"):
+        hyps = _read_jsonl("hypotheses.jsonl")
+        existing_index = next((i for i, h in enumerate(hyps) if h.get("id") == patch["id"]), None)
+        existing_record = hyps[existing_index] if existing_index is not None else {}
+        prior_stage = existing_record.get("evidence_stage")
+        effective_stage = patch.get("evidence_stage", prior_stage)
+        prior_status = existing_record.get("status")
+        effective_status = patch.get("status", prior_status if existing_index is not None else "active")
 
-    # Item 3 (Jan's explicit mandate), extended by the 10-backlog-rule
-    # addendum item 1: at least MIN_BACKLOG_BEFORE_ACTIVE_PROMOTION
-    # genuinely scored backlog candidates must exist, full stop, no
-    # exception - not counting the one being promoted here via
-    # backlog_candidate_id. The earlier grandfather clause exempting a
-    # hypothesis already active before this rule existed was a misreading
-    # of Jan's original, unambiguous instruction and is removed entirely,
-    # retroactively: an already-active hypothesis staying active on this
-    # update is gated exactly the same as a brand-new promotion - the only
-    # way through while the gate is unsatisfied is a genuinely resolving
-    # update (status='evaluated'/'buried', which makes effective_status
-    # something other than 'active' and skips this block entirely).
-    if effective_status == "active":
-        _promoting_candidate_id = patch.get("backlog_candidate_id", existing_record.get("backlog_candidate_id"))
-        _count = _scored_backlog_count(exclude_id=_promoting_candidate_id)
-        if _count < MIN_BACKLOG_BEFORE_ACTIVE_PROMOTION:
-            if prior_status != "active":
+        # Item 3 (Jan's explicit mandate), extended by the 10-backlog-rule
+        # addendum item 1: at least MIN_BACKLOG_BEFORE_ACTIVE_PROMOTION
+        # genuinely scored backlog candidates must exist, full stop, no
+        # exception - not counting the one being promoted here via
+        # backlog_candidate_id. The earlier grandfather clause exempting a
+        # hypothesis already active before this rule existed was a misreading
+        # of Jan's original, unambiguous instruction and is removed entirely,
+        # retroactively: an already-active hypothesis staying active on this
+        # update is gated exactly the same as a brand-new promotion - the only
+        # way through while the gate is unsatisfied is a genuinely resolving
+        # update (status='evaluated'/'buried', which makes effective_status
+        # something other than 'active' and skips this block entirely).
+        if effective_status == "active":
+            _promoting_candidate_id = patch.get("backlog_candidate_id", existing_record.get("backlog_candidate_id"))
+            _count = _scored_backlog_count(exclude_id=_promoting_candidate_id)
+            if _count < MIN_BACKLOG_BEFORE_ACTIVE_PROMOTION:
+                if prior_status != "active":
+                    return json.dumps({
+                        "error": f"only {_count} genuinely scored backlog candidates exist "
+                                 f"(need {MIN_BACKLOG_BEFORE_ACTIVE_PROMOTION} before promoting any hypothesis to "
+                                 "status='active') - write_backlog_candidate more candidates with real impact/"
+                                 "confidence/ease scores and grounding first, per Jan's explicit instruction"
+                    })
                 return json.dumps({
                     "error": f"only {_count} genuinely scored backlog candidates exist "
-                             f"(need {MIN_BACKLOG_BEFORE_ACTIVE_PROMOTION} before promoting any hypothesis to "
-                             "status='active') - write_backlog_candidate more candidates with real impact/"
-                             "confidence/ease scores and grounding first, per Jan's explicit instruction"
+                             f"(need {MIN_BACKLOG_BEFORE_ACTIVE_PROMOTION}) - no further progress on an "
+                             "already-active hypothesis is allowed either while this gate is unsatisfied "
+                             "(10-backlog-rule addendum: the earlier grandfather clause is removed, no "
+                             "exception) - resolve it now (status='evaluated'/'buried') or build more scored "
+                             "backlog candidates first"
                 })
-            return json.dumps({
-                "error": f"only {_count} genuinely scored backlog candidates exist "
-                         f"(need {MIN_BACKLOG_BEFORE_ACTIVE_PROMOTION}) - no further progress on an "
-                         "already-active hypothesis is allowed either while this gate is unsatisfied "
-                         "(10-backlog-rule addendum: the earlier grandfather clause is removed, no "
-                         "exception) - resolve it now (status='evaluated'/'buried') or build more scored "
-                         "backlog candidates first"
-            })
 
-    # Section 5: reasoning fields must be this hypothesis's own, not reused
-    # instruction/incident-template phrasing - checked before anything else
-    # touches these fields, so a copied field can't slip through via some
-    # other code path first.
-    for _echo_field in ("build_cost_reasoning", "defensibility_notes"):
-        if _echo_field in patch:
-            _echoed = _instruction_echo_match(patch[_echo_field])
-            if _echoed:
+        # Section 5: reasoning fields must be this hypothesis's own, not reused
+        # instruction/incident-template phrasing - checked before anything else
+        # touches these fields, so a copied field can't slip through via some
+        # other code path first.
+        for _echo_field in ("build_cost_reasoning", "defensibility_notes"):
+            if _echo_field in patch:
+                _echoed = _instruction_echo_match(patch[_echo_field])
+                if _echoed:
+                    return json.dumps({
+                        "error": f"{_echo_field} echoes known instruction/incident template language "
+                                 f"('{_echoed}') rather than this hypothesis's own reasoning - describe "
+                                 "what's actually specific to this hypothesis, don't reuse example wording"
+                    })
+
+        # Section 3: research plan required before evidence_stage='research'
+        # actually takes effect - the objective and confirming/disconfirming
+        # criteria, logged before research starts.
+        if effective_stage == "research" and prior_stage != "research":
+            _merged_plan = {**existing_record, **patch}
+            _missing_plan = {f for f in RESEARCH_PLAN_FIELDS if not (_merged_plan.get(f) or "").strip()}
+            if _missing_plan:
                 return json.dumps({
-                    "error": f"{_echo_field} echoes known instruction/incident template language "
-                             f"('{_echoed}') rather than this hypothesis's own reasoning - describe "
-                             "what's actually specific to this hypothesis, don't reuse example wording"
+                    "error": f"evidence_stage='research' requires the research plan fields first: "
+                             f"{sorted(_missing_plan)} - the specific question this research answers, and "
+                             "what counts as confirming vs. disconfirming evidence, logged before research starts"
                 })
 
-    # Section 3: research plan required before evidence_stage='research'
-    # actually takes effect - the objective and confirming/disconfirming
-    # criteria, logged before research starts.
-    if effective_stage == "research" and prior_stage != "research":
-        _merged_plan = {**existing_record, **patch}
-        _missing_plan = {f for f in RESEARCH_PLAN_FIELDS if not (_merged_plan.get(f) or "").strip()}
-        if _missing_plan:
+        # Section 4: crossing into community_engagement needs a real artifact,
+        # not just the claim the stage was "done".
+        if effective_stage == "community_engagement" and prior_stage not in ("community_engagement", *EVIDENCE_LATER_STAGES):
+            if not _has_real_community_engagement_artifact(patch["id"]) and not _has_approved_stage_skip(patch["id"], "community_engagement"):
+                return json.dumps({
+                    "error": "evidence_stage='community_engagement' requires a real posted (or "
+                             "approved-and-queued) thread_reply/own_question_post draft for this hypothesis "
+                             "first (draft_content) - or a Main-CEO-approved stage-skip request "
+                             "(file_stage_skip_request) if this genuinely doesn't apply here"
+                })
+
+        # Section 4: crossing into landing_page/build for the first time needs
+        # artifact-backed research AND community_engagement history, or a
+        # Main-CEO-reviewed stage-skip request - never a self-written excuse.
+        if effective_stage in EVIDENCE_LATER_STAGES and prior_stage not in EVIDENCE_LATER_STAGES:
+            _has_research = _has_substantive_research_artifact(patch["id"])
+            _has_engagement = _has_real_community_engagement_artifact(patch["id"])
+            if not (_has_research and _has_engagement) and not _has_approved_stage_skip(patch["id"], effective_stage):
+                _missing_bits = []
+                if not _has_research:
+                    _missing_bits.append("a substantive research_findings.jsonl entry (log_research_finding)")
+                if not _has_engagement:
+                    _missing_bits.append("a real posted/queued community_engagement draft (draft_content)")
+                return json.dumps({
+                    "error": f"evidence_stage='{effective_stage}' requires artifact-backed history first - "
+                             f"missing: {'; '.join(_missing_bits)}. If skipping genuinely applies here (e.g. "
+                             "research truly isn't relevant), file_stage_skip_request for the Main-CEO to "
+                             "review instead of setting this directly."
+                })
+
+        # AI-native economics addendum: whenever estimated_build_cost is being
+        # set (create or update), it must be justified - and justified more
+        # substantively the higher it goes above what a Dev-agent LLM build
+        # actually costs. Falls back to the existing record's own reasoning on
+        # an update that doesn't re-touch build_cost_reasoning, so a legitimate
+        # unrelated update isn't blocked by this.
+        effective_reasoning = (
+            patch["build_cost_reasoning"] if "build_cost_reasoning" in patch
+            else existing_record.get("build_cost_reasoning")
+        )
+        effective_reasoning = (effective_reasoning or "").strip()
+        if "estimated_build_cost" in patch:
+            if not effective_reasoning:
+                return json.dumps({
+                    "error": "estimated_build_cost requires a non-empty build_cost_reasoning - ground it in "
+                             "what this system actually pays (Dev-agent LLM calls + genuine recurring infra "
+                             "cost), never a human developer/agency/employee rate"
+                })
+            cost = patch["estimated_build_cost"]
+            if cost > SIMPLE_BUILD_COST_CEILING and len(effective_reasoning) < BUILD_COST_JUSTIFICATION_MIN_LENGTH:
+                return json.dumps({
+                    "error": f"estimated_build_cost of {cost} exceeds the ${SIMPLE_BUILD_COST_CEILING:.0f} "
+                             "sanity-check ceiling for a typical Dev-buildable artifact (landing page, signup "
+                             "form, small backend script/webhook) - token cost alone should land in the very "
+                             "low single digits here. Going higher needs a substantive build_cost_reasoning "
+                             f"(at least {BUILD_COST_JUSTIFICATION_MIN_LENGTH} chars) citing genuine additional "
+                             "token/iteration volume (more files, more integration points, more passes needed) "
+                             "- not 'it feels like it should cost more'"
+                })
+        effective_horizon = patch.get("break_even_horizon_months", existing_record.get("break_even_horizon_months"))
+        if effective_horizon is not None and effective_horizon > 1 and not effective_reasoning:
             return json.dumps({
-                "error": f"evidence_stage='research' requires the research plan fields first: "
-                         f"{sorted(_missing_plan)} - the specific question this research answers, and "
-                         "what counts as confirming vs. disconfirming evidence, logged before research starts"
+                "error": "break_even_horizon_months > 1 requires a non-empty build_cost_reasoning explaining "
+                         "why (e.g. real recurring infra cost) - default to 1 month unless there's a concrete "
+                         "reason, builds are cheap enough here that a validated idea should pay for itself fast"
             })
 
-    # Section 4: crossing into community_engagement needs a real artifact,
-    # not just the claim the stage was "done".
-    if effective_stage == "community_engagement" and prior_stage not in ("community_engagement", *EVIDENCE_LATER_STAGES):
-        if not _has_real_community_engagement_artifact(patch["id"]) and not _has_approved_stage_skip(patch["id"], "community_engagement"):
-            return json.dumps({
-                "error": "evidence_stage='community_engagement' requires a real posted (or "
-                         "approved-and-queued) thread_reply/own_question_post draft for this hypothesis "
-                         "first (draft_content) - or a Main-CEO-approved stage-skip request "
-                         "(file_stage_skip_request) if this genuinely doesn't apply here"
-            })
+        # Section 2: economics only load-bearing (required) once the final
+        # state is landing_page/build - a one-way door with real cost/
+        # commitment. Checked against the full merged state, not just this
+        # patch's own keys, so economics set on an earlier update aren't
+        # demanded again on an unrelated later one.
+        if effective_stage in EVIDENCE_LATER_STAGES:
+            _merged_econ = {**existing_record, **patch}
+            _missing_econ = {f for f in STAGE_GATED_ECONOMICS_FIELDS if _merged_econ.get(f) is None}
+            if _missing_econ:
+                return json.dumps({
+                    "error": f"evidence_stage='{effective_stage}' requires real economics now: "
+                             f"{sorted(_missing_econ)} - this is a one-way door, the numbers backing it must "
+                             "be precise and evidence-grounded, not a rough_economics_note guess anymore"
+                })
+            # Competitor-research addendum: defensibility_grounding must point
+            # at a real record (typically a knowledge_base competitor-scan
+            # entry from write_knowledge_entry(topic='competitor scan', ...) -
+            # same id universe/helper as backlog ICE sub-score grounding, not a
+            # second parallel existence check.
+            _defensibility_grounding = _merged_econ.get("defensibility_grounding")
+            if not _backlog_grounding_exists(_defensibility_grounding):
+                return json.dumps({
+                    "error": f"defensibility_grounding '{_defensibility_grounding}' is not a real "
+                             "research_finding/knowledge_base/channel/approval id from this subsidiary's "
+                             "current data - defensibility_notes must be grounded in an actual competitor "
+                             "scan (write_knowledge_entry(topic='competitor scan', ...)), not general reasoning"
+                })
 
-    # Section 4: crossing into landing_page/build for the first time needs
-    # artifact-backed research AND community_engagement history, or a
-    # Main-CEO-reviewed stage-skip request - never a self-written excuse.
-    if effective_stage in EVIDENCE_LATER_STAGES and prior_stage not in EVIDENCE_LATER_STAGES:
-        _has_research = _has_substantive_research_artifact(patch["id"])
-        _has_engagement = _has_real_community_engagement_artifact(patch["id"])
-        if not (_has_research and _has_engagement) and not _has_approved_stage_skip(patch["id"], effective_stage):
-            _missing_bits = []
-            if not _has_research:
-                _missing_bits.append("a substantive research_findings.jsonl entry (log_research_finding)")
-            if not _has_engagement:
-                _missing_bits.append("a real posted/queued community_engagement draft (draft_content)")
-            return json.dumps({
-                "error": f"evidence_stage='{effective_stage}' requires artifact-backed history first - "
-                         f"missing: {'; '.join(_missing_bits)}. If skipping genuinely applies here (e.g. "
-                         "research truly isn't relevant), file_stage_skip_request for the Main-CEO to "
-                         "review instead of setting this directly."
-            })
-
-    # AI-native economics addendum: whenever estimated_build_cost is being
-    # set (create or update), it must be justified - and justified more
-    # substantively the higher it goes above what a Dev-agent LLM build
-    # actually costs. Falls back to the existing record's own reasoning on
-    # an update that doesn't re-touch build_cost_reasoning, so a legitimate
-    # unrelated update isn't blocked by this.
-    effective_reasoning = (
-        patch["build_cost_reasoning"] if "build_cost_reasoning" in patch
-        else existing_record.get("build_cost_reasoning")
-    )
-    effective_reasoning = (effective_reasoning or "").strip()
-    if "estimated_build_cost" in patch:
-        if not effective_reasoning:
-            return json.dumps({
-                "error": "estimated_build_cost requires a non-empty build_cost_reasoning - ground it in "
-                         "what this system actually pays (Dev-agent LLM calls + genuine recurring infra "
-                         "cost), never a human developer/agency/employee rate"
-            })
-        cost = patch["estimated_build_cost"]
-        if cost > SIMPLE_BUILD_COST_CEILING and len(effective_reasoning) < BUILD_COST_JUSTIFICATION_MIN_LENGTH:
-            return json.dumps({
-                "error": f"estimated_build_cost of {cost} exceeds the ${SIMPLE_BUILD_COST_CEILING:.0f} "
-                         "sanity-check ceiling for a typical Dev-buildable artifact (landing page, signup "
-                         "form, small backend script/webhook) - token cost alone should land in the very "
-                         "low single digits here. Going higher needs a substantive build_cost_reasoning "
-                         f"(at least {BUILD_COST_JUSTIFICATION_MIN_LENGTH} chars) citing genuine additional "
-                         "token/iteration volume (more files, more integration points, more passes needed) "
-                         "- not 'it feels like it should cost more'"
-            })
-    effective_horizon = patch.get("break_even_horizon_months", existing_record.get("break_even_horizon_months"))
-    if effective_horizon is not None and effective_horizon > 1 and not effective_reasoning:
-        return json.dumps({
-            "error": "break_even_horizon_months > 1 requires a non-empty build_cost_reasoning explaining "
-                     "why (e.g. real recurring infra cost) - default to 1 month unless there's a concrete "
-                     "reason, builds are cheap enough here that a validated idea should pay for itself fast"
-        })
-
-    # Section 2: economics only load-bearing (required) once the final
-    # state is landing_page/build - a one-way door with real cost/
-    # commitment. Checked against the full merged state, not just this
-    # patch's own keys, so economics set on an earlier update aren't
-    # demanded again on an unrelated later one.
-    if effective_stage in EVIDENCE_LATER_STAGES:
-        _merged_econ = {**existing_record, **patch}
-        _missing_econ = {f for f in STAGE_GATED_ECONOMICS_FIELDS if _merged_econ.get(f) is None}
-        if _missing_econ:
-            return json.dumps({
-                "error": f"evidence_stage='{effective_stage}' requires real economics now: "
-                         f"{sorted(_missing_econ)} - this is a one-way door, the numbers backing it must "
-                         "be precise and evidence-grounded, not a rough_economics_note guess anymore"
-            })
-        # Competitor-research addendum: defensibility_grounding must point
-        # at a real record (typically a knowledge_base competitor-scan
-        # entry from write_knowledge_entry(topic='competitor scan', ...) -
-        # same id universe/helper as backlog ICE sub-score grounding, not a
-        # second parallel existence check.
-        _defensibility_grounding = _merged_econ.get("defensibility_grounding")
-        if not _backlog_grounding_exists(_defensibility_grounding):
-            return json.dumps({
-                "error": f"defensibility_grounding '{_defensibility_grounding}' is not a real "
-                         "research_finding/knowledge_base/channel/approval id from this subsidiary's "
-                         "current data - defensibility_notes must be grounded in an actual competitor "
-                         "scan (write_knowledge_entry(topic='competitor scan', ...)), not general reasoning"
-            })
-
-    # Section 6: duration-cap policy, board-set via Telegram confirmation
-    # (see DEFAULT_PROPOSED_DURATION_CAPS) - only enforced once
-    # status=='confirmed', never a silently-active default. Anything over
-    # the confirmed ceiling for this stage still goes through the existing
-    # approval queue (duration_extension_approval_id pointing at an
-    # approved request_approval) - the escalation path itself doesn't
-    # change, only the source of the ceiling number does.
-    effective_duration = patch.get("duration_days", existing_record.get("duration_days"))
-    if effective_duration is not None and effective_stage:
-        _duration_policy = _read_own_policies().get("max_duration_days_by_stage") or {}
-        if _duration_policy.get("status") == "confirmed":
-            _ceiling = (_duration_policy.get("values") or {}).get(effective_stage)
-            if _ceiling is not None and effective_duration > _ceiling:
-                _ext_approval_id = patch.get(
-                    "duration_extension_approval_id", existing_record.get("duration_extension_approval_id")
-                )
-                _ext_approval = None
-                if _ext_approval_id:
-                    _ext_approval = next(
-                        (a for a in _read_global_jsonl("approval_queue.jsonl") if a.get("id") == _ext_approval_id), None
+        # Section 6: duration-cap policy, board-set via Telegram confirmation
+        # (see DEFAULT_PROPOSED_DURATION_CAPS) - only enforced once
+        # status=='confirmed', never a silently-active default. Anything over
+        # the confirmed ceiling for this stage still goes through the existing
+        # approval queue (duration_extension_approval_id pointing at an
+        # approved request_approval) - the escalation path itself doesn't
+        # change, only the source of the ceiling number does.
+        effective_duration = patch.get("duration_days", existing_record.get("duration_days"))
+        if effective_duration is not None and effective_stage:
+            _duration_policy = _read_own_policies().get("max_duration_days_by_stage") or {}
+            if _duration_policy.get("status") == "confirmed":
+                _ceiling = (_duration_policy.get("values") or {}).get(effective_stage)
+                if _ceiling is not None and effective_duration > _ceiling:
+                    _ext_approval_id = patch.get(
+                        "duration_extension_approval_id", existing_record.get("duration_extension_approval_id")
                     )
-                if not _ext_approval or _ext_approval.get("status") != "approved":
-                    return json.dumps({
-                        "error": f"duration_days={effective_duration} exceeds the confirmed policy ceiling "
-                                 f"({_ceiling} days) for evidence_stage='{effective_stage}' - shorten it, or "
-                                 "pass duration_extension_approval_id pointing at an approved request_approval"
-                    })
+                    _ext_approval = None
+                    if _ext_approval_id:
+                        _ext_approval = next(
+                            (a for a in _read_global_jsonl("approval_queue.jsonl") if a.get("id") == _ext_approval_id), None
+                        )
+                    if not _ext_approval or _ext_approval.get("status") != "approved":
+                        return json.dumps({
+                            "error": f"duration_days={effective_duration} exceeds the confirmed policy ceiling "
+                                     f"({_ceiling} days) for evidence_stage='{effective_stage}' - shorten it, or "
+                                     "pass duration_extension_approval_id pointing at an approved request_approval"
+                        })
 
-    if existing_index is None:
-        missing = BASE_REQUIRED_HYPOTHESIS_FIELDS - patch.keys()
-        if missing:
-            return json.dumps({"error": f"new hypothesis missing required fields: {sorted(missing)}"})
-        prior_id = patch.get("prior_hypothesis_id")
-        if prior_id:
-            prior = next((h for h in hyps if h.get("id") == prior_id), None)
-            if prior is not None and prior.get("outcome") == "pivot":
-                if patch.get("pivot_variable_changed") not in PIVOT_VARIABLES:
-                    return json.dumps({
-                        "error": "this hypothesis follows a 'pivot' outcome - pivot_variable_changed "
-                                 f"must be one of {sorted(PIVOT_VARIABLES)} (exactly one identified variable)"
-                    })
-                if not (patch.get("pivot_reasoning") or "").strip():
-                    return json.dumps({"error": "this hypothesis follows a 'pivot' outcome - pivot_reasoning is required"})
-        else:
-            # First attempt (including the very first hypothesis ever) -
-            # the one-variable rule applies here too, not just to pivots
-            # (four-fixes addendum, point 2). No prior to diff against, so
-            # this is a self-declared "what am I actually isolating" field
-            # rather than something mechanically diffable, same trust model
-            # as pivot_variable_changed above.
-            if patch.get("primary_variable_tested") not in PIVOT_VARIABLES:
-                return json.dumps({
-                    "error": "a first-attempt hypothesis (no prior_hypothesis_id) requires "
-                             f"primary_variable_tested, one of {sorted(PIVOT_VARIABLES)} - name the one "
-                             "untested assumption this test isolates; don't bundle more than one "
-                             "genuinely untested variable into a single first test"
-                })
-        if patch.get("status", "active") == "active":
-            active_count = sum(1 for h in hyps if h.get("status") == "active")
-            if active_count >= MAX_ACTIVE_HYPOTHESES:
-                return json.dumps({
-                    "error": f"{active_count} hypotheses are already status='active' "
-                             f"(max {MAX_ACTIVE_HYPOTHESES}) - rank candidate ideas by impact_score/"
-                             "confidence_score and the economics/defensibility/channel-fit reasoning "
-                             "already captured per hypothesis, same Bullseye logic as the channel cap, "
-                             "and only write the highest-priority one(s); move a hypothesis to "
-                             "'evaluated'/'buried' first to free capacity"
-                })
-            channel_record = next(
-                (c for c in _read_jsonl("channels.jsonl") if c.get("id") == patch["channel"]), None
-            )
-            if channel_record is None or channel_record.get("status") != "testing":
-                return json.dumps({
-                    "error": f"channel '{patch['channel']}' is not currently status='testing' in the "
-                             "roster - call read_channels()/write_channel() to run the Bullseye "
-                             "channel-selection step and promote it first"
-                })
-            active_same_variant = [
-                h for h in hyps
-                if h.get("status") == "active" and h.get("landing_page_variant_id") == patch["landing_page_variant_id"]
-            ]
-            if len(active_same_variant) >= 2:
-                return json.dumps({
-                    "error": f"parallelism limit reached for variant {patch['landing_page_variant_id']} "
-                             f"({len(active_same_variant)} active already, max 2)"
-                })
-        record = {
-            "created_at": datetime.now(timezone.utc).isoformat(),
-            "status": "active",
-            "interim_proxy": True,
-            "measured": {"conversions": 0, "reach_estimate": None, "reach_source": None},
-            "score": None,
-            "outcome": None,
-            "prior_hypothesis_id": None,
-            "prior_score": None,
-            "extension_used": False,
-            "next_step": None,
-            "landing_page_live": False,
-            "defensibility_notes": None,
-            "defensibility_grounding": None,
-            "pricing_tier_reasoning": None,
-            "expansion_notes": None,
-            "channel_fit_reasoning": None,
-            "sample_size_trigger": None,
-            "primary_variable_tested": None,
-            "holding_constant_notes": None,
-            "evidence_stage": None,
-            "payment_intent_approval_id": None,
-            # Economics: no longer unconditionally required at create time
-            # (section 2) - explicit None defaults so the keys are always
-            # present for a reader, even at research/community_engagement
-            # where they're genuinely not known yet.
-            "estimated_build_cost": None,
-            "price_point_monthly": None,
-            "break_even_horizon_months": None,
-            "break_even_users": None,
-            "build_cost_reasoning": None,
-            "rough_economics_note": None,
-            "research_objective": None,
-            "research_confirming_criteria": None,
-            "research_disconfirming_criteria": None,
-            **patch,
-        }
-        hyps.append(record)
-    else:
-        merged = dict(hyps[existing_index])
-        for key, value in patch.items():
-            if key == "measured" and isinstance(value, dict) and isinstance(merged.get("measured"), dict):
-                merged["measured"] = {**merged["measured"], **value}
+        if existing_index is None:
+            missing = BASE_REQUIRED_HYPOTHESIS_FIELDS - patch.keys()
+            if missing:
+                return json.dumps({"error": f"new hypothesis missing required fields: {sorted(missing)}"})
+            prior_id = patch.get("prior_hypothesis_id")
+            if prior_id:
+                prior = next((h for h in hyps if h.get("id") == prior_id), None)
+                if prior is not None and prior.get("outcome") == "pivot":
+                    if patch.get("pivot_variable_changed") not in PIVOT_VARIABLES:
+                        return json.dumps({
+                            "error": "this hypothesis follows a 'pivot' outcome - pivot_variable_changed "
+                                     f"must be one of {sorted(PIVOT_VARIABLES)} (exactly one identified variable)"
+                        })
+                    if not (patch.get("pivot_reasoning") or "").strip():
+                        return json.dumps({"error": "this hypothesis follows a 'pivot' outcome - pivot_reasoning is required"})
             else:
-                merged[key] = value
-        hyps[existing_index] = merged
+                # First attempt (including the very first hypothesis ever) -
+                # the one-variable rule applies here too, not just to pivots
+                # (four-fixes addendum, point 2). No prior to diff against, so
+                # this is a self-declared "what am I actually isolating" field
+                # rather than something mechanically diffable, same trust model
+                # as pivot_variable_changed above.
+                if patch.get("primary_variable_tested") not in PIVOT_VARIABLES:
+                    return json.dumps({
+                        "error": "a first-attempt hypothesis (no prior_hypothesis_id) requires "
+                                 f"primary_variable_tested, one of {sorted(PIVOT_VARIABLES)} - name the one "
+                                 "untested assumption this test isolates; don't bundle more than one "
+                                 "genuinely untested variable into a single first test"
+                    })
+            if patch.get("status", "active") == "active":
+                active_count = sum(1 for h in hyps if h.get("status") == "active")
+                if active_count >= MAX_ACTIVE_HYPOTHESES:
+                    return json.dumps({
+                        "error": f"{active_count} hypotheses are already status='active' "
+                                 f"(max {MAX_ACTIVE_HYPOTHESES}) - rank candidate ideas by impact_score/"
+                                 "confidence_score and the economics/defensibility/channel-fit reasoning "
+                                 "already captured per hypothesis, same Bullseye logic as the channel cap, "
+                                 "and only write the highest-priority one(s); move a hypothesis to "
+                                 "'evaluated'/'buried' first to free capacity"
+                    })
+                channel_record = next(
+                    (c for c in _read_jsonl("channels.jsonl") if c.get("id") == patch["channel"]), None
+                )
+                if channel_record is None or channel_record.get("status") != "testing":
+                    return json.dumps({
+                        "error": f"channel '{patch['channel']}' is not currently status='testing' in the "
+                                 "roster - call read_channels()/write_channel() to run the Bullseye "
+                                 "channel-selection step and promote it first"
+                    })
+                active_same_variant = [
+                    h for h in hyps
+                    if h.get("status") == "active" and h.get("landing_page_variant_id") == patch["landing_page_variant_id"]
+                ]
+                if len(active_same_variant) >= 2:
+                    return json.dumps({
+                        "error": f"parallelism limit reached for variant {patch['landing_page_variant_id']} "
+                                 f"({len(active_same_variant)} active already, max 2)"
+                    })
+            record = {
+                "created_at": datetime.now(timezone.utc).isoformat(),
+                "status": "active",
+                "interim_proxy": True,
+                "measured": {"conversions": 0, "reach_estimate": None, "reach_source": None},
+                "score": None,
+                "outcome": None,
+                "prior_hypothesis_id": None,
+                "prior_score": None,
+                "extension_used": False,
+                "next_step": None,
+                "landing_page_live": False,
+                "defensibility_notes": None,
+                "defensibility_grounding": None,
+                "pricing_tier_reasoning": None,
+                "expansion_notes": None,
+                "channel_fit_reasoning": None,
+                "sample_size_trigger": None,
+                "primary_variable_tested": None,
+                "holding_constant_notes": None,
+                "evidence_stage": None,
+                "payment_intent_approval_id": None,
+                # Economics: no longer unconditionally required at create time
+                # (section 2) - explicit None defaults so the keys are always
+                # present for a reader, even at research/community_engagement
+                # where they're genuinely not known yet.
+                "estimated_build_cost": None,
+                "price_point_monthly": None,
+                "break_even_horizon_months": None,
+                "break_even_users": None,
+                "build_cost_reasoning": None,
+                "rough_economics_note": None,
+                "research_objective": None,
+                "research_confirming_criteria": None,
+                "research_disconfirming_criteria": None,
+                **patch,
+            }
+            hyps.append(record)
+        else:
+            merged = dict(hyps[existing_index])
+            for key, value in patch.items():
+                if key == "measured" and isinstance(value, dict) and isinstance(merged.get("measured"), dict):
+                    merged["measured"] = {**merged["measured"], **value}
+                else:
+                    merged[key] = value
+            hyps[existing_index] = merged
 
-    _write_jsonl("hypotheses.jsonl", hyps)
+        _write_jsonl("hypotheses.jsonl", hyps)
 
     # 2026-08-11 fix: closing orphaned task orders tied to a buried
     # hypothesis used to depend entirely on an LLM instruction (task_ceo's
@@ -1679,15 +1689,16 @@ def write_hypothesis(hypothesis: str) -> str:
     final_status = (record if existing_index is None else merged).get("status")
     orders_auto_closed = 0
     if final_status == "buried":
-        orders = _read_jsonl("task_orders.jsonl")
-        for o in orders:
-            if o.get("hypothesis_id") == patch["id"] and o.get("status") == "open":
-                o["status"] = "done"
-                o["result"] = f"auto-cancelled - hypothesis '{patch['id']}' was buried"
-                o["completed_at"] = datetime.now(timezone.utc).isoformat()
-                orders_auto_closed += 1
-        if orders_auto_closed:
-            _write_jsonl("task_orders.jsonl", orders)
+        with _jsonl_lock("task_orders.jsonl"):
+            orders = _read_jsonl("task_orders.jsonl")
+            for o in orders:
+                if o.get("hypothesis_id") == patch["id"] and o.get("status") == "open":
+                    o["status"] = "done"
+                    o["result"] = f"auto-cancelled - hypothesis '{patch['id']}' was buried"
+                    o["completed_at"] = datetime.now(timezone.utc).isoformat()
+                    orders_auto_closed += 1
+            if orders_auto_closed:
+                _write_jsonl("task_orders.jsonl", orders)
 
     response = {"ok": True, "id": patch["id"]}
     if orders_auto_closed:
@@ -1955,84 +1966,90 @@ def write_backlog_candidate(candidate: str) -> str:
             "error": f"invalid ease_target_stage '{patch['ease_target_stage']}', must be one of {EVIDENCE_STAGES}"
         })
 
-    backlog = _read_jsonl("hypothesis_backlog.jsonl")
-    existing_index = next((i for i, c in enumerate(backlog) if c.get("id") == patch["id"]), None)
-    existing_record = backlog[existing_index] if existing_index is not None else {}
-    merged_for_checks = {**existing_record, **patch}
+    # Held across the whole read->mutate->write span, not just the write:
+    # crewai can run several write_backlog_candidate calls from one LLM
+    # turn concurrently, and two racing calls that both read before either
+    # writes would otherwise silently discard all but the last writer's
+    # candidate (see jsonl_store.locked()).
+    with _jsonl_lock("hypothesis_backlog.jsonl"):
+        backlog = _read_jsonl("hypothesis_backlog.jsonl")
+        existing_index = next((i for i, c in enumerate(backlog) if c.get("id") == patch["id"]), None)
+        existing_record = backlog[existing_index] if existing_index is not None else {}
+        merged_for_checks = {**existing_record, **patch}
 
-    if merged_for_checks.get("status") == "shelved" and not (merged_for_checks.get("shelved_reasoning") or "").strip():
-        return json.dumps({"error": "status='shelved' requires a non-empty shelved_reasoning"})
+        if merged_for_checks.get("status") == "shelved" and not (merged_for_checks.get("shelved_reasoning") or "").strip():
+            return json.dumps({"error": "status='shelved' requires a non-empty shelved_reasoning"})
 
-    fit = merged_for_checks.get("fits_subsidiary_scope")
-    if fit in ("no", "unclear") and not (merged_for_checks.get("fits_subsidiary_scope_reasoning") or "").strip():
-        return json.dumps({
-            "error": f"fits_subsidiary_scope='{fit}' requires a non-empty fits_subsidiary_scope_reasoning - "
-                     "this is what the Main-CEO reviews via propose_idea, say plainly why it might not fit"
-        })
-
-    if existing_index is None:
-        statement = (patch.get("statement") or "").strip()
-        if len(statement) < BACKLOG_STATEMENT_MIN_LENGTH:
+        fit = merged_for_checks.get("fits_subsidiary_scope")
+        if fit in ("no", "unclear") and not (merged_for_checks.get("fits_subsidiary_scope_reasoning") or "").strip():
             return json.dumps({
-                "error": f"statement must be at least {BACKLOG_STATEMENT_MIN_LENGTH} characters - a real, "
-                         "specific starting rationale, not a one-line stub"
+                "error": f"fits_subsidiary_scope='{fit}' requires a non-empty fits_subsidiary_scope_reasoning - "
+                         "this is what the Main-CEO reviews via propose_idea, say plainly why it might not fit"
             })
-        if _instruction_echo_match(statement):
-            return json.dumps({
-                "error": "statement echoes known instruction/incident template language rather than this "
-                         "subsidiary's own reasoning - describe what's actually specific to this candidate"
-            })
-        missing = {"statement", "source", "fits_subsidiary_scope"} - patch.keys()
-        if missing:
-            return json.dumps({"error": f"new backlog candidate missing required fields: {sorted(missing)}"})
+
+        if existing_index is None:
+            statement = (patch.get("statement") or "").strip()
+            if len(statement) < BACKLOG_STATEMENT_MIN_LENGTH:
+                return json.dumps({
+                    "error": f"statement must be at least {BACKLOG_STATEMENT_MIN_LENGTH} characters - a real, "
+                             "specific starting rationale, not a one-line stub"
+                })
+            if _instruction_echo_match(statement):
+                return json.dumps({
+                    "error": "statement echoes known instruction/incident template language rather than this "
+                             "subsidiary's own reasoning - describe what's actually specific to this candidate"
+                })
+            missing = {"statement", "source", "fits_subsidiary_scope"} - patch.keys()
+            if missing:
+                return json.dumps({"error": f"new backlog candidate missing required fields: {sorted(missing)}"})
+            for score_field, grounding_field in (
+                ("impact", "impact_grounding"), ("confidence", "confidence_grounding"), ("ease", "ease_grounding"),
+            ):
+                if score_field not in patch or grounding_field not in patch:
+                    return json.dumps({
+                        "error": f"new backlog candidate requires both '{score_field}' and '{grounding_field}' - "
+                                 "every ICE sub-score must cite a real reason, never an unsupported number"
+                    })
+
         for score_field, grounding_field in (
             ("impact", "impact_grounding"), ("confidence", "confidence_grounding"), ("ease", "ease_grounding"),
         ):
-            if score_field not in patch or grounding_field not in patch:
-                return json.dumps({
-                    "error": f"new backlog candidate requires both '{score_field}' and '{grounding_field}' - "
-                             "every ICE sub-score must cite a real reason, never an unsupported number"
-                })
+            if score_field in patch:
+                score_value = patch[score_field]
+                if not (ICE_SUB_SCORE_MIN <= score_value <= ICE_SUB_SCORE_MAX):
+                    return json.dumps({
+                        "error": f"{score_field} must be between {ICE_SUB_SCORE_MIN} and {ICE_SUB_SCORE_MAX}, "
+                                 f"got {score_value}"
+                    })
+                grounding = patch.get(grounding_field, existing_record.get(grounding_field))
+                if not _backlog_grounding_exists(grounding):
+                    return json.dumps({
+                        "error": f"{grounding_field} '{grounding}' is not a real research_finding/knowledge_base/"
+                                 "channel/approval id from this subsidiary's current data - an unsupported "
+                                 "number isn't accepted"
+                    })
 
-    for score_field, grounding_field in (
-        ("impact", "impact_grounding"), ("confidence", "confidence_grounding"), ("ease", "ease_grounding"),
-    ):
-        if score_field in patch:
-            score_value = patch[score_field]
-            if not (ICE_SUB_SCORE_MIN <= score_value <= ICE_SUB_SCORE_MAX):
-                return json.dumps({
-                    "error": f"{score_field} must be between {ICE_SUB_SCORE_MIN} and {ICE_SUB_SCORE_MAX}, "
-                             f"got {score_value}"
-                })
-            grounding = patch.get(grounding_field, existing_record.get(grounding_field))
-            if not _backlog_grounding_exists(grounding):
-                return json.dumps({
-                    "error": f"{grounding_field} '{grounding}' is not a real research_finding/knowledge_base/"
-                             "channel/approval id from this subsidiary's current data - an unsupported "
-                             "number isn't accepted"
-                })
+        if "impact" in patch or "impact_grounding" in patch:
+            patch["impact_scored_under_direction_id"] = _current_strategic_direction_id()
 
-    if "impact" in patch or "impact_grounding" in patch:
-        patch["impact_scored_under_direction_id"] = _current_strategic_direction_id()
+        if existing_index is None:
+            record = {
+                "created_at": datetime.now(timezone.utc).isoformat(),
+                "status": "candidate",
+                "fits_subsidiary_scope_reasoning": None,
+                "ease_target_stage": None,
+                "promoted_to_hypothesis_id": None,
+                "shelved_reasoning": None,
+                "impact_scored_under_direction_id": _current_strategic_direction_id(),
+                **patch,
+            }
+            backlog.append(record)
+        else:
+            merged = dict(backlog[existing_index])
+            merged.update(patch)
+            backlog[existing_index] = merged
 
-    if existing_index is None:
-        record = {
-            "created_at": datetime.now(timezone.utc).isoformat(),
-            "status": "candidate",
-            "fits_subsidiary_scope_reasoning": None,
-            "ease_target_stage": None,
-            "promoted_to_hypothesis_id": None,
-            "shelved_reasoning": None,
-            "impact_scored_under_direction_id": _current_strategic_direction_id(),
-            **patch,
-        }
-        backlog.append(record)
-    else:
-        merged = dict(backlog[existing_index])
-        merged.update(patch)
-        backlog[existing_index] = merged
-
-    _write_jsonl("hypothesis_backlog.jsonl", backlog)
+        _write_jsonl("hypothesis_backlog.jsonl", backlog)
     return json.dumps({"ok": True, "id": patch["id"]})
 
 
@@ -2248,16 +2265,19 @@ def complete_task_order(order_id: str, result: str) -> str:
     via status reports, the Main-CEO) actually reads back, not a summary of
     the summary.
     """
-    orders = _read_jsonl("task_orders.jsonl")
-    idx = next((i for i, o in enumerate(orders) if o.get("id") == order_id), None)
-    if idx is None:
-        return json.dumps({"error": f"no task order with id '{order_id}'"})
-    if orders[idx].get("status") == "done":
-        return json.dumps({"error": f"'{order_id}' is already marked done, not overwriting its result"})
-    orders[idx]["status"] = "done"
-    orders[idx]["result"] = result
-    orders[idx]["completed_at"] = datetime.now(timezone.utc).isoformat()
-    _write_jsonl("task_orders.jsonl", orders)
+    # See write_backlog_candidate's comment: Dev/Growth close out several
+    # orders per turn, and crewai can run those calls concurrently.
+    with _jsonl_lock("task_orders.jsonl"):
+        orders = _read_jsonl("task_orders.jsonl")
+        idx = next((i for i, o in enumerate(orders) if o.get("id") == order_id), None)
+        if idx is None:
+            return json.dumps({"error": f"no task order with id '{order_id}'"})
+        if orders[idx].get("status") == "done":
+            return json.dumps({"error": f"'{order_id}' is already marked done, not overwriting its result"})
+        orders[idx]["status"] = "done"
+        orders[idx]["result"] = result
+        orders[idx]["completed_at"] = datetime.now(timezone.utc).isoformat()
+        _write_jsonl("task_orders.jsonl", orders)
     return json.dumps({"ok": True, "id": order_id})
 
 
@@ -2328,97 +2348,103 @@ def write_channel(channel: str, reason: str = "") -> str:
             "error": f"invalid status '{patch['status']}', must be one of {sorted(CHANNEL_STATUSES)}"
         })
 
-    channels = _read_jsonl("channels.jsonl")
-    existing_index = next((i for i, c in enumerate(channels) if c.get("id") == patch["id"]), None)
-    now = datetime.now(timezone.utc).isoformat()
+    # See write_backlog_candidate's comment: crewai can run several
+    # write_channel calls from one turn concurrently, so the whole
+    # read->mutate->write span (including the name-collision and
+    # testing-cap checks below, which depend on the current roster) must
+    # be inside one lock, not just the final write.
+    with _jsonl_lock("channels.jsonl"):
+        channels = _read_jsonl("channels.jsonl")
+        existing_index = next((i for i, c in enumerate(channels) if c.get("id") == patch["id"]), None)
+        now = datetime.now(timezone.utc).isoformat()
 
-    if existing_index is None:
-        if len(channels) >= MAX_TOTAL_CHANNELS:
-            return json.dumps({
-                "error": f"roster already has {len(channels)} channels (max {MAX_TOTAL_CHANNELS}) - "
-                         "work with the existing candidates (read_channels) instead of brainstorming "
-                         "more; if this is a retry after an earlier error, the roster from that "
-                         "earlier attempt is very likely already there"
-            })
-        missing = REQUIRED_CHANNEL_FIELDS - patch.keys()
-        if missing:
-            return json.dumps({"error": f"new channel missing required fields: {sorted(missing)}"})
-        name_norm = patch["name"].strip().casefold()
-        name_match = next(
-            (c for c in channels if (c.get("name") or "").strip().casefold() == name_norm), None,
-        )
-        if name_match is not None:
-            return json.dumps({
-                "error": f"a channel named '{patch['name']}' already exists as id "
-                         f"'{name_match.get('id')}' (status={name_match.get('status')}) - call "
-                         f"read_channels() and update that id instead of creating a near-duplicate "
-                         "under a new one; if you already wrote this channel earlier in this same "
-                         "run, this is that same call landing twice, not a new channel"
-            })
-        old_status = None
-        record = {
-            "created_at": now,
-            "cost_to_test_usd": None,
-            "metrics_channel": None,
-            "notes": "",
-            "approved_request_id": None,
-            "status_history": [],
-            **patch,
-        }
-        record["status"] = patch.get("status", "not_tested")
-    else:
-        old = channels[existing_index]
-        old_status = old.get("status")
-        if "status" in patch and patch["status"] != old_status and not reason.strip():
-            return json.dumps({
-                "error": "changing an existing channel's status requires a non-empty reason "
-                         "(audit trail for channel swaps)"
-            })
-        record = {**old, **patch}
-        record.setdefault("status", old_status)
-
-    record["updated_at"] = now
-    target_status = record["status"]
-
-    if target_status == "testing":
-        other_testing = [c for c in channels if c.get("status") == "testing" and c.get("id") != patch["id"]]
-        if len(other_testing) >= MAX_CHANNELS_TESTING:
-            return json.dumps({
-                "error": f"testing cap reached ({len(other_testing)} channels already testing, "
-                         f"max {MAX_CHANNELS_TESTING}) - move one to bench/retired first, or hold off"
-            })
-        if record.get("is_paid"):
-            if not _read_own_policies().get("paid_channels_allowed"):
+        if existing_index is None:
+            if len(channels) >= MAX_TOTAL_CHANNELS:
                 return json.dumps({
-                    "error": "this subsidiary's policies have paid_channels_allowed=false - a paid "
-                             "channel cannot move to status='testing' at all right now. This is a "
-                             "Main-CEO-level setting (update_subsidiary_policies), not something to "
-                             "work around here - use an organic channel instead or escalate via "
-                             "file_cross_subsidiary_request if you think the policy should change."
+                    "error": f"roster already has {len(channels)} channels (max {MAX_TOTAL_CHANNELS}) - "
+                             "work with the existing candidates (read_channels) instead of brainstorming "
+                             "more; if this is a retry after an earlier error, the roster from that "
+                             "earlier attempt is very likely already there"
                 })
-            approved_request_id = record.get("approved_request_id")
-            approval = None
-            if approved_request_id:
-                approvals = _read_global_jsonl("approval_queue.jsonl")
-                approval = next((a for a in approvals if a.get("id") == approved_request_id), None)
-            if not approval or approval.get("status") != "approved" or approval.get("category") != "spend":
+            missing = REQUIRED_CHANNEL_FIELDS - patch.keys()
+            if missing:
+                return json.dumps({"error": f"new channel missing required fields: {sorted(missing)}"})
+            name_norm = patch["name"].strip().casefold()
+            name_match = next(
+                (c for c in channels if (c.get("name") or "").strip().casefold() == name_norm), None,
+            )
+            if name_match is not None:
                 return json.dumps({
-                    "error": "paid channel cannot move to status='testing' without approved_request_id "
-                             "pointing at an approved, category='spend' entry in the approval queue - "
-                             "file request_approval first, get it approved, then pass its id here"
+                    "error": f"a channel named '{patch['name']}' already exists as id "
+                             f"'{name_match.get('id')}' (status={name_match.get('status')}) - call "
+                             f"read_channels() and update that id instead of creating a near-duplicate "
+                             "under a new one; if you already wrote this channel earlier in this same "
+                             "run, this is that same call landing twice, not a new channel"
                 })
+            old_status = None
+            record = {
+                "created_at": now,
+                "cost_to_test_usd": None,
+                "metrics_channel": None,
+                "notes": "",
+                "approved_request_id": None,
+                "status_history": [],
+                **patch,
+            }
+            record["status"] = patch.get("status", "not_tested")
+        else:
+            old = channels[existing_index]
+            old_status = old.get("status")
+            if "status" in patch and patch["status"] != old_status and not reason.strip():
+                return json.dumps({
+                    "error": "changing an existing channel's status requires a non-empty reason "
+                             "(audit trail for channel swaps)"
+                })
+            record = {**old, **patch}
+            record.setdefault("status", old_status)
 
-    if target_status != old_status:
-        record["status_history"] = record.get("status_history", []) + [{
-            "at": now, "from": old_status, "to": target_status, "reason": reason or "initial",
-        }]
+        record["updated_at"] = now
+        target_status = record["status"]
 
-    if existing_index is None:
-        channels.append(record)
-    else:
-        channels[existing_index] = record
+        if target_status == "testing":
+            other_testing = [c for c in channels if c.get("status") == "testing" and c.get("id") != patch["id"]]
+            if len(other_testing) >= MAX_CHANNELS_TESTING:
+                return json.dumps({
+                    "error": f"testing cap reached ({len(other_testing)} channels already testing, "
+                             f"max {MAX_CHANNELS_TESTING}) - move one to bench/retired first, or hold off"
+                })
+            if record.get("is_paid"):
+                if not _read_own_policies().get("paid_channels_allowed"):
+                    return json.dumps({
+                        "error": "this subsidiary's policies have paid_channels_allowed=false - a paid "
+                                 "channel cannot move to status='testing' at all right now. This is a "
+                                 "Main-CEO-level setting (update_subsidiary_policies), not something to "
+                                 "work around here - use an organic channel instead or escalate via "
+                                 "file_cross_subsidiary_request if you think the policy should change."
+                    })
+                approved_request_id = record.get("approved_request_id")
+                approval = None
+                if approved_request_id:
+                    approvals = _read_global_jsonl("approval_queue.jsonl")
+                    approval = next((a for a in approvals if a.get("id") == approved_request_id), None)
+                if not approval or approval.get("status") != "approved" or approval.get("category") != "spend":
+                    return json.dumps({
+                        "error": "paid channel cannot move to status='testing' without approved_request_id "
+                                 "pointing at an approved, category='spend' entry in the approval queue - "
+                                 "file request_approval first, get it approved, then pass its id here"
+                    })
 
-    _write_jsonl("channels.jsonl", channels)
+        if target_status != old_status:
+            record["status_history"] = record.get("status_history", []) + [{
+                "at": now, "from": old_status, "to": target_status, "reason": reason or "initial",
+            }]
+
+        if existing_index is None:
+            channels.append(record)
+        else:
+            channels[existing_index] = record
+
+        _write_jsonl("channels.jsonl", channels)
     return json.dumps({"ok": True, "id": patch["id"], "status": target_status})
 
 

@@ -13,6 +13,7 @@ import os
 import shutil
 import sys
 import tempfile
+import threading
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
@@ -27,6 +28,7 @@ import holding  # noqa: E402
 import approve  # noqa: E402
 import crew  # noqa: E402
 import pricing  # noqa: E402
+import jsonl_store  # noqa: E402
 
 results = []
 
@@ -499,6 +501,70 @@ def test_jsonl_rapid_successive_full_rewrites_all_persist():
         tools._write_jsonl("scratch_burst.jsonl", current)
     stored = tools._read_jsonl("scratch_burst.jsonl")
     assert [r["seq"] for r in stored] == list(range(11))
+
+
+def test_jsonl_locked_prevents_lost_update_under_real_concurrency():
+    # This is the actual root cause, not just the symptom: reading crewai's
+    # installed source (crew_agent_executor.py) confirmed it dispatches
+    # every tool call requested in one LLM turn on a REAL ThreadPoolExecutor
+    # (up to 8 workers) - a sequential burst (the test above) doesn't
+    # reproduce that. Hammer the same file from real threading.Thread
+    # workers, each holding jsonl_store.locked() across its own
+    # read->mutate->write, and confirm every worker's record survives -
+    # without the lock this reliably loses updates (last writer wins).
+    reset_state()
+    directory = tools._subsidiary_dir()
+    filename = "scratch_concurrent.jsonl"
+    n_workers = 12
+
+    def worker(i):
+        with jsonl_store.locked(directory, filename):
+            records = jsonl_store.read_jsonl(directory, filename)
+            records.append({"seq": i})
+            jsonl_store.write_jsonl(directory, filename, records)
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(n_workers)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    stored = jsonl_store.read_jsonl(directory, filename)
+    assert sorted(r["seq"] for r in stored) == list(range(n_workers))
+
+
+def test_write_backlog_candidate_survives_concurrent_calls():
+    # End-to-end regression test for the exact live-observed failure: the
+    # real Sub-CEO's write_backlog_candidate calls from one turn (executed
+    # concurrently by crewai) each returned {"ok": true}, but a later
+    # read_backlog() only showed a fraction of them. Call the real @tool
+    # concurrently from real threads and confirm read_backlog() shows
+    # every one of them afterward.
+    reset_state()
+    n_workers = 10
+
+    def worker(i):
+        result = json.loads(tools.write_backlog_candidate.run(candidate=json.dumps({
+            "id": f"cand_concurrent_{i:02d}",
+            "statement": f"Concurrency regression candidate #{i} - a rationale long enough to clear "
+                         "the real statement-length bar this tool enforces on every new candidate.",
+            "source": "checkup: concurrency regression",
+            "fits_subsidiary_scope": "yes",
+            "impact": 5, "impact_grounding": "reddit",
+            "confidence": 5, "confidence_grounding": "reddit",
+            "ease": 5, "ease_grounding": "reddit",
+        })))
+        assert result.get("ok") is True, result
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(n_workers)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    stored_ids = {c["id"] for c in json.loads(tools.read_backlog.run(status="candidate"))}
+    expected_ids = {f"cand_concurrent_{i:02d}" for i in range(n_workers)}
+    assert expected_ids <= stored_ids
 
 
 # --- tools.py: request_approval / read_state -------------------------------

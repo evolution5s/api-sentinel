@@ -21,7 +21,7 @@ from pathlib import Path
 
 from crewai.tools import tool
 
-from jsonl_store import append_jsonl, read_jsonl, write_jsonl
+from jsonl_store import append_jsonl, locked, read_jsonl, write_jsonl
 from scoring import HYPOTHESIS_OUTCOMES
 from tools import EVIDENCE_STAGES, STATE_DIR as SUBSIDIARY_STATE_DIR, _instruction_echo_match
 
@@ -86,6 +86,11 @@ def _write(filename: str, records: list) -> None:
     write_jsonl(HOLDING_DIR, filename, records)
 
 
+def _jsonl_lock(filename: str):
+    """Hold across a _read()->mutate->_write() span - see jsonl_store.locked()."""
+    return locked(HOLDING_DIR, filename)
+
+
 def _append(filename: str, record: dict) -> None:
     append_jsonl(HOLDING_DIR, filename, record)
 
@@ -115,10 +120,11 @@ def _bootstrap_default_subsidiary() -> dict:
 
 
 def _all_subsidiaries() -> list:
-    subs = _read("subsidiaries.jsonl")
-    if not subs:
-        subs = [_bootstrap_default_subsidiary()]
-        _write("subsidiaries.jsonl", subs)
+    with _jsonl_lock("subsidiaries.jsonl"):
+        subs = _read("subsidiaries.jsonl")
+        if not subs:
+            subs = [_bootstrap_default_subsidiary()]
+            _write("subsidiaries.jsonl", subs)
     return subs
 
 
@@ -363,21 +369,25 @@ def route_idea(idea_id: str, decision: str, reasoning: str, target_subsidiary_id
         if not any(s.get("id") == target_subsidiary_id for s in subs):
             return json.dumps({"error": f"no subsidiary with id '{target_subsidiary_id}'"})
 
-    ideas = _read("ideas.jsonl")
-    idx = next((i for i, rec in enumerate(ideas) if rec.get("id") == idea_id), None)
-    if idx is None:
-        return json.dumps({"error": f"no idea with id '{idea_id}'"})
-    if ideas[idx].get("status") == "routed":
-        return json.dumps({
-            "error": f"'{idea_id}' was already routed ({ideas[idx].get('routing_decision')}), not re-routing"
-        })
+    # Main-CEO routes several pending ideas per turn, and crewai can run
+    # those calls concurrently - see tools.write_backlog_candidate's
+    # comment on why the whole read->mutate->write span must be locked.
+    with _jsonl_lock("ideas.jsonl"):
+        ideas = _read("ideas.jsonl")
+        idx = next((i for i, rec in enumerate(ideas) if rec.get("id") == idea_id), None)
+        if idx is None:
+            return json.dumps({"error": f"no idea with id '{idea_id}'"})
+        if ideas[idx].get("status") == "routed":
+            return json.dumps({
+                "error": f"'{idea_id}' was already routed ({ideas[idx].get('routing_decision')}), not re-routing"
+            })
 
-    ideas[idx]["status"] = "routed"
-    ideas[idx]["routing_decision"] = decision
-    ideas[idx]["routing_reasoning"] = reasoning
-    ideas[idx]["target_subsidiary_id"] = target_subsidiary_id or None
-    ideas[idx]["routed_at"] = datetime.now(timezone.utc).isoformat()
-    _write("ideas.jsonl", ideas)
+        ideas[idx]["status"] = "routed"
+        ideas[idx]["routing_decision"] = decision
+        ideas[idx]["routing_reasoning"] = reasoning
+        ideas[idx]["target_subsidiary_id"] = target_subsidiary_id or None
+        ideas[idx]["routed_at"] = datetime.now(timezone.utc).isoformat()
+        _write("ideas.jsonl", ideas)
     return json.dumps({"ok": True, "id": idea_id, "decision": decision})
 
 
@@ -441,20 +451,23 @@ def decide_pivot_proposal(proposal_id: str, decision: str, reasoning: str) -> st
     if decision not in PIVOT_DECISIONS:
         return json.dumps({"error": f"invalid decision '{decision}', must be one of {sorted(PIVOT_DECISIONS)}"})
 
-    proposals = _read("pivot_proposals.jsonl")
-    idx = next((i for i, p in enumerate(proposals) if p.get("id") == proposal_id), None)
-    if idx is None:
-        return json.dumps({"error": f"no pivot proposal with id '{proposal_id}'"})
-    if proposals[idx].get("status") == "decided":
-        return json.dumps({
-            "error": f"'{proposal_id}' was already decided ({proposals[idx].get('decision')}), not re-deciding"
-        })
+    # See route_idea's comment: batch-decided per turn, needs the lock
+    # held across the whole read->mutate->write span.
+    with _jsonl_lock("pivot_proposals.jsonl"):
+        proposals = _read("pivot_proposals.jsonl")
+        idx = next((i for i, p in enumerate(proposals) if p.get("id") == proposal_id), None)
+        if idx is None:
+            return json.dumps({"error": f"no pivot proposal with id '{proposal_id}'"})
+        if proposals[idx].get("status") == "decided":
+            return json.dumps({
+                "error": f"'{proposal_id}' was already decided ({proposals[idx].get('decision')}), not re-deciding"
+            })
 
-    proposals[idx]["status"] = "decided"
-    proposals[idx]["decision"] = decision
-    proposals[idx]["decision_reasoning"] = reasoning
-    proposals[idx]["decided_at"] = datetime.now(timezone.utc).isoformat()
-    _write("pivot_proposals.jsonl", proposals)
+        proposals[idx]["status"] = "decided"
+        proposals[idx]["decision"] = decision
+        proposals[idx]["decision_reasoning"] = reasoning
+        proposals[idx]["decided_at"] = datetime.now(timezone.utc).isoformat()
+        _write("pivot_proposals.jsonl", proposals)
     return json.dumps({"ok": True, "id": proposal_id, "decision": decision})
 
 
@@ -538,19 +551,22 @@ def decide_stage_skip_request(request_id: str, decision: str, reasoning: str) ->
     if decision not in STAGE_SKIP_DECISIONS:
         return json.dumps({"error": f"invalid decision '{decision}', must be one of {sorted(STAGE_SKIP_DECISIONS)}"})
 
-    requests = _read("stage_skip_requests.jsonl")
-    idx = next((i for i, r in enumerate(requests) if r.get("id") == request_id), None)
-    if idx is None:
-        return json.dumps({"error": f"no stage-skip request with id '{request_id}'"})
-    if requests[idx].get("status") != "pending":
-        return json.dumps({
-            "error": f"'{request_id}' is already '{requests[idx].get('status')}', not re-deciding"
-        })
+    # See route_idea's comment: batch-decided per turn, needs the lock
+    # held across the whole read->mutate->write span.
+    with _jsonl_lock("stage_skip_requests.jsonl"):
+        requests = _read("stage_skip_requests.jsonl")
+        idx = next((i for i, r in enumerate(requests) if r.get("id") == request_id), None)
+        if idx is None:
+            return json.dumps({"error": f"no stage-skip request with id '{request_id}'"})
+        if requests[idx].get("status") != "pending":
+            return json.dumps({
+                "error": f"'{request_id}' is already '{requests[idx].get('status')}', not re-deciding"
+            })
 
-    requests[idx]["status"] = decision
-    requests[idx]["decision_reasoning"] = reasoning
-    requests[idx]["decided_at"] = datetime.now(timezone.utc).isoformat()
-    _write("stage_skip_requests.jsonl", requests)
+        requests[idx]["status"] = decision
+        requests[idx]["decision_reasoning"] = reasoning
+        requests[idx]["decided_at"] = datetime.now(timezone.utc).isoformat()
+        _write("stage_skip_requests.jsonl", requests)
     return json.dumps({"ok": True, "id": request_id, "decision": decision})
 
 
@@ -603,18 +619,21 @@ def resolve_cross_subsidiary_request(request_id: str, decision: str, result: str
     if decision not in CROSS_REQUEST_DECISIONS:
         return json.dumps({"error": f"decision must be one of {sorted(CROSS_REQUEST_DECISIONS)}"})
 
-    reqs = _read("cross_subsidiary_requests.jsonl")
-    idx = next((i for i, r in enumerate(reqs) if r.get("id") == request_id), None)
-    if idx is None:
-        return json.dumps({"error": f"no cross-subsidiary request with id '{request_id}'"})
-    if reqs[idx].get("status") != "pending":
-        return json.dumps({"error": f"'{request_id}' is already '{reqs[idx].get('status')}', not touching it"})
+    # See route_idea's comment: batch-resolved per turn, needs the lock
+    # held across the whole read->mutate->write span.
+    with _jsonl_lock("cross_subsidiary_requests.jsonl"):
+        reqs = _read("cross_subsidiary_requests.jsonl")
+        idx = next((i for i, r in enumerate(reqs) if r.get("id") == request_id), None)
+        if idx is None:
+            return json.dumps({"error": f"no cross-subsidiary request with id '{request_id}'"})
+        if reqs[idx].get("status") != "pending":
+            return json.dumps({"error": f"'{request_id}' is already '{reqs[idx].get('status')}', not touching it"})
 
-    reqs[idx]["status"] = decision
-    reqs[idx]["result"] = result
-    reqs[idx]["reasoning"] = reasoning
-    reqs[idx]["resolved_at"] = datetime.now(timezone.utc).isoformat()
-    _write("cross_subsidiary_requests.jsonl", reqs)
+        reqs[idx]["status"] = decision
+        reqs[idx]["result"] = result
+        reqs[idx]["reasoning"] = reasoning
+        reqs[idx]["resolved_at"] = datetime.now(timezone.utc).isoformat()
+        _write("cross_subsidiary_requests.jsonl", reqs)
     return json.dumps({"ok": True, "id": request_id, "status": decision})
 
 
@@ -741,43 +760,49 @@ def assess_subsidiary_trajectory(subsidiary_id: str) -> str:
     still needs the board, same as any other Tier 1/2 boundary in this
     system.
     """
-    subs = _all_subsidiaries()
-    idx = next((i for i, s in enumerate(subs) if s.get("id") == subsidiary_id), None)
-    if idx is None:
-        return json.dumps({"error": f"no subsidiary with id '{subsidiary_id}'"})
-    sub = subs[idx]
+    # Called once per active subsidiary per cycle - today that's a single
+    # call, but the race is architecturally identical to route_idea's once
+    # a second subsidiary exists, so lock it now rather than waiting for
+    # that to bite. _all_subsidiaries() reacquires the same (reentrant)
+    # lock internally, which is fine - see jsonl_store.locked().
+    with _jsonl_lock("subsidiaries.jsonl"):
+        subs = _all_subsidiaries()
+        idx = next((i for i, s in enumerate(subs) if s.get("id") == subsidiary_id), None)
+        if idx is None:
+            return json.dumps({"error": f"no subsidiary with id '{subsidiary_id}'"})
+        sub = subs[idx]
 
-    state_dir_value = sub.get("state_dir")
-    if not state_dir_value:
-        return json.dumps({
-            "subsidiary_id": subsidiary_id, "outcome_counts": {}, "resolved_count": 0,
-            "possible_stall": False, "reason": "no state_dir on record yet - nothing to assess",
-        })
+        state_dir_value = sub.get("state_dir")
+        if not state_dir_value:
+            return json.dumps({
+                "subsidiary_id": subsidiary_id, "outcome_counts": {}, "resolved_count": 0,
+                "possible_stall": False, "reason": "no state_dir on record yet - nothing to assess",
+            })
 
-    outcome_counts = {"build": 0, "test_further": 0, "pivot": 0, "bury": 0}
-    for h in read_jsonl(Path(state_dir_value), "hypotheses.jsonl"):
-        outcome = h.get("outcome")
-        if outcome in outcome_counts:
-            outcome_counts[outcome] += 1
+        outcome_counts = {"build": 0, "test_further": 0, "pivot": 0, "bury": 0}
+        for h in read_jsonl(Path(state_dir_value), "hypotheses.jsonl"):
+            outcome = h.get("outcome")
+            if outcome in outcome_counts:
+                outcome_counts[outcome] += 1
 
-    resolved_count = outcome_counts["build"] + outcome_counts["pivot"] + outcome_counts["bury"]
-    build_count = outcome_counts["build"]
-    possible_stall = resolved_count >= STALL_RESOLVED_THRESHOLD and build_count == 0
+        resolved_count = outcome_counts["build"] + outcome_counts["pivot"] + outcome_counts["bury"]
+        build_count = outcome_counts["build"]
+        possible_stall = resolved_count >= STALL_RESOLVED_THRESHOLD and build_count == 0
 
-    if possible_stall:
-        sub["consecutive_stall_cycles"] = sub.get("consecutive_stall_cycles", 0) + 1
-        if sub["consecutive_stall_cycles"] >= STAGNATION_ESCALATION_THRESHOLD and not sub.get("stagnation_escalated"):
-            sub["stagnation_escalated"] = True
-            sub["stagnation_escalated_at"] = datetime.now(timezone.utc).isoformat()
-    else:
-        # A real build (or simply not stalled anymore) clears the pattern
-        # that caused the escalation - the underlying problem resolved
-        # itself, no human acknowledgment needed to clear it in that case.
-        sub["consecutive_stall_cycles"] = 0
-        sub["stagnation_escalated"] = False
-        sub["stagnation_escalated_at"] = None
-    subs[idx] = sub
-    _write("subsidiaries.jsonl", subs)
+        if possible_stall:
+            sub["consecutive_stall_cycles"] = sub.get("consecutive_stall_cycles", 0) + 1
+            if sub["consecutive_stall_cycles"] >= STAGNATION_ESCALATION_THRESHOLD and not sub.get("stagnation_escalated"):
+                sub["stagnation_escalated"] = True
+                sub["stagnation_escalated_at"] = datetime.now(timezone.utc).isoformat()
+        else:
+            # A real build (or simply not stalled anymore) clears the pattern
+            # that caused the escalation - the underlying problem resolved
+            # itself, no human acknowledgment needed to clear it in that case.
+            sub["consecutive_stall_cycles"] = 0
+            sub["stagnation_escalated"] = False
+            sub["stagnation_escalated_at"] = None
+        subs[idx] = sub
+        _write("subsidiaries.jsonl", subs)
 
     return json.dumps({
         "subsidiary_id": subsidiary_id,
@@ -1396,12 +1421,16 @@ def acknowledge_status_report(report_id: str) -> str:
     """Mark a status report as reviewed, so the same report doesn't keep
     showing up as needing attention cycle after cycle.
     """
-    reports = _read("status_reports.jsonl")
-    idx = next((i for i, r in enumerate(reports) if r.get("id") == report_id), None)
-    if idx is None:
-        return json.dumps({"error": f"no status report with id '{report_id}'"})
-    reports[idx]["acknowledged"] = True
-    _write("status_reports.jsonl", reports)
+    # See route_idea's comment: acknowledged in a batch ("for each you've
+    # actually considered"), needs the lock held across the whole
+    # read->mutate->write span.
+    with _jsonl_lock("status_reports.jsonl"):
+        reports = _read("status_reports.jsonl")
+        idx = next((i for i, r in enumerate(reports) if r.get("id") == report_id), None)
+        if idx is None:
+            return json.dumps({"error": f"no status report with id '{report_id}'"})
+        reports[idx]["acknowledged"] = True
+        _write("status_reports.jsonl", reports)
     return json.dumps({"ok": True, "id": report_id})
 
 

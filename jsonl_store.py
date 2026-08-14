@@ -6,7 +6,44 @@ directory without duplicating this logic.
 """
 import json
 import os
+import threading
+import uuid
 from pathlib import Path
+
+_locks_guard = threading.Lock()
+_locks: dict[str, threading.RLock] = {}
+
+
+def locked(directory: Path, filename: str) -> threading.RLock:
+    """Lock serializing a read-modify-write critical section for one JSONL file.
+
+    Root cause of the live-observed backlog-candidate data loss
+    (2026-08-14): crewai's agent executor runs multiple tool calls
+    requested in the same LLM turn CONCURRENTLY on a thread pool
+    (crew_agent_executor.py's ThreadPoolExecutor, up to 8 workers). Any
+    function that does read_jsonl() -> mutate the list -> write_jsonl()
+    is racy under that: two threads both snapshot the same
+    pre-mutation list, each appends its own record, and whichever
+    thread's write_jsonl() call finishes last wins - silently discarding
+    every other thread's change, even though each call itself returns
+    success. A lock inside write_jsonl() alone can't fix this because
+    the race starts at the read, not the write. Callers must hold this
+    lock across their entire read + mutate + write span. One lock per
+    (directory, filename) - real concurrent writes to *different* files
+    are unaffected.
+
+    Reentrant (RLock, not Lock) on purpose: a locked span can legitimately
+    call a helper that acquires the same (directory, filename) lock again
+    on the same thread (e.g. a bootstrap-on-empty helper) - that must not
+    deadlock the thread against itself.
+    """
+    key = str((directory / filename).resolve())
+    with _locks_guard:
+        lock = _locks.get(key)
+        if lock is None:
+            lock = threading.RLock()
+            _locks[key] = lock
+        return lock
 
 
 def read_jsonl(directory: Path, filename: str) -> list:
@@ -27,19 +64,20 @@ def read_jsonl(directory: Path, filename: str) -> list:
 
 
 def write_jsonl(directory: Path, filename: str, records: list) -> None:
-    # Live-discovered bug (2026-08-14): under a rapid burst of full-file
-    # rewrites in a single cycle (e.g. 10+ backlog candidates created back
-    # to back), writes that landed right before the container exited were
-    # missing from the very next read_backlog() call, despite each write
-    # itself returning {"ok": true}. plain open("w") only flushes into the
-    # OS page cache, not to the underlying (network-backed Railway) volume
-    # - a container teardown right after can lose data that was never
-    # fsync'd. Write to a temp file, fsync it, then atomically rename over
-    # the target so a read never observes a partial file and a completed
-    # write() call means the bytes are actually durable.
+    # Belt-and-suspenders durability/atomicity: write to a uniquely-named
+    # temp file (pid + thread id + a random suffix - concurrent callers,
+    # e.g. from locked() being held by a different (directory, filename)
+    # key, or a caller that doesn't go through locked() at all, must never
+    # share a temp path or one os.replace() can find the other's temp file
+    # already gone), fsync it, then atomically rename over the target. This
+    # means a read never observes a partial file, and a completed write()
+    # call means the bytes are durable even if the container is torn down
+    # right after. This alone does NOT fix the lost-update race between
+    # concurrent read-modify-write callers - see locked() above, which
+    # callers must hold across their read + mutate + write span.
     directory.mkdir(parents=True, exist_ok=True)
     target = directory / filename
-    tmp = directory / f".{filename}.tmp{os.getpid()}"
+    tmp = directory / f".{filename}.tmp{os.getpid()}.{threading.get_ident()}.{uuid.uuid4().hex[:8]}"
     with tmp.open("w", encoding="utf-8") as f:
         for record in records:
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
