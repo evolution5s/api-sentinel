@@ -885,6 +885,88 @@ def _get_subsidiary(subsidiary_id: str):
     return subs, idx
 
 
+# --------------------------------------------------------------------------
+# Self-assessment (self-development addendum, Part F item 1). Distinct from
+# the routine per-cycle business report (necessarily narrow - one cycle's
+# activity) and from Kaizen (specific improvement actions): a periodic,
+# honest retrospective on real cumulative progress since the last reset -
+# what's actually been learned that's durable (reusable in the knowledge
+# base) versus what turned out to be a dead end, and a plain statement of
+# where the subsidiary genuinely stands relative to the ultimate goal (a
+# validated, monetizable business). Deterministic and mechanical, same
+# discipline as assess_subsidiary_trajectory just above - counts and real
+# records, never a model's own narrative substituting for the numbers.
+# Run on an adaptive cadence (Part D, crew.py wires {self_assessment_due}
+# the same way as {kaizen_due}), not every cycle.
+#
+# "Since the last reset" needs no separate bookkeeping: a wipe
+# (execute_confirmed_wipe) clears hypotheses.jsonl/knowledge_base.jsonl/
+# usage_history.jsonl (the last one added specifically for this, see
+# tools._WIPE_SUBSIDIARY_JSONL_FILES) together, so the earliest surviving
+# record IS the reset boundary - a subsidiary that's never been wiped
+# simply has "since" reaching back to its own real beginning.
+# --------------------------------------------------------------------------
+
+@tool("build_self_assessment")
+def build_self_assessment(subsidiary_id: str) -> str:
+    """Periodic honest retrospective - real cumulative progress since the
+    last state wipe (or since this subsidiary began, if never wiped): every
+    hypothesis tried and its outcome, tokens/cost actually spent, what's
+    been durably learned (knowledge_base.jsonl - reusable takeaways) versus
+    what was a dead end, and how many genuinely scored backlog candidates
+    exist right now. Never fabricates a verdict - every field traces to a
+    real record. Adaptively paced (Part D) - call this when {self_
+    assessment_due} says yes, not every cycle.
+    """
+    subs, idx = _get_subsidiary(subsidiary_id)
+    state_dir = _subsidiary_state_dir(subs[idx] if idx is not None else None, subsidiary_id)
+
+    hyps = read_jsonl(state_dir, "hypotheses.jsonl")
+    outcome_counts = {"build": 0, "test_further": 0, "pivot": 0, "bury": 0}
+    still_open = 0
+    for h in hyps:
+        outcome = h.get("outcome")
+        if outcome in outcome_counts:
+            outcome_counts[outcome] += 1
+        else:
+            still_open += 1
+    resolved_count = outcome_counts["build"] + outcome_counts["pivot"] + outcome_counts["bury"]
+
+    usage = read_jsonl(state_dir, "usage_history.jsonl")
+    total_tokens = sum(u.get("total_tokens") or 0 for u in usage)
+    total_cost_usd = sum(u.get("cost_usd") or 0 for u in usage if u.get("cost_usd") is not None)
+
+    knowledge = read_jsonl(state_dir, "knowledge_base.jsonl")
+    durable_learnings = [
+        {"id": k.get("id"), "topic": k.get("topic"), "takeaway": k.get("takeaway"), "confidence": k.get("confidence")}
+        for k in knowledge
+    ]
+
+    backlog = read_jsonl(state_dir, "hypothesis_backlog.jsonl")
+    scored_candidates = sum(
+        1 for c in backlog
+        if c.get("status") == "candidate" and c.get("impact") is not None
+        and c.get("confidence") is not None and c.get("ease") is not None
+    )
+
+    since = min((h.get("created_at") for h in hyps if h.get("created_at")), default=None)
+
+    return json.dumps({
+        "subsidiary_id": subsidiary_id,
+        "since": since,
+        "hypotheses_tried": len(hyps),
+        "outcome_counts": outcome_counts,
+        "resolved_count": resolved_count,
+        "still_active_or_untested": still_open,
+        "has_any_validated_build": outcome_counts["build"] > 0,
+        "total_tokens_invested": total_tokens,
+        "total_cost_usd": round(total_cost_usd, 4) if total_cost_usd else 0.0,
+        "durable_learnings_count": len(durable_learnings),
+        "durable_learnings": durable_learnings,
+        "scored_backlog_candidates_count": scored_candidates,
+    }, ensure_ascii=False)
+
+
 def _persist_fix_streak(subsidiary_id: str, check_name: str, streak: int, extra: dict = None) -> None:
     subs, idx = _get_subsidiary(subsidiary_id)
     if idx is None:
@@ -1176,8 +1258,23 @@ def _kaizen_tier_violation(text: str) -> str:
 
 def _kaizen_grounding_exists(subsidiary_id: str, grounding: str) -> bool:
     """A Kaizen item is grounded only if `grounding` is an id that actually
-    exists in this subsidiary's real current hypotheses.jsonl/channels.jsonl
-    or the global approval_queue.jsonl - not just a non-empty string.
+    exists in this subsidiary's real current data - not just a non-empty
+    string.
+
+    2026-08-14 calibration fix (Kaizen-must-produce-real-output addendum,
+    Part E): originally only checked hypotheses.jsonl/channels.jsonl/the
+    global approval_queue.jsonl. Confirmed real miscalibration - EVERY
+    Kaizen attempt since it was built had been rejected, and the most
+    common real, concrete, citable facts a cycle actually produces
+    (a research finding, a knowledge-base takeaway, a backlog candidate)
+    weren't in the checked id universe at all, even though they're exactly
+    the kind of specific fact this check is meant to require. Broadened to
+    the SAME grounding universe already established and validated
+    elsewhere in this codebase (tools._backlog_grounding_exists) - not a
+    new, separately-invented one - so a real research_finding/knowledge_
+    base/backlog id is accepted, same discipline as ICE-score grounding.
+    Still rejects ANY non-existent id - this widens what counts as a real
+    fact, it does not relax the "must be real" requirement itself.
     """
     if not grounding:
         return False
@@ -1186,6 +1283,9 @@ def _kaizen_grounding_exists(subsidiary_id: str, grounding: str) -> bool:
     ids = {h.get("id") for h in read_jsonl(state_dir, "hypotheses.jsonl")}
     ids |= {c.get("id") for c in read_jsonl(state_dir, "channels.jsonl")}
     ids |= {a.get("id") for a in read_jsonl(SUBSIDIARY_STATE_DIR, "approval_queue.jsonl")}
+    ids |= {r.get("id") for r in read_jsonl(state_dir, "research_findings.jsonl")}
+    ids |= {k.get("id") for k in read_jsonl(state_dir, "knowledge_base.jsonl")}
+    ids |= {b.get("id") for b in read_jsonl(state_dir, "hypothesis_backlog.jsonl")}
     return grounding in ids
 
 
@@ -1432,6 +1532,129 @@ def acknowledge_status_report(report_id: str) -> str:
         reports[idx]["acknowledged"] = True
         _write("status_reports.jsonl", reports)
     return json.dumps({"ok": True, "id": report_id})
+
+
+# --------------------------------------------------------------------------
+# Board-question channel (self-development addendum, Part F item 2). Real
+# gap this closes: the system previously had no way to raise genuine open
+# strategic uncertainty back to Jan that doesn't fit request_approval
+# (needs sign-off on a specific action), file_pivot_proposal (a specific
+# decision type: approve_in_place/move_to_subsidiary/spinoff_required/
+# rejected), or file_stage_skip_request (a specific evidence-stage
+# exception) - e.g. "the backlog surfaced two genuinely different,
+# well-scored problem directions; do you have a preference before we
+# commit testing capacity to one" has no honest home in any of those
+# three. Both ceo_agent and main_ceo_agent get this tool (crew.py) -
+# genuine open uncertainty can come from either role, not just the
+# Main-CEO. Deliberately NOT a way to avoid an ordinary Tier-0 judgment
+# call either agent is already equipped to make on its own - instructed
+# accordingly in crew.py's task descriptions.
+# --------------------------------------------------------------------------
+
+BOARD_QUESTION_STATUSES = {"open", "answered"}
+
+
+@tool("file_board_question")
+def file_board_question(subsidiary_id: str, question: str, context: str, filed_by: str) -> str:
+    """File a genuine open strategic question for Jan/the board - distinct
+    from request_approval (needs sign-off on a specific action already
+    decided), file_pivot_proposal (a specific pivot decision type), and
+    file_stage_skip_request (a specific evidence-stage exception). Use this
+    only for genuine open uncertainty that doesn't fit those boxes - never
+    as a way to avoid an ordinary judgment call you're already equipped to
+    make on your own.
+
+    question: the actual question, one clear sentence.
+    context: why this matters right now and what's genuinely at stake -
+    say plainly what's uncertain and why it's not a call you can make
+    alone, not just background narration.
+    filed_by: one of 'sub_ceo'/'main_ceo' - which role is asking.
+
+    Surfaced as a short pointer in the Telegram "Fuer den Aufsichtsrat"
+    section (never the full question/context repeated in chat every
+    cycle) until answered via the 'board_answer: <id> <answer text>'
+    Telegram command.
+    """
+    if not question.strip():
+        return json.dumps({"error": "question must not be empty"})
+    if not context.strip():
+        return json.dumps({"error": "context must not be empty - say plainly why this is genuinely uncertain"})
+    if filed_by not in ("sub_ceo", "main_ceo"):
+        return json.dumps({"error": "filed_by must be one of 'sub_ceo'/'main_ceo'"})
+    record = {
+        "id": f"boardq_{uuid.uuid4().hex[:8]}",
+        "subsidiary_id": subsidiary_id,
+        "question": question,
+        "context": context,
+        "filed_by": filed_by,
+        "filed_at": datetime.now(timezone.utc).isoformat(),
+        "status": "open",
+        "answer": None,
+        "answered_at": None,
+        "telegram_notified_at": None,
+    }
+    _append("board_questions.jsonl", record)
+    return json.dumps({"ok": True, "id": record["id"]})
+
+
+@tool("read_board_questions")
+def read_board_questions(subsidiary_id: str = "", status: str = "") -> str:
+    """Read filed board questions, optionally scoped to one subsidiary
+    and/or status ('open'/'answered'). Check this before filing a new
+    question on the same genuine uncertainty - don't refile one that's
+    already open and unanswered.
+    """
+    questions = _read("board_questions.jsonl")
+    if subsidiary_id:
+        questions = [q for q in questions if q.get("subsidiary_id") == subsidiary_id]
+    if status:
+        questions = [q for q in questions if q.get("status") == status]
+    return json.dumps(questions, ensure_ascii=False)
+
+
+def read_unnotified_board_questions() -> list:
+    """Orchestration-level (crew.py's Telegram surfacing), same pattern as
+    read_unnotified_kaizen_suggestions: open questions never yet pointed to
+    in a Telegram report.
+    """
+    return [q for q in _read("board_questions.jsonl") if q.get("status") == "open" and not q.get("telegram_notified_at")]
+
+
+def mark_board_questions_notified(question_ids: list) -> None:
+    if not question_ids:
+        return
+    with _jsonl_lock("board_questions.jsonl"):
+        questions = _read("board_questions.jsonl")
+        now = datetime.now(timezone.utc).isoformat()
+        changed = False
+        for q in questions:
+            if q.get("id") in question_ids and not q.get("telegram_notified_at"):
+                q["telegram_notified_at"] = now
+                changed = True
+        if changed:
+            _write("board_questions.jsonl", questions)
+
+
+def answer_board_question(question_id: str, answer: str) -> dict:
+    """Telegram command 'board_answer: <id> <answer text>' - only reachable
+    via _apply_telegram_commands (crew.py), same tier as fix_resolved:/
+    stagnation_ack:, never an agent tool: answering is Jan's call, not
+    something either agent can do to itself.
+    """
+    if not answer.strip():
+        return {"error": "answer must not be empty"}
+    with _jsonl_lock("board_questions.jsonl"):
+        questions = _read("board_questions.jsonl")
+        idx = next((i for i, q in enumerate(questions) if q.get("id") == question_id), None)
+        if idx is None:
+            return {"error": f"no board question with id '{question_id}'"}
+        if questions[idx].get("status") != "open":
+            return {"error": f"'{question_id}' is already '{questions[idx].get('status')}', not re-answering"}
+        questions[idx]["status"] = "answered"
+        questions[idx]["answer"] = answer
+        questions[idx]["answered_at"] = datetime.now(timezone.utc).isoformat()
+        _write("board_questions.jsonl", questions)
+        return {"ok": True, "id": question_id}
 
 
 # --------------------------------------------------------------------------

@@ -10,6 +10,7 @@ from crewai.events import crewai_event_bus
 from crewai.events.types.tool_usage_events import ToolUsageFinishedEvent, ToolValidateInputErrorEvent
 from crewai.tasks.conditional_task import ConditionalTask
 
+import adaptive_cadence
 import crewai_patches
 import holding
 import pricing
@@ -76,14 +77,17 @@ from tools import (
 from holding import (
     acknowledge_status_report,
     assess_subsidiary_trajectory,
+    build_self_assessment,
     decide_pivot_proposal,
     decide_stage_skip_request,
+    file_board_question,
     file_cross_subsidiary_request,
     file_kaizen_report,
     file_pivot_proposal,
     file_stage_skip_request,
     file_status_report,
     propose_idea,
+    read_board_questions,
     read_cross_subsidiary_requests,
     read_ideas,
     read_kaizen_actions,
@@ -522,7 +526,24 @@ ceo_agent = Agent(
         "pricing angle from a payment-propensity scan, even something "
         "tangential from researching a different topic entirely - don't "
         "self-censor to only what's narrowly on-topic for whatever is "
-        "currently active. Score every candidate's impact/confidence/ease "
+        "currently active. Broader-problem-space addendum (Part B): if this "
+        "subsidiary's strategic direction frames a genuine PROBLEM SPACE "
+        "rather than one specific product concept (check "
+        "read_strategic_direction - it should describe a target audience "
+        "and a mandate to discover real pain points, not a pre-picked "
+        "solution), candidates should genuinely range across DIFFERENT "
+        "PROBLEM TYPES within that space, not just parametric variations "
+        "(different price/channel/copy) of one fixed product idea already "
+        "assumed to be the answer. A prior real regression: an earlier "
+        "direction described a specific product ('exchange API failure "
+        "monitoring') instead of the audience and problem space it was "
+        "meant to serve, and every backlog candidate that followed was "
+        "structurally forced into variations of that one idea - the "
+        "direction itself was the constraint, not a lack of trying. If "
+        "every candidate in the backlog right now is a variant of the same "
+        "underlying idea, that's worth noticing and correcting with a "
+        "genuinely different one, not evidence the space has been covered. "
+        "Score every candidate's impact/confidence/ease "
         "(1-10 each, scoring.compute_ice_score multiplies them into one "
         "comparable number) with a real grounding id for each sub-score - "
         "a research finding, a knowledge-base/payment-propensity verdict, a "
@@ -530,17 +551,29 @@ ceo_agent = Agent(
         "relative to THIS subsidiary's current strategic direction, not a "
         "fixed property of the idea - the same idea can score very "
         "differently under a different audience/pricing lens; read_backlog's "
-        "impact_stale flag means the direction has since moved on and this "
-        "entry's impact is worth re-scoring before trusting it for ranking "
-        "or promotion, not something to silently keep reusing. Backlog "
-        "grooming (new candidates, re-scoring stale entries, promoting one) "
-        "isn't mandatory every cycle - it belongs where there's real spare "
-        "capacity, either because MAX_ACTIVE_HYPOTHESES isn't full and a new "
-        "slot could genuinely be filled, or because of the anti-stagnation "
-        "rule directly below. Promotion is two steps: write_hypothesis to "
-        "actually create the new active hypothesis (citing "
-        "backlog_candidate_id on it), then write_backlog_candidate again "
-        "with status='promoted' and promoted_to_hypothesis_id set. A "
+        "score_stale flag (with stale_reasons explaining which of "
+        "direction-change/new-relevant-research/plain age actually fired) "
+        "means this entry is worth re-scoring before trusting it for "
+        "ranking or promotion, not something to silently keep reusing - but "
+        "a score is CACHED, not recomputed every cycle: only re-score a "
+        "candidate when score_stale is actually true, never as a blanket "
+        "sweep. Backlog grooming (new candidates, re-scoring stale entries, "
+        "promoting one) isn't mandatory every cycle - it belongs where "
+        "there's real spare capacity, either because MAX_ACTIVE_HYPOTHESES "
+        "isn't full and a new slot could genuinely be filled, or because of "
+        "the anti-stagnation rule directly below. Every new hypothesis, "
+        "without exception - not even the very first one ever, not even a "
+        "pivot follow-up - must originate from a backlog candidate: "
+        "write_hypothesis now REQUIRES backlog_candidate_id pointing at a "
+        "real, still-unpromoted, fully ICE-scored candidate, and marks it "
+        "'promoted' as part of that same call (one mechanical step now, not "
+        "a separate write_backlog_candidate(status='promoted') call "
+        "afterward). When a slot opens, this is a real, visible comparison, "
+        "not a convenient pick: rank the genuinely eligible candidates "
+        "(status='candidate', ICE-scored) by ice_score in your own report "
+        "and promote the highest-ranked one that's actually eligible - "
+        "never assume whichever hypothesis was active before automatically "
+        "gets first claim on the next slot just because it's familiar. A "
         "candidate flagged fits_subsidiary_scope='no'/'unclear' isn't this "
         "role's call - propose_idea it to the Main-CEO (reference the "
         "backlog candidate's id in the summary/reasoning) instead of "
@@ -584,7 +617,7 @@ ceo_agent = Agent(
         read_subsidiary_policies, read_content_drafts, log_research_finding, read_research_findings,
         read_knowledge_base, write_knowledge_entry, propose_idea, file_stage_skip_request,
         write_backlog_candidate, read_backlog, set_next_step, withdraw_approval,
-        search_web, read_webpage,
+        search_web, read_webpage, file_board_question, read_board_questions,
     ],
     max_iter=AGENT_PROFILE["agents"]["sub_ceo"]["max_iter"],
     max_execution_time=AGENT_PROFILE["agents"]["sub_ceo"]["max_execution_time"],
@@ -744,6 +777,7 @@ main_ceo_agent = Agent(
         read_stage_skip_requests, decide_stage_skip_request,
         write_backlog_candidate, read_backlog,
         search_web, read_webpage, file_kaizen_report,
+        file_board_question, read_board_questions, build_self_assessment,
     ],
     max_iter=AGENT_PROFILE["agents"]["main_ceo"]["max_iter"],
     max_execution_time=AGENT_PROFILE["agents"]["main_ceo"]["max_execution_time"],
@@ -1703,8 +1737,15 @@ task_ceo = ConditionalTask(
         "answer for a routine bury/pivot/test_further.\n"
         "8) Never invent conversion, reach, revenue, or economics numbers. "
         "Every number in your report must trace back to a tool call above.\n"
-        "9) Kaizen (routine self-improvement reflection, every real cycle, "
-        "regardless of whether anything above was 'good' or 'bad'): before "
+        "9) Kaizen (routine self-improvement reflection) - due this cycle: "
+        "{kaizen_due}. Kaizen's own real yield is tracked adaptively "
+        "(self-development addendum, Part D): if it's genuinely produced "
+        "nothing grounded for several cycles in a row, it's stretched to "
+        "run less often rather than burning tokens every single cycle on a "
+        "reliably-empty pass - if {kaizen_due} says 'no' below, skip this "
+        "step entirely this cycle (say so in one line in your report, "
+        "nothing more) and move on to step 10. When it IS due: "
+        "regardless of whether anything above was 'good' or 'bad', before "
         "filing your file_status_report, gather 1-3 subsidiary-level "
         "observations about what could genuinely move this subsidiary "
         "forward - each one must cite something concrete from THIS cycle's "
@@ -1723,6 +1764,17 @@ task_ceo = ConditionalTask(
         "regardless of how small they seem), you may act on it this same "
         "cycle and say so in the observation itself; otherwise just flag "
         "it, the Main-CEO decides what's selbst_umsetzbar vs needs Jan.\n"
+        "9.5) Board questions (self-development addendum, Part F item 2): "
+        "file_board_question is for genuine open strategic uncertainty "
+        "that doesn't fit request_approval/file_pivot_proposal/file_stage_"
+        "skip_request - e.g. two genuinely different, well-scored backlog "
+        "directions and no clear reason to prefer one, or real doubt "
+        "whether something falls inside this subsidiary's mandate. Not a "
+        "way to avoid an ordinary judgment call you're already equipped to "
+        "make - the rare exception, not a routine step. Check "
+        "read_board_questions(status='open') first so you don't refile one "
+        "already pending; the Main-CEO surfaces these to the board on its "
+        "own adaptive cadence (step 5.6), you don't need to chase a reply.\n"
         "10) Business report (cycle-reporting addendum, Part 1): your FINAL "
         "ANSWER for this task is used directly as the narrative body of "
         "this cycle's business progress report to Telegram - write it in "
@@ -1872,9 +1924,16 @@ task_main_ceo_review = ConditionalTask(
         "check_escalation's own trigger (that stays the one thing that "
         "actually starts a formal pivot proposal, from the Sub-CEO's side) "
         "- this is your own observation to raise, not a mechanical gate.\n"
-        "5.5) Kaizen (routine self-improvement reflection, every real "
-        "cycle): read each active subsidiary's latest status report(s) from "
-        "step 1 above for their kaizen_points field - the Sub-CEO's own "
+        "5.5) Kaizen (routine self-improvement reflection) - due this "
+        "cycle: {kaizen_due}. Adaptively paced (self-development addendum, "
+        "Part D) - if {kaizen_due} says 'no', skip this step entirely (one "
+        "line noting the skip is enough) and continue to step 6; when it's "
+        "'yes' (either brand-new or genuinely due again), file "
+        "file_kaizen_report as usual, even if the Sub-CEO's own report "
+        "skipped its half this cycle - your own holding-level observations "
+        "alone are still worth filing. When due: read each active "
+        "subsidiary's latest status report(s) from step 1 above for their "
+        "kaizen_points field - the Sub-CEO's own "
         "grounded subsidiary-level observations. Merge those with your own "
         "holding-level observations (also grounded in this cycle's real "
         "data - a real subsidiary/channel/approval, never generic advice) "
@@ -1896,6 +1955,29 @@ task_main_ceo_review = ConditionalTask(
         "backdoor around the existing approval-queue boundary. Passing an "
         "empty list for either bucket is a completely valid, honest "
         "outcome some cycles - never invent a point just to have one.\n"
+        "5.6) Self-assessment (self-development addendum, Part F) - due "
+        "this cycle: {self_assessment_due}. Same adaptive pacing as "
+        "Kaizen above - if {self_assessment_due} says 'no', skip entirely "
+        "and continue to step 6. When 'yes': call build_self_assessment "
+        "for every active subsidiary and give a genuinely honest read in "
+        "your own report - real cumulative progress since the last reset "
+        "(hypotheses tried and their real outcomes, tokens/cost actually "
+        "spent, durable_learnings_count vs how many hypotheses were "
+        "resolved - a low ratio is a real signal, not just a number), and "
+        "a plain statement of where this subsidiary genuinely stands "
+        "toward a validated, monetizable business - not spun positively, "
+        "not artificially urgent. 'We're early and that's fine' is a "
+        "complete, honest answer when the real numbers say so. This is "
+        "also the natural moment to check read_board_questions(status="
+        "'open') and surface any that have accumulated (they're pointed "
+        "to in Telegram regardless, but tying the 'where do we stand' "
+        "reflection to 'what we need from the board to keep moving well' "
+        "in the same moment, rather than scattering them across routine "
+        "reports, is the point). If genuine open strategic uncertainty "
+        "surfaces from this reflection itself - not an ordinary Tier-0 "
+        "call you're already equipped to make - file_board_question about "
+        "it (filed_by='main_ceo'); check existing open questions first so "
+        "you don't refile one already pending.\n"
         "6) Call read_strategic_direction(subsidiary_id=...) for every "
         "active subsidiary. If it returns direction=null - this subsidiary "
         "has NEVER had a strategic direction set, not even once - call "
@@ -2248,6 +2330,7 @@ def _aufsichtsrat_lines(
     pending_approvals, duration_policy: dict, pending_stage_skips: int,
     stagnation_escalations: list = None, fix_md_new_entries: list = None,
     kaizen_new_count: int = 0, needs_rejection_reason_ids: list = None,
+    board_questions_new: list = None,
 ) -> list:
     """"Fuer den Aufsichtsrat" only appears when something genuinely needs
     a human decision (section 8) - never printed out of habit. Triggers:
@@ -2258,11 +2341,13 @@ def _aufsichtsrat_lines(
     short pointer only, never the full addendum text, resolve via
     'fix_resolved: <id>'), new unread Kaizen board suggestions (Part
     2.3 - same short-pointer/dedup pattern, full text lives in
-    kaizen_suggestions.jsonl only), and reason-less rejections
+    kaizen_suggestions.jsonl only), reason-less rejections
     (rejection-reasoning addendum - approve.decide left these
     status='pending' with needs_rejection_reason=true instead of silently
     closing them, so they keep showing up here as an open question until a
-    real reason is given).
+    real reason is given), and new unread board questions (self-development
+    addendum, Part F - short pointer only, full question/context lives in
+    board_questions.jsonl only, answer via 'board_answer: <id> <text>').
     """
     items = []
     if isinstance(pending_approvals, int) and pending_approvals > 0:
@@ -2297,6 +2382,11 @@ def _aufsichtsrat_lines(
         items.append(
             f"- {kaizen_new_count} neue Kaizen-Vorschlaege fuers Board seit letztem Report, "
             "siehe kaizen_suggestions.jsonl."
+        )
+    for q in (board_questions_new or []):
+        items.append(
+            f"- Offene Frage ({q.get('filed_by')}, {q.get('subsidiary_id')}) - {q.get('id')}: "
+            f"{q.get('question')} Antworte 'board_answer: {q.get('id')} <deine Antwort>'."
         )
     if not items:
         return []
@@ -2513,6 +2603,9 @@ def send_cycle_summary(
         kaizen_new_entries = holding.read_unnotified_kaizen_suggestions()
         if kaizen_new_entries:
             holding.mark_kaizen_suggestions_notified([e["id"] for e in kaizen_new_entries])
+        board_questions_new = holding.read_unnotified_board_questions()
+        if board_questions_new:
+            holding.mark_board_questions_notified([q["id"] for q in board_questions_new])
 
         message_a = _technical_status_message(
             subsidiary_id, usage, kickoff_error, persistence_warning, telegram_action_log, fix_md_new_entries,
@@ -2586,6 +2679,7 @@ def send_cycle_summary(
             len(current_approval_ids), duration_policy, pending_stage_skips, stagnation_escalations,
             fix_md_new_entries=fix_md_new_entries, kaizen_new_count=len(kaizen_new_entries),
             needs_rejection_reason_ids=needs_rejection_reason_ids,
+            board_questions_new=board_questions_new,
         )
         lines_b += ["", f"Naechster Schritt: {next_step}"]
         message_b = "\n".join(lines_b)
@@ -2669,10 +2763,54 @@ if __name__ == "__main__":
             # this to the Main-CEO's own judgment doesn't work.
             maybe_correct_stale_strategic_direction(sub_id)
 
+            # Adaptive check-cadence addendum, Part D: computed BEFORE
+            # kickoff() so both task_ceo's and task_main_ceo_review's
+            # {kaizen_due} placeholder resolve to the same real decision -
+            # Kaizen is the confirmed real case (zero real output across
+            # every attempt so far under the old, too-strict grounding
+            # check, see Part E) of an LLM-costly step worth pacing rather
+            # than running unconditionally every cycle.
+            sub_state_dir = tools.STATE_DIR / sub_id
+            kaizen_due_now = adaptive_cadence.is_check_due(sub_state_dir, "kaizen")
+            kaizen_watch_since = datetime.now(timezone.utc).isoformat()
+            # Self-development addendum, Part F item 1 + Part D: same
+            # adaptive mechanism, different "did this produce something
+            # meaningful" signal - build_self_assessment is a pure readout
+            # (no side effects of its own), so its real yield is whether
+            # this SUBSIDIARY genuinely produced new state this cycle
+            # (reuses spare_capacity_produced_nothing's own delta below,
+            # computed once already, not a second parallel check) - a
+            # fresh reflection has nothing new to say when nothing changed.
+            self_assessment_due_now = adaptive_cadence.is_check_due(sub_state_dir, "self_assessment")
+
             def _finish_cycle(kickoff_exc: Exception = None):
                 run_fix_checks_for_subsidiary(sub_id)
+                # Adaptive check-cadence addendum, Part D: record the real
+                # outcome of this cycle's Kaizen attempt (or the fact it
+                # was skipped) so the interval keeps self-tuning. Ground
+                # truth from the actual persisted records, not the
+                # narrated report - same discipline as everything else
+                # this system reports on.
+                if kaizen_due_now:
+                    kaizen_produced_something = bool(
+                        holding.read_kaizen_actions(sub_id, kaizen_watch_since)
+                        or holding.read_kaizen_suggestions(sub_id, kaizen_watch_since)
+                    )
+                    adaptive_cadence.record_check_outcome(sub_state_dir, "kaizen", kaizen_produced_something)
+                else:
+                    adaptive_cadence.note_cycle_passed_without_running(sub_state_dir, "kaizen")
+                cycle_end_counts = snapshot_state_counts()
+                if self_assessment_due_now:
+                    # Real new activity this cycle (any tracked count moved)
+                    # is this check's own "produced something meaningful" -
+                    # a fresh reflection has nothing new to say otherwise.
+                    adaptive_cadence.record_check_outcome(
+                        sub_state_dir, "self_assessment", cycle_start_counts != cycle_end_counts,
+                    )
+                else:
+                    adaptive_cadence.note_cycle_passed_without_running(sub_state_dir, "self_assessment")
                 spare_capacity_nothing = scoring.spare_capacity_produced_nothing(
-                    pre_active_count, tools.MAX_ACTIVE_HYPOTHESES, cycle_start_counts, snapshot_state_counts(),
+                    pre_active_count, tools.MAX_ACTIVE_HYPOTHESES, cycle_start_counts, cycle_end_counts,
                 )
                 auto_escalated_idea_id = None
                 if spare_capacity_nothing:
@@ -2690,7 +2828,11 @@ if __name__ == "__main__":
                 )
 
             try:
-                crew.kickoff(inputs={"subsidiary_id": sub_id})
+                crew.kickoff(inputs={
+                    "subsidiary_id": sub_id,
+                    "kaizen_due": "yes" if kaizen_due_now else "no",
+                    "self_assessment_due": "yes" if self_assessment_due_now else "no",
+                })
                 print(f"[api-sentinel] Execution finished for '{sub_id}'.")
                 _finish_cycle()
             except Exception as exc:

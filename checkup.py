@@ -29,6 +29,7 @@ import approve  # noqa: E402
 import crew  # noqa: E402
 import pricing  # noqa: E402
 import jsonl_store  # noqa: E402
+import adaptive_cadence  # noqa: E402
 
 results = []
 
@@ -63,23 +64,36 @@ def _seed_testing_channel(channel_id="reddit"):
     }))
 
 
-def _seed_scored_backlog(n=None, channel_id="reddit"):
+def _seed_scored_backlog(n=None, channel_id="reddit", id_prefix="backlog_seed_"):
     """Most hypothesis tests promote a new hypothesis to status='active',
     which write_hypothesis now refuses unless at least
     tools.MIN_BACKLOG_BEFORE_ACTIVE_PROMOTION genuinely scored backlog
-    candidates exist (item 3, addendum). Called on every reset_state(), same
-    reasoning/pattern as _seed_testing_channel above - real tests for the
-    gate itself (test_write_hypothesis_active_promotion_requires_backlog_*)
-    reset without this seed instead of calling reset_state().
+    candidates exist EXCLUDING the one being promoted (item 3, addendum;
+    exclude-self behavior confirmed intentional, not touched by the
+    unified backlog-only pipeline addendum). Called on every reset_state(),
+    same reasoning/pattern as _seed_testing_channel above - real tests for
+    the gate itself (test_write_hypothesis_active_promotion_requires_
+    backlog_*) reset without this seed instead of calling reset_state().
+    Seeds ONE MORE than the bare minimum by default (MIN_BACKLOG_BEFORE_
+    ACTIVE_PROMOTION + 1, unified backlog-only pipeline addendum, Part C
+    item 1): every new hypothesis now REQUIRES a real backlog_candidate_id
+    (SAMPLE_HYP uses "backlog_seed_0000"), and promoting it moves it out of
+    status='candidate' - with exactly the bare minimum seeded, promoting
+    any one of them would leave only MIN-1 others and fail the gate on the
+    very first hypothesis a test tries to create. A test that promotes
+    SEVERAL hypotheses in a row needs its own extra batch under a distinct
+    id_prefix (see _seed_extra_backlog_candidates below) - the backlog
+    genuinely shrinks with each promotion and needs replenishing, same as
+    it would live.
     Grounds every ICE sub-score on the real channel_id _seed_testing_channel
     already wrote (a valid grounding id per tools._backlog_grounding_exists),
     not a fabricated one.
     """
     if n is None:
-        n = tools.MIN_BACKLOG_BEFORE_ACTIVE_PROMOTION
+        n = tools.MIN_BACKLOG_BEFORE_ACTIVE_PROMOTION + 1
     for i in range(n):
         tools.write_backlog_candidate.run(candidate=json.dumps({
-            "id": f"backlog_seed_{i:04d}",
+            "id": f"{id_prefix}{i:04d}",
             "statement": f"Seeded test backlog candidate #{i} - a placeholder rationale long enough to "
                          "clear the real statement-length bar this tool enforces on every candidate.",
             "source": "checkup: _seed_scored_backlog",
@@ -88,6 +102,20 @@ def _seed_scored_backlog(n=None, channel_id="reddit"):
             "confidence": 5, "confidence_grounding": channel_id,
             "ease": 5, "ease_grounding": channel_id,
         }))
+
+
+def _seed_extra_backlog_candidates(count, id_prefix="backlog_extra_"):
+    """For a test that promotes `count` hypotheses in a row without
+    replenishing the backlog in between - each promotion needs
+    MIN_BACKLOG_BEFORE_ACTIVE_PROMOTION OTHER candidates still scored at
+    the moment it happens, so `count` promotions in a row need
+    MIN_BACKLOG_BEFORE_ACTIVE_PROMOTION + count seeded up front. Returns
+    the list of candidate ids to hand out one per hypothesis, distinct
+    from reset_state()'s own "backlog_seed_" batch so the two don't collide.
+    """
+    total = tools.MIN_BACKLOG_BEFORE_ACTIVE_PROMOTION + count
+    _seed_scored_backlog(n=total, id_prefix=id_prefix)
+    return [f"{id_prefix}{i:04d}" for i in range(total)]
 
 
 def _allow_paid_channels():
@@ -136,6 +164,17 @@ SAMPLE_HYP = {
     # knowledge_base entry every test doesn't actually need.
     "defensibility_notes": "test placeholder - no real competitor scan behind this in fixtures",
     "defensibility_grounding": "reddit",
+    # Unified backlog-only pipeline addendum (Part C, item 1):
+    # backlog_candidate_id is now required on every new hypothesis, and
+    # impact_score/confidence_score are auto-derived from that candidate
+    # (whatever's set here is ignored/overwritten) - "backlog_seed_0000" is
+    # real because reset_state() always seeds
+    # tools.MIN_BACKLOG_BEFORE_ACTIVE_PROMOTION scored candidates
+    # (backlog_seed_0000..NNNN, _seed_scored_backlog) before any test runs.
+    # A test creating more than one hypothesis from SAMPLE_HYP needs a
+    # second, still-'candidate'-status seed id of its own (backlog_seed_0000
+    # becomes 'promoted' the first time it's used).
+    "backlog_candidate_id": "backlog_seed_0000",
     "impact_score": 3,
     "confidence_score": 3,
     "primary_variable_tested": "audience",  # required for a first attempt (no prior_hypothesis_id)
@@ -884,6 +923,219 @@ def test_write_hypothesis_create_and_read():
     assert stored["measured"] == {"conversions": 0, "reach_estimate": None, "reach_source": None}
 
 
+# --------------------------------------------------------------------------
+# Unified backlog-only hypothesis pipeline (2026-08-14 addendum, Part C):
+# every new hypothesis, without exception, must originate from an already-
+# scored backlog candidate.
+# --------------------------------------------------------------------------
+
+def test_write_hypothesis_requires_backlog_candidate_id():
+    reset_state()
+    without_id = {k: v for k, v in SAMPLE_HYP.items() if k != "backlog_candidate_id"}
+    result = json.loads(tools.write_hypothesis.run(hypothesis=json.dumps(without_id)))
+    assert "error" in result and "backlog_candidate_id" in result["error"]
+
+
+def test_write_hypothesis_rejects_nonexistent_backlog_candidate_id():
+    reset_state()
+    hyp = {**SAMPLE_HYP, "backlog_candidate_id": "backlog_does_not_exist"}
+    result = json.loads(tools.write_hypothesis.run(hypothesis=json.dumps(hyp)))
+    assert "error" in result and "does not exist" in result["error"]
+
+
+def test_write_hypothesis_rejects_already_promoted_backlog_candidate():
+    reset_state()
+    tools.write_hypothesis.run(hypothesis=json.dumps(SAMPLE_HYP))  # promotes backlog_seed_0000
+    second = {**SAMPLE_HYP, "id": "hyp_second", "landing_page_variant_id": "lp_v2"}  # same candidate id again
+    result = json.loads(tools.write_hypothesis.run(hypothesis=json.dumps(second)))
+    assert "error" in result and "not 'candidate'" in result["error"]
+
+
+def test_write_hypothesis_rejects_unscored_backlog_candidate():
+    # write_backlog_candidate itself already requires all three ICE
+    # sub-scores on creation, so this state can't arise through the normal
+    # tool path - written directly to simulate a legacy/manually-edited
+    # record, exercising write_hypothesis's own defensive check.
+    reset_state()
+    tools.write_backlog_candidate.run(candidate=json.dumps({
+        "id": "bl_unscored", "statement": BACKLOG_STATEMENT, "source": "growth",
+        "fits_subsidiary_scope": "yes",
+        "impact": 5, "impact_grounding": "reddit",
+        "confidence": 5, "confidence_grounding": "reddit",
+        "ease": 5, "ease_grounding": "reddit",
+    }))
+    backlog = tools._read_jsonl("hypothesis_backlog.jsonl")
+    idx = next(i for i, c in enumerate(backlog) if c["id"] == "bl_unscored")
+    backlog[idx]["ease"] = None
+    tools._write_jsonl("hypothesis_backlog.jsonl", backlog)
+
+    hyp = {**SAMPLE_HYP, "backlog_candidate_id": "bl_unscored"}
+    result = json.loads(tools.write_hypothesis.run(hypothesis=json.dumps(hyp)))
+    assert "error" in result and "not fully ICE-scored" in result["error"]
+
+
+def test_write_hypothesis_auto_derives_impact_and_confidence_from_candidate():
+    # Closes a real scale-mismatch bug found while building an earlier
+    # one-off hypothesis-to-backlog conversion (hypothesis-level scores had
+    # no enforced 1-10 range, unlike backlog ICE sub-scores) - whatever is
+    # passed for impact_score/confidence_score is ignored in favor of the
+    # candidate's own already-validated numbers.
+    reset_state()
+    tools.write_backlog_candidate.run(candidate=json.dumps({
+        "id": "bl_specific_scores", "statement": BACKLOG_STATEMENT, "source": "growth",
+        "fits_subsidiary_scope": "yes",
+        "impact": 8, "impact_grounding": "reddit",
+        "confidence": 6, "confidence_grounding": "reddit",
+        "ease": 5, "ease_grounding": "reddit",
+    }))
+    hyp = {**SAMPLE_HYP, "backlog_candidate_id": "bl_specific_scores", "impact_score": 1, "confidence_score": 1}
+    tools.write_hypothesis.run(hypothesis=json.dumps(hyp))
+    stored = next(h for h in json.loads(tools.read_hypotheses.run()) if h["id"] == "hyp_test_0001")
+    assert stored["impact_score"] == 8
+    assert stored["confidence_score"] == 6
+
+
+def test_write_hypothesis_marks_candidate_promoted_as_single_mechanical_step():
+    reset_state()
+    tools.write_hypothesis.run(hypothesis=json.dumps(SAMPLE_HYP))
+    candidates = {c["id"]: c for c in json.loads(tools.read_backlog.run())}
+    promoted = candidates["backlog_seed_0000"]
+    assert promoted["status"] == "promoted"
+    assert promoted["promoted_to_hypothesis_id"] == "hyp_test_0001"
+
+
+def test_write_hypothesis_failed_creation_does_not_falsely_promote_candidate():
+    # A later validation failure (e.g. the MAX_ACTIVE_HYPOTHESES cap) must
+    # never leave a candidate marked 'promoted' pointing at a hypothesis
+    # that was never actually created.
+    reset_state()
+    candidate_ids = _seed_extra_backlog_candidates(tools.MAX_ACTIVE_HYPOTHESES)
+    for i in range(tools.MAX_ACTIVE_HYPOTHESES):
+        h = {**SAMPLE_HYP, "id": f"hyp_cap_{i}", "landing_page_variant_id": f"lp_v{i}_cap", "backlog_candidate_id": candidate_ids[i]}
+        tools.write_hypothesis.run(hypothesis=json.dumps(h))
+    overflow_candidate_id = candidate_ids[tools.MAX_ACTIVE_HYPOTHESES]
+    overflow = {**SAMPLE_HYP, "id": "hyp_overflow", "landing_page_variant_id": "lp_v_overflow", "backlog_candidate_id": overflow_candidate_id}
+    result = json.loads(tools.write_hypothesis.run(hypothesis=json.dumps(overflow)))
+    assert "error" in result
+    candidates = {c["id"]: c for c in json.loads(tools.read_backlog.run())}
+    assert candidates[overflow_candidate_id]["status"] == "candidate"
+    assert candidates[overflow_candidate_id]["promoted_to_hypothesis_id"] is None
+
+
+def test_write_hypothesis_no_exception_for_pivot_followups_either():
+    # Part C item 1 is explicit: no exceptions, not even a pivot follow-up.
+    reset_state()
+    candidate_ids = _seed_extra_backlog_candidates(2)
+    tools.write_hypothesis.run(hypothesis=json.dumps({**SAMPLE_HYP, "outcome": "pivot", "backlog_candidate_id": candidate_ids[0]}))
+    followup_without_id = {
+        k: v for k, v in {
+            **SAMPLE_HYP, "id": "hyp_pivot_followup_no_backlog", "landing_page_variant_id": "lp_v2_pivot",
+            "prior_hypothesis_id": "hyp_test_0001", "prior_score": -0.5,
+            "pivot_variable_changed": "price", "pivot_reasoning": "too high",
+        }.items() if k != "backlog_candidate_id"
+    }
+    result = json.loads(tools.write_hypothesis.run(hypothesis=json.dumps(followup_without_id)))
+    assert "error" in result and "backlog_candidate_id" in result["error"]
+
+
+def test_build_top_hypotheses_block_shows_backlog_promoted_active_hypotheses():
+    # Regression for a real bug found while implementing Part C: the
+    # "active" section used to exclude ANY hypothesis whose id appeared as
+    # a promoted backlog candidate's promoted_to_hypothesis_id - harmless
+    # while backlog_candidate_id was optional and rare, but since Part C
+    # makes EVERY hypothesis backlog-promoted, that filter silently emptied
+    # "active" entirely.
+    reset_state()
+    tools.write_hypothesis.run(hypothesis=json.dumps(SAMPLE_HYP))
+    block = tools.build_top_hypotheses_block(limit=2)
+    assert [h["id"] for h in block["active"]] == ["hyp_test_0001"]
+
+
+# --------------------------------------------------------------------------
+# Lazy re-scoring (2026-08-14 addendum, Part C item 3): a backlog
+# candidate's ICE score is cached, not eagerly recomputed - flagged stale
+# only on a real triggering reason.
+# --------------------------------------------------------------------------
+
+def test_read_backlog_scored_at_set_on_score_write_not_on_unrelated_update():
+    reset_state()
+    tools.write_backlog_candidate.run(candidate=json.dumps({
+        "id": "bl_lazy", "statement": BACKLOG_STATEMENT, "source": "growth",
+        "fits_subsidiary_scope": "yes",
+        "impact": 5, "impact_grounding": "reddit",
+        "confidence": 5, "confidence_grounding": "reddit",
+        "ease": 5, "ease_grounding": "reddit",
+    }))
+    first = next(c for c in json.loads(tools.read_backlog.run()) if c["id"] == "bl_lazy")
+    assert first["scored_at"] is not None
+
+    tools.write_backlog_candidate.run(candidate=json.dumps({"id": "bl_lazy", "ease_target_stage": "research"}))
+    second = next(c for c in json.loads(tools.read_backlog.run()) if c["id"] == "bl_lazy")
+    assert second["scored_at"] == first["scored_at"], "an unrelated field update must not touch scored_at"
+
+
+def test_read_backlog_score_stale_true_when_direction_changes():
+    reset_state()
+    tools.write_backlog_candidate.run(candidate=json.dumps({
+        "id": "bl_dir_stale", "statement": BACKLOG_STATEMENT, "source": "growth",
+        "fits_subsidiary_scope": "yes",
+        "impact": 5, "impact_grounding": "reddit",
+        "confidence": 5, "confidence_grounding": "reddit",
+        "ease": 5, "ease_grounding": "reddit",
+    }))
+    entry = next(c for c in json.loads(tools.read_backlog.run()) if c["id"] == "bl_dir_stale")
+    assert entry["score_stale"] is False
+
+    holding.set_strategic_direction.run(subsidiary_id="api-sentinel", focus_area="a new frame", reasoning="r")
+    entry = next(c for c in json.loads(tools.read_backlog.run()) if c["id"] == "bl_dir_stale")
+    assert entry["score_stale"] is True
+    assert "strategic_direction_changed" in entry["stale_reasons"]
+
+
+def test_read_backlog_score_stale_true_when_new_research_logged_for_same_hypothesis():
+    reset_state()
+    hyp_id = _seed_hypothesis_for_grounding("hyp_for_lazy_rescoring")
+    finding_id = _real_research_finding_id(hyp_id)
+    tools.write_backlog_candidate.run(candidate=json.dumps({
+        "id": "bl_research_stale", "statement": BACKLOG_STATEMENT, "source": "growth",
+        "fits_subsidiary_scope": "yes",
+        "impact": 5, "impact_grounding": finding_id,
+        "confidence": 5, "confidence_grounding": finding_id,
+        "ease": 5, "ease_grounding": finding_id,
+    }))
+    entry = next(c for c in json.loads(tools.read_backlog.run()) if c["id"] == "bl_research_stale")
+    assert entry["score_stale"] is False
+
+    tools.log_research_finding.run(
+        hypothesis_id=hyp_id, finding_type="forum_discussion",
+        source="https://reddit.com/r/algotrading/comments/newer_finding",
+        summary=_SUBSTANTIVE_SUMMARY,
+    )
+    entry = next(c for c in json.loads(tools.read_backlog.run()) if c["id"] == "bl_research_stale")
+    assert entry["score_stale"] is True
+    assert "new_research_since_scored" in entry["stale_reasons"]
+
+
+def test_read_backlog_score_stale_true_when_older_than_staleness_window():
+    reset_state()
+    tools.write_backlog_candidate.run(candidate=json.dumps({
+        "id": "bl_age_stale", "statement": BACKLOG_STATEMENT, "source": "growth",
+        "fits_subsidiary_scope": "yes",
+        "impact": 5, "impact_grounding": "reddit",
+        "confidence": 5, "confidence_grounding": "reddit",
+        "ease": 5, "ease_grounding": "reddit",
+    }))
+    old_iso = (datetime.now(timezone.utc) - timedelta(days=tools.SCORE_STALENESS_DAYS + 1)).isoformat()
+    backlog = tools._read_jsonl("hypothesis_backlog.jsonl")
+    idx = next(i for i, c in enumerate(backlog) if c["id"] == "bl_age_stale")
+    backlog[idx]["scored_at"] = old_iso
+    tools._write_jsonl("hypothesis_backlog.jsonl", backlog)
+
+    entry = next(c for c in json.loads(tools.read_backlog.run()) if c["id"] == "bl_age_stale")
+    assert entry["score_stale"] is True
+    assert "score_older_than_staleness_window" in entry["stale_reasons"]
+
+
 def test_write_hypothesis_update_merges():
     reset_state()
     tools.write_hypothesis.run(hypothesis=json.dumps(SAMPLE_HYP))
@@ -1150,12 +1402,14 @@ def test_write_hypothesis_non_bury_update_does_not_close_orders():
 def test_write_hypothesis_pivot_followup_requires_variable_and_reasoning():
     reset_state()
     _seed_testing_channel("reddit")
-    tools.write_hypothesis.run(hypothesis=json.dumps({**SAMPLE_HYP, "outcome": "pivot"}))
+    candidate_ids = _seed_extra_backlog_candidates(2)
+    tools.write_hypothesis.run(hypothesis=json.dumps({**SAMPLE_HYP, "outcome": "pivot", "backlog_candidate_id": candidate_ids[0]}))
 
     followup = {
         **SAMPLE_HYP, "id": "hyp_pivot_followup",
         "landing_page_variant_id": "lp_v2_pivot",
         "prior_hypothesis_id": "hyp_test_0001", "prior_score": -0.5,
+        "backlog_candidate_id": candidate_ids[1],
     }
     result = json.loads(tools.write_hypothesis.run(hypothesis=json.dumps(followup)))
     assert "error" in result and "pivot_variable_changed" in result["error"]
@@ -1197,13 +1451,12 @@ def test_write_hypothesis_first_attempt_succeeds_with_primary_variable():
 
 def test_write_hypothesis_parallelism_limit():
     reset_state()
+    candidate_ids = _seed_extra_backlog_candidates(3)
     for i in range(2):
-        h = dict(SAMPLE_HYP)
-        h["id"] = f"hyp_parallel_{i}"
+        h = {**dict(SAMPLE_HYP), "id": f"hyp_parallel_{i}", "backlog_candidate_id": candidate_ids[i]}
         result = json.loads(tools.write_hypothesis.run(hypothesis=json.dumps(h)))
         assert result.get("ok") is True, result
-    third = dict(SAMPLE_HYP)
-    third["id"] = "hyp_parallel_2"
+    third = {**dict(SAMPLE_HYP), "id": "hyp_parallel_2", "backlog_candidate_id": candidate_ids[2]}
     result = json.loads(tools.write_hypothesis.run(hypothesis=json.dumps(third)))
     assert "error" in result, "expected the 3rd active hypothesis on the same variant to be rejected"
 
@@ -1212,24 +1465,26 @@ def test_write_hypothesis_parallelism_limit():
 
 def test_write_hypothesis_max_active_cap_enforced():
     reset_state()
+    candidate_ids = _seed_extra_backlog_candidates(tools.MAX_ACTIVE_HYPOTHESES)
     for i in range(tools.MAX_ACTIVE_HYPOTHESES):
-        h = {**SAMPLE_HYP, "id": f"hyp_cap_{i}", "landing_page_variant_id": f"lp_v{i}_cap"}
+        h = {**SAMPLE_HYP, "id": f"hyp_cap_{i}", "landing_page_variant_id": f"lp_v{i}_cap", "backlog_candidate_id": candidate_ids[i]}
         result = json.loads(tools.write_hypothesis.run(hypothesis=json.dumps(h)))
         assert result.get("ok") is True, result
-    overflow = {**SAMPLE_HYP, "id": "hyp_cap_overflow", "landing_page_variant_id": "lp_v_overflow"}
+    overflow = {**SAMPLE_HYP, "id": "hyp_cap_overflow", "landing_page_variant_id": "lp_v_overflow", "backlog_candidate_id": candidate_ids[tools.MAX_ACTIVE_HYPOTHESES]}
     result = json.loads(tools.write_hypothesis.run(hypothesis=json.dumps(overflow)))
     assert "error" in result and "already status='active'" in result["error"], result
 
 
 def test_write_hypothesis_max_active_cap_frees_up_after_evaluation():
     reset_state()
+    candidate_ids = _seed_extra_backlog_candidates(tools.MAX_ACTIVE_HYPOTHESES + 1)
     for i in range(tools.MAX_ACTIVE_HYPOTHESES):
-        h = {**SAMPLE_HYP, "id": f"hyp_cap_{i}", "landing_page_variant_id": f"lp_v{i}_cap"}
+        h = {**SAMPLE_HYP, "id": f"hyp_cap_{i}", "landing_page_variant_id": f"lp_v{i}_cap", "backlog_candidate_id": candidate_ids[i]}
         tools.write_hypothesis.run(hypothesis=json.dumps(h))
     tools.write_hypothesis.run(hypothesis=json.dumps({
         "id": "hyp_cap_0", "status": "evaluated", "outcome": "bury", "bury_reasoning": "weak signal",
     }))
-    freed = {**SAMPLE_HYP, "id": "hyp_cap_new", "landing_page_variant_id": "lp_v_new"}
+    freed = {**SAMPLE_HYP, "id": "hyp_cap_new", "landing_page_variant_id": "lp_v_new", "backlog_candidate_id": candidate_ids[tools.MAX_ACTIVE_HYPOTHESES]}
     result = json.loads(tools.write_hypothesis.run(hypothesis=json.dumps(freed)))
     assert result.get("ok") is True, result
 
@@ -1468,14 +1723,17 @@ def test_evaluate_hypothesis_returns_test_further_when_score_good_but_sample_too
 
 def test_check_escalation_triggers_on_low_rolling_average():
     reset_state()
-    tools.write_hypothesis.run(hypothesis=json.dumps({**SAMPLE_HYP, "id": "hyp_a", "score": -0.8, "status": "evaluated"}))
+    candidate_ids = _seed_extra_backlog_candidates(3)
+    tools.write_hypothesis.run(hypothesis=json.dumps({
+        **SAMPLE_HYP, "id": "hyp_a", "score": -0.8, "status": "evaluated", "backlog_candidate_id": candidate_ids[0],
+    }))
     tools.write_hypothesis.run(hypothesis=json.dumps({
         **SAMPLE_HYP, "id": "hyp_b", "landing_page_variant_id": "lp_v2_x",
-        "score": -0.6, "status": "evaluated", "prior_hypothesis_id": "hyp_a",
+        "score": -0.6, "status": "evaluated", "prior_hypothesis_id": "hyp_a", "backlog_candidate_id": candidate_ids[1],
     }))
     tools.write_hypothesis.run(hypothesis=json.dumps({
         **SAMPLE_HYP, "id": "hyp_c", "landing_page_variant_id": "lp_v3_x",
-        "score": -0.5, "status": "evaluated", "prior_hypothesis_id": "hyp_b",
+        "score": -0.5, "status": "evaluated", "prior_hypothesis_id": "hyp_b", "backlog_candidate_id": candidate_ids[2],
     }))
     result = json.loads(tools.check_escalation.run(hypothesis_id="hyp_c"))
     assert result["escalate"] is True, result
@@ -1881,16 +2139,18 @@ def test_compare_channel_performance_empty():
 def test_compare_channel_performance_ranks_by_score():
     reset_state()
     _seed_testing_channel("x")
+    candidate_ids = _seed_extra_backlog_candidates(3)
     tools.write_hypothesis.run(hypothesis=json.dumps({
         **SAMPLE_HYP, "id": "hyp_reddit_1", "channel": "reddit", "status": "evaluated", "score": 0.8,
+        "backlog_candidate_id": candidate_ids[0],
     }))
     tools.write_hypothesis.run(hypothesis=json.dumps({
         **SAMPLE_HYP, "id": "hyp_reddit_2", "landing_page_variant_id": "lp_v2",
-        "channel": "reddit", "status": "evaluated", "score": 0.4,
+        "channel": "reddit", "status": "evaluated", "score": 0.4, "backlog_candidate_id": candidate_ids[1],
     }))
     tools.write_hypothesis.run(hypothesis=json.dumps({
         **SAMPLE_HYP, "id": "hyp_x_1", "landing_page_variant_id": "lp_v3",
-        "channel": "x", "status": "evaluated", "score": -0.6,
+        "channel": "x", "status": "evaluated", "score": -0.6, "backlog_candidate_id": candidate_ids[2],
     }))
     result = json.loads(tools.compare_channel_performance.run())
     assert result["ranked"][0] == {"channel": "reddit", "average_score": 0.6, "evaluated_hypotheses": 2}
@@ -3683,9 +3943,26 @@ def test_assess_subsidiary_trajectory_unknown_subsidiary():
 
 
 def _write_buried_hyp(i):
+    # Self-seeds its own backlog candidate (unified backlog-only pipeline
+    # addendum, Part C item 1: every new hypothesis needs a distinct,
+    # real, unpromoted one) rather than relying on reset_state()'s shared
+    # "backlog_seed_" pool - callers loop this several times per test, and
+    # SAMPLE_HYP's default backlog_candidate_id would collide across calls.
+    own_candidate_id = f"backlog_bury_{i:04d}"
+    tools.write_backlog_candidate.run(candidate=json.dumps({
+        "id": own_candidate_id,
+        "statement": f"Own candidate for _write_buried_hyp #{i} - a placeholder rationale long enough "
+                     "to clear the real statement-length bar this tool enforces on every candidate.",
+        "source": "checkup: _write_buried_hyp",
+        "fits_subsidiary_scope": "yes",
+        "impact": 5, "impact_grounding": "reddit",
+        "confidence": 5, "confidence_grounding": "reddit",
+        "ease": 5, "ease_grounding": "reddit",
+    }))
     tools.write_hypothesis.run(hypothesis=json.dumps({
         **SAMPLE_HYP, "id": f"hyp_bury_{i}", "landing_page_variant_id": f"lp_v{i}_bury",
         "status": "buried", "outcome": "bury", "bury_reasoning": "weak signal",
+        "backlog_candidate_id": own_candidate_id,
     }))
 
 
@@ -4049,7 +4326,7 @@ def test_ceo_agent_tools_match_spec():
         "read_subsidiary_policies", "read_content_drafts", "log_research_finding", "read_research_findings",
         "read_knowledge_base", "write_knowledge_entry", "propose_idea", "file_stage_skip_request",
         "write_backlog_candidate", "read_backlog", "set_next_step", "withdraw_approval",
-        "search_web", "read_webpage",
+        "search_web", "read_webpage", "file_board_question", "read_board_questions",
     }, tool_names
 
 
@@ -4067,6 +4344,7 @@ def test_main_ceo_agent_tools_match_spec():
         "read_stage_skip_requests", "decide_stage_skip_request",
         "write_backlog_candidate", "read_backlog",
         "search_web", "read_webpage", "file_kaizen_report",
+        "file_board_question", "read_board_questions", "build_self_assessment",
     }, tool_names
 
 
@@ -4247,7 +4525,7 @@ def test_all_task_descriptions_and_agent_backstories_interpolate_cleanly():
     task_originals = [(t, t.description, t.expected_output, t.output_file) for t in tasks]
     agent_originals = [(a, a.role, a.goal, a.backstory) for a in agents]
     try:
-        crew.crew._interpolate_inputs({"subsidiary_id": "api-sentinel"})
+        crew.crew._interpolate_inputs({"subsidiary_id": "api-sentinel", "kaizen_due": "yes", "self_assessment_due": "yes"})
     except Exception as exc:
         raise AssertionError(
             "a task description or agent backstory contains a literal "
@@ -4538,13 +4816,14 @@ def test_check_recurring_malformed_tool_calls_requires_same_signature():
 
 def test_check_channel_bury_streak_fires_on_consecutive_buries():
     reset_state()
+    candidate_ids = _seed_extra_backlog_candidates(3)
     for i in range(3):
         hyp = {
             "id": f"hyp_bury_{i}", "statement": "s", "category": "value", "landing_page_variant_id": "v1",
             "failure_rate": 0.5, "success_rate": 0.5, "duration_days": 3, "channel": "reddit",
-            "hypothesis_type": "value", "impact_score": 3, "confidence_score": 3, "evidence_stage": "research",
+            "hypothesis_type": "value", "evidence_stage": "research",
             "research_objective": "o", "research_confirming_criteria": "c", "research_disconfirming_criteria": "d",
-            "primary_variable_tested": "audience",
+            "primary_variable_tested": "audience", "backlog_candidate_id": candidate_ids[i],
         }
         tools.write_hypothesis.run(hypothesis=json.dumps(hyp))
         tools.write_hypothesis.run(hypothesis=json.dumps({
@@ -4768,12 +5047,25 @@ def test_aufsichtsrat_lines_fix_md_new_entries():
 # --------------------------------------------------------------------------
 
 def _seed_hypothesis_for_grounding(hyp_id="hyp_kaizen_ground"):
+    # Self-seeds its own backlog candidate - see _write_buried_hyp's
+    # comment for why (unified backlog-only pipeline addendum, Part C).
+    own_candidate_id = f"backlog_ground_{hyp_id}"
+    tools.write_backlog_candidate.run(candidate=json.dumps({
+        "id": own_candidate_id,
+        "statement": f"Own candidate for _seed_hypothesis_for_grounding({hyp_id!r}) - a placeholder "
+                     "rationale long enough to clear the real statement-length bar this tool enforces.",
+        "source": "checkup: _seed_hypothesis_for_grounding",
+        "fits_subsidiary_scope": "yes",
+        "impact": 5, "impact_grounding": "reddit",
+        "confidence": 5, "confidence_grounding": "reddit",
+        "ease": 5, "ease_grounding": "reddit",
+    }))
     hyp = {
         "id": hyp_id, "statement": "s", "category": "value", "landing_page_variant_id": "v1",
         "failure_rate": 0.5, "success_rate": 0.5, "duration_days": 3, "channel": "reddit",
-        "hypothesis_type": "value", "impact_score": 3, "confidence_score": 3, "evidence_stage": "research",
+        "hypothesis_type": "value", "evidence_stage": "research",
         "research_objective": "o", "research_confirming_criteria": "c", "research_disconfirming_criteria": "d",
-        "primary_variable_tested": "audience",
+        "primary_variable_tested": "audience", "backlog_candidate_id": own_candidate_id,
     }
     tools.write_hypothesis.run(hypothesis=json.dumps(hyp))
     return hyp_id
@@ -4849,10 +5141,54 @@ def test_file_kaizen_report_accepts_grounded_items_and_persists_board_bucket():
     assert stored[0]["grounding"] == hyp_id
     assert stored[0]["telegram_notified_at"] is None
 
-    unnotified = holding.read_unnotified_kaizen_suggestions()
-    assert len(unnotified) == 1
-    holding.mark_kaizen_suggestions_notified([stored[0]["id"]])
-    assert holding.read_unnotified_kaizen_suggestions() == []
+
+def test_file_kaizen_report_accepts_research_finding_and_backlog_grounding():
+    # Calibration fix (Kaizen-must-produce-real-output addendum, Part E):
+    # confirmed real miscalibration - a research_finding/knowledge_base/
+    # backlog id, the most common real fact a cycle actually produces, was
+    # previously rejected as "not grounded" even though it's a genuinely
+    # real, citable id. This is the actual fix, not just an investigation.
+    reset_state()
+    hyp_id = _seed_hypothesis_for_grounding("hyp_kaizen_research_ground")
+    finding_id = _real_research_finding_id(hyp_id)
+    knowledge_result = json.loads(tools.write_knowledge_entry.run(
+        topic="reddit organic reach", takeaway="moderate response rate on own_question_post",
+        confidence="moderate", source_hypothesis_ids=json.dumps([hyp_id]),
+    ))
+    knowledge_id = knowledge_result["id"]
+    backlog_result = json.loads(tools.write_backlog_candidate.run(candidate=json.dumps({
+        "id": "bl_kaizen_ground", "statement": BACKLOG_STATEMENT, "source": "growth",
+        "fits_subsidiary_scope": "yes",
+        "impact": 5, "impact_grounding": "reddit",
+        "confidence": 5, "confidence_grounding": "reddit",
+        "ease": 5, "ease_grounding": "reddit",
+    })))
+    assert backlog_result.get("ok") is True, backlog_result
+
+    report = {
+        "selbst_umsetzbar": [{
+            "action": f"apply the pattern from {finding_id} to the next drafted post",
+            "grounding": finding_id, "status": "acted",
+        }],
+        "fuer_aufsichtsrat": [
+            {"suggestion": f"{knowledge_id} suggests revisiting channel mix", "grounding": knowledge_id},
+            {"suggestion": "bl_kaizen_ground looks worth prioritizing next", "grounding": "bl_kaizen_ground"},
+        ],
+    }
+    result = json.loads(holding.file_kaizen_report.run(subsidiary_id="api-sentinel", kaizen_report=json.dumps(report)))
+    assert result == {"logged_selbst_umsetzbar": 1, "logged_fuer_aufsichtsrat": 2}
+
+
+def test_file_kaizen_report_still_rejects_genuinely_nonexistent_grounding():
+    # The calibration fix widens what counts as a real fact - it must not
+    # relax the "must be real" requirement itself.
+    reset_state()
+    report = {
+        "selbst_umsetzbar": [],
+        "fuer_aufsichtsrat": [{"suggestion": "generic advice", "grounding": "totally_made_up_id"}],
+    }
+    result = json.loads(holding.file_kaizen_report.run(subsidiary_id="api-sentinel", kaizen_report=json.dumps(report)))
+    assert "error" in result and "not a real" in result["error"]
 
 
 def test_file_status_report_accepts_kaizen_points():
@@ -5317,8 +5653,19 @@ def test_build_top_hypotheses_block_keeps_active_and_backlog_separate():
             "confidence": 5, "confidence_grounding": finding_id,
             "ease": 5, "ease_grounding": finding_id,
         }))
-    hyp = dict(SAMPLE_HYP)
-    hyp["impact_score"], hyp["confidence_score"] = 4, 4  # own score 16 - would rank below bl_a/bl_b if merged
+    # Unified backlog-only pipeline addendum (Part C, item 1):
+    # impact_score/confidence_score are now auto-derived from the promoted
+    # backlog candidate's own scores, not independently settable - seed a
+    # dedicated candidate with the exact 4/4 this test wants (own score
+    # 16 - would rank below bl_a/bl_b if merged into the backlog ranking).
+    tools.write_backlog_candidate.run(candidate=json.dumps({
+        "id": "bl_for_hyp_own_score", "statement": BACKLOG_STATEMENT, "source": "growth",
+        "fits_subsidiary_scope": "yes",
+        "impact": 4, "impact_grounding": finding_id,
+        "confidence": 4, "confidence_grounding": finding_id,
+        "ease": 5, "ease_grounding": finding_id,
+    }))
+    hyp = {**dict(SAMPLE_HYP), "backlog_candidate_id": "bl_for_hyp_own_score"}
     tools.write_hypothesis.run(hypothesis=json.dumps(hyp))
 
     block = tools.build_top_hypotheses_block(limit=2)
@@ -5776,6 +6123,7 @@ def _seed_wipeable_state(subsidiary_id="api-sentinel"):
     entry_id = "fix_wipetest01"
     holding.append_fix_md(entry_id, "technisch", "Test headline", "Test body.")
     holding.record_fix_entry(entry_id, "technisch", "Test headline", subsidiary_id, "zero_state_streak")
+    tools.log_cycle_usage({"total_tokens": 12345, "cost_usd": 0.42})
 
 
 def test_prepare_state_wipe_computes_real_counts_and_archives_without_deleting():
@@ -5805,6 +6153,7 @@ def test_prepare_state_wipe_computes_real_counts_and_archives_without_deleting()
     assert counts["kaizen_suggestions.jsonl"] == 1
     assert counts["kaizen_actions.jsonl"] == 1
     assert counts["fix_entries.jsonl (unresolved)"] == 1
+    assert counts["usage_history.jsonl"] == 1
 
     # Nothing was actually cleared yet - this is a dry run.
     assert len(json.loads(tools.read_hypotheses.run())) == 1
@@ -5812,6 +6161,7 @@ def test_prepare_state_wipe_computes_real_counts_and_archives_without_deleting()
     assert len(tools._read_global_jsonl("approval_queue.jsonl")) == 1
     assert len(holding._read("ideas.jsonl")) == 1
     assert "fix_wipetest01" in holding.HOLDING_DIR.joinpath("FIX.md").read_text(encoding="utf-8")
+    assert len(tools._read_jsonl("usage_history.jsonl")) == 1
 
     # Real archive files exist with the real content.
     archive_dir = Path(result["archive_dir"])
@@ -5891,6 +6241,7 @@ def test_execute_confirmed_wipe_clears_everything_after_prepare():
     unresolved_fix = [e for e in holding._read("fix_entries.jsonl") if not e.get("resolved")]
     assert unresolved_fix == []
     assert "fix_wipetest01" not in holding.HOLDING_DIR.joinpath("FIX.md").read_text(encoding="utf-8")
+    assert tools._read_jsonl("usage_history.jsonl") == [], "token/cost history resets too - a genuine clean start"
 
     # Archived data survives the wipe intact.
     archive_dir = Path(prepared["archive_dir"])
@@ -6174,109 +6525,262 @@ def test_backlog_gate_reopens_once_ten_real_candidates_exist():
 
 
 # --------------------------------------------------------------------------
-# One-time hyp_research_001 migration (Part B addendum, item 2)
+# Adaptive check-cadence utility (self-development addendum, Part D)
 # --------------------------------------------------------------------------
 
-def _seed_active_hyp_research_001():
+def test_adaptive_cadence_new_check_is_always_due():
+    state_dir = SCRATCH_DIR / "adaptive_new"
+    assert adaptive_cadence.is_check_due(state_dir, "kaizen") is True
+
+
+def test_adaptive_cadence_stretches_after_consecutive_misses():
+    state_dir = SCRATCH_DIR / "adaptive_stretch"
+    for _ in range(adaptive_cadence.STRETCH_AFTER_CONSECUTIVE_MISSES):
+        assert adaptive_cadence.is_check_due(state_dir, "kaizen") is True
+        adaptive_cadence.record_check_outcome(state_dir, "kaizen", False)
+    # Interval doubled to 2 after 3 consecutive misses - not due again next cycle.
+    assert adaptive_cadence.is_check_due(state_dir, "kaizen") is False
+    adaptive_cadence.note_cycle_passed_without_running(state_dir, "kaizen")
+    assert adaptive_cadence.is_check_due(state_dir, "kaizen") is True
+
+
+def test_adaptive_cadence_tightens_immediately_on_a_hit():
+    state_dir = SCRATCH_DIR / "adaptive_tighten"
+    for _ in range(adaptive_cadence.STRETCH_AFTER_CONSECUTIVE_MISSES):
+        adaptive_cadence.record_check_outcome(state_dir, "kaizen", False)
+    adaptive_cadence.note_cycle_passed_without_running(state_dir, "kaizen")
+    assert adaptive_cadence.is_check_due(state_dir, "kaizen") is True
+    # A hit on the stretched-interval attempt tightens straight back to
+    # every cycle, not just a smaller stretch.
+    adaptive_cadence.record_check_outcome(state_dir, "kaizen", True)
+    assert adaptive_cadence.is_check_due(state_dir, "kaizen") is True
+    adaptive_cadence.note_cycle_passed_without_running(state_dir, "kaizen")
+    assert adaptive_cadence.is_check_due(state_dir, "kaizen") is True
+
+
+def test_adaptive_cadence_interval_caps_at_max():
+    state_dir = SCRATCH_DIR / "adaptive_cap"
+    for _ in range(6):  # far more misses than needed to reach MAX_INTERVAL
+        adaptive_cadence.record_check_outcome(state_dir, "kaizen", False)
+    entry = adaptive_cadence._read_all(state_dir)["kaizen"]
+    assert entry["interval"] <= adaptive_cadence.MAX_INTERVAL
+
+
+def test_adaptive_cadence_scoped_per_check_name():
+    state_dir = SCRATCH_DIR / "adaptive_scoped"
+    for _ in range(adaptive_cadence.STRETCH_AFTER_CONSECUTIVE_MISSES):
+        adaptive_cadence.record_check_outcome(state_dir, "kaizen", False)
+    assert adaptive_cadence.is_check_due(state_dir, "kaizen") is False
+    assert adaptive_cadence.is_check_due(state_dir, "some_other_check") is True
+
+
+def test_kaizen_due_input_wired_into_interpolation_and_sub_ceo_gets_a_real_signal():
+    # End-to-end wiring check: the real crew object interpolates
+    # {kaizen_due} cleanly (this is what production kickoff() does), and
+    # the resolved text actually reflects the value passed, not a stale
+    # placeholder.
+    original = [(t, t.description) for t in crew.crew.tasks]
+    try:
+        crew.crew._interpolate_inputs({"subsidiary_id": "api-sentinel", "kaizen_due": "no", "self_assessment_due": "no"})
+        task_ceo_text = crew.task_ceo.description
+        assert "due this cycle: no" in task_ceo_text
+    finally:
+        for t, description in original:
+            t.description = description
+
+
+def test_self_assessment_due_wired_into_main_ceo_review_interpolation():
+    original = [(t, t.description) for t in crew.crew.tasks]
+    try:
+        crew.crew._interpolate_inputs({"subsidiary_id": "api-sentinel", "kaizen_due": "yes", "self_assessment_due": "no"})
+        main_ceo_text = crew.task_main_ceo_review.description
+        assert "5.6) Self-assessment" in main_ceo_text
+        assert "due this cycle: no. Same adaptive pacing" in main_ceo_text
+    finally:
+        for t, description in original:
+            t.description = description
+
+
+# --------------------------------------------------------------------------
+# Self-assessment (self-development addendum, Part F item 1)
+# --------------------------------------------------------------------------
+
+def test_build_self_assessment_on_fresh_subsidiary_is_honestly_minimal():
+    reset_state()
+    holding.read_subsidiaries.run()
+    result = json.loads(holding.build_self_assessment.run(subsidiary_id="api-sentinel"))
+    assert result["hypotheses_tried"] == 0
+    assert result["resolved_count"] == 0
+    assert result["has_any_validated_build"] is False
+    assert result["durable_learnings_count"] == 0
+    assert result["since"] is None
+
+
+def test_build_self_assessment_counts_real_outcomes_and_learnings():
+    reset_state()
+    holding.read_subsidiaries.run()
+    tools.write_hypothesis.run(hypothesis=json.dumps(SAMPLE_HYP))
     tools.write_hypothesis.run(hypothesis=json.dumps({
-        "id": "hyp_research_001", "statement": "silent API failures in trading bots", "category": "value",
-        "landing_page_variant_id": "v1", "failure_rate": 0.5, "success_rate": 0.5, "duration_days": 14,
-        "channel": "reddit", "hypothesis_type": "value", "impact_score": 7, "confidence_score": 6,
-        "evidence_stage": "research", "research_objective": "o", "research_confirming_criteria": "c",
-        "research_disconfirming_criteria": "d", "primary_variable_tested": "audience",
+        "id": "hyp_test_0001", "status": "evaluated", "outcome": "bury", "bury_reasoning": "weak signal",
     }))
-    return _real_research_finding_id("hyp_research_001")
-
-
-def _seed_hyp_research_001_approvals():
-    tools._write_global_jsonl("approval_queue.jsonl", tools._read_global_jsonl("approval_queue.jsonl") + [
-        {
-            "id": "appr_52dbb9d5", "category": "publish", "proposal": "post to r/algotrading",
-            "reasoning": "r", "status": "pending", "subsidiary_id": "api-sentinel",
-        },
-        {
-            "id": "appr_018963dc", "category": "publish", "proposal": "post to r/quantfinance",
-            "reasoning": "r", "status": "pending", "subsidiary_id": "api-sentinel",
-        },
-    ])
-
-
-def test_classify_command_migrate_hyp_research_001():
-    assert tools._classify_command("migrate_hyp_research_001: api-sentinel", "") == (
-        "migrate_hyp_research_001", "api-sentinel",
+    tools.write_knowledge_entry.run(
+        topic="reddit organic reach", takeaway="weak response, try a different community",
+        confidence="moderate", source_hypothesis_ids=json.dumps(["hyp_test_0001"]),
     )
-    assert tools._classify_command("migrate_hyp_research_001:", "") is None
+    tools.log_cycle_usage({"total_tokens": 5000, "cost_usd": 0.15})
+
+    result = json.loads(holding.build_self_assessment.run(subsidiary_id="api-sentinel"))
+    assert result["hypotheses_tried"] == 1
+    assert result["outcome_counts"]["bury"] == 1
+    assert result["resolved_count"] == 1
+    assert result["has_any_validated_build"] is False
+    assert result["durable_learnings_count"] == 1
+    assert result["total_tokens_invested"] == 5000
+    assert result["total_cost_usd"] == 0.15
+    assert result["since"] is not None
+    # 10 (+1) seeded by reset_state()'s _seed_scored_backlog, none promoted here.
+    assert result["scored_backlog_candidates_count"] >= 10
 
 
-def test_migrate_hyp_research_001_to_backlog_skips_when_not_found():
+def test_build_self_assessment_flags_a_real_validated_build():
     reset_state()
-    result = tools.migrate_hyp_research_001_to_backlog("api-sentinel")
-    assert "skipped" in result
-
-
-def test_migrate_hyp_research_001_to_backlog_skips_when_already_resolved():
-    reset_state()
-    _seed_active_hyp_research_001()
+    holding.read_subsidiaries.run()
+    tools.write_hypothesis.run(hypothesis=json.dumps(SAMPLE_HYP))
     tools.write_hypothesis.run(hypothesis=json.dumps({
-        "id": "hyp_research_001", "status": "evaluated", "next_step": "already resolved earlier",
+        "id": "hyp_test_0001", "status": "evaluated", "outcome": "build",
     }))
-    result = tools.migrate_hyp_research_001_to_backlog("api-sentinel")
-    assert "skipped" in result
+    result = json.loads(holding.build_self_assessment.run(subsidiary_id="api-sentinel"))
+    assert result["has_any_validated_build"] is True
+    assert result["outcome_counts"]["build"] == 1
 
 
-def test_migrate_hyp_research_001_to_backlog_full_flow():
+def test_build_self_assessment_resets_with_state_wipe():
+    # "Since the last reset" needs no separate bookkeeping - a wipe clears
+    # hypotheses.jsonl/knowledge_base.jsonl/usage_history.jsonl together
+    # (2026-08-14 fix: usage_history.jsonl was missing from the wipe file
+    # list, found while building this exact mechanism), so the assessment
+    # naturally reports near-zero right after.
     reset_state()
-    _seed_active_hyp_research_001()
-    _seed_hyp_research_001_approvals()
+    holding.read_subsidiaries.run()
+    tools.write_hypothesis.run(hypothesis=json.dumps(SAMPLE_HYP))
+    tools.log_cycle_usage({"total_tokens": 9999, "cost_usd": 1.23})
+    before = json.loads(holding.build_self_assessment.run(subsidiary_id="api-sentinel"))
+    assert before["hypotheses_tried"] == 1
+    assert before["total_tokens_invested"] == 9999
 
-    result = tools.migrate_hyp_research_001_to_backlog("api-sentinel")
-    assert result.get("ok") is True, result
-    assert result["backlog_candidate_id"] == "backlog_from_hyp_research_001"
-    assert sorted(result["approvals_withdrawn"]) == ["appr_018963dc", "appr_52dbb9d5"]
+    tools.prepare_state_wipe("api-sentinel")
+    tools.execute_confirmed_wipe("api-sentinel")
 
-    candidates = {c["id"]: c for c in json.loads(tools.read_backlog.run(status="candidate"))}
-    assert "backlog_from_hyp_research_001" in candidates
-    cand = candidates["backlog_from_hyp_research_001"]
-    assert cand["impact"] == 7 and cand["confidence"] == 6
-
-    hyps = {h["id"]: h for h in json.loads(tools.read_hypotheses.run())}
-    assert hyps["hyp_research_001"]["status"] == "evaluated"
-
-    approvals = {a["id"]: a for a in tools._read_global_jsonl("approval_queue.jsonl")}
-    assert approvals["appr_52dbb9d5"]["status"] == "withdrawn"
-    assert approvals["appr_018963dc"]["status"] == "withdrawn"
-
-    # Idempotent: a second call is a clean no-op, not a duplicate/error.
-    second = tools.migrate_hyp_research_001_to_backlog("api-sentinel")
-    assert "skipped" in second
+    after = json.loads(holding.build_self_assessment.run(subsidiary_id="api-sentinel"))
+    assert after["hypotheses_tried"] == 0
+    assert after["total_tokens_invested"] == 0
+    assert after["since"] is None
 
 
-def test_migrate_hyp_research_001_to_backlog_requires_grounding():
+# --------------------------------------------------------------------------
+# Board-question channel (self-development addendum, Part F item 2)
+# --------------------------------------------------------------------------
+
+def test_file_board_question_requires_real_fields():
     reset_state()
-    tools.write_hypothesis.run(hypothesis=json.dumps({
-        "id": "hyp_research_001", "statement": "silent API failures in trading bots", "category": "value",
-        "landing_page_variant_id": "v1", "failure_rate": 0.5, "success_rate": 0.5, "duration_days": 14,
-        "channel": "reddit", "hypothesis_type": "value", "impact_score": 7, "confidence_score": 6,
-        "evidence_stage": "research", "research_objective": "o", "research_confirming_criteria": "c",
-        "research_disconfirming_criteria": "d", "primary_variable_tested": "audience",
-    }))
-    # No research_findings logged for it this time - must refuse rather than
-    # fabricate a candidate with no real grounding.
-    result = tools.migrate_hyp_research_001_to_backlog("api-sentinel")
+    assert "error" in json.loads(holding.file_board_question.run(
+        subsidiary_id="api-sentinel", question="", context="c", filed_by="sub_ceo",
+    ))
+    assert "error" in json.loads(holding.file_board_question.run(
+        subsidiary_id="api-sentinel", question="q", context="", filed_by="sub_ceo",
+    ))
+    assert "error" in json.loads(holding.file_board_question.run(
+        subsidiary_id="api-sentinel", question="q", context="c", filed_by="growth",
+    ))
+
+
+def test_file_board_question_and_read_roundtrip():
+    reset_state()
+    result = json.loads(holding.file_board_question.run(
+        subsidiary_id="api-sentinel",
+        question="Two well-scored directions surfaced - which should get the next active slot?",
+        context="Both candidates score similarly on ICE; no clear tactical reason to prefer one.",
+        filed_by="main_ceo",
+    ))
+    assert result.get("ok") is True
+    question_id = result["id"]
+
+    open_questions = json.loads(holding.read_board_questions.run(subsidiary_id="api-sentinel", status="open"))
+    assert len(open_questions) == 1
+    assert open_questions[0]["id"] == question_id
+    assert open_questions[0]["filed_by"] == "main_ceo"
+
+
+def test_classify_command_board_answer():
+    assert tools._classify_command("board_answer: boardq_abc123 go with the enterprise angle", "") == (
+        "board_answer", ("boardq_abc123", "go with the enterprise angle"),
+    )
+    assert tools._classify_command("board_answer: boardq_abc123", "") is None
+    assert tools._classify_command("board_answer:", "") is None
+
+
+def test_answer_board_question_closes_it_with_a_real_answer():
+    reset_state()
+    filed = json.loads(holding.file_board_question.run(
+        subsidiary_id="api-sentinel", question="q", context="c", filed_by="sub_ceo",
+    ))
+    result = holding.answer_board_question(filed["id"], "go with option A")
+    assert result.get("ok") is True
+
+    stored = json.loads(holding.read_board_questions.run(subsidiary_id="api-sentinel"))[0]
+    assert stored["status"] == "answered"
+    assert stored["answer"] == "go with option A"
+    assert stored["answered_at"] is not None
+
+
+def test_answer_board_question_requires_nonempty_answer_and_only_touches_open():
+    reset_state()
+    filed = json.loads(holding.file_board_question.run(
+        subsidiary_id="api-sentinel", question="q", context="c", filed_by="sub_ceo",
+    ))
+    assert "error" in holding.answer_board_question(filed["id"], "")
+    holding.answer_board_question(filed["id"], "first answer")
+    result = holding.answer_board_question(filed["id"], "second answer")
     assert "error" in result
+    stored = json.loads(holding.read_board_questions.run(subsidiary_id="api-sentinel"))[0]
+    assert stored["answer"] == "first answer", "already-answered question must not be silently overwritten"
 
 
-def test_apply_telegram_commands_migrate_hyp_research_001_dispatch():
+def test_apply_telegram_commands_board_answer_dispatch():
     reset_state()
-    _seed_active_hyp_research_001()
-    _seed_hyp_research_001_approvals()
-
+    filed = json.loads(holding.file_board_question.run(
+        subsidiary_id="api-sentinel", question="q", context="c", filed_by="sub_ceo",
+    ))
     log = tools._apply_telegram_commands([
-        {"text": "migrate_hyp_research_001: api-sentinel", "reply_to_text": ""},
+        {"text": f"board_answer: {filed['id']} go with the enterprise angle", "reply_to_text": ""},
     ])
-    assert any("hyp_research_001 migriert" in entry for entry in log), log
-    hyps = {h["id"]: h for h in json.loads(tools.read_hypotheses.run())}
-    assert hyps["hyp_research_001"]["status"] == "evaluated"
+    assert any("Board-Frage beantwortet" in entry for entry in log), log
+    stored = json.loads(holding.read_board_questions.run(subsidiary_id="api-sentinel"))[0]
+    assert stored["status"] == "answered"
+    assert stored["answer"] == "go with the enterprise angle"
+
+
+def test_aufsichtsrat_lines_surfaces_new_board_questions():
+    lines = crew._aufsichtsrat_lines(
+        0, {}, 0, board_questions_new=[{
+            "id": "boardq_x", "filed_by": "main_ceo", "subsidiary_id": "api-sentinel",
+            "question": "Which direction should we prioritize?",
+        }],
+    )
+    joined = "\n".join(lines)
+    assert "boardq_x" in joined
+    assert "board_answer: boardq_x" in joined
+
+
+def test_read_unnotified_board_questions_and_mark_notified():
+    reset_state()
+    filed = json.loads(holding.file_board_question.run(
+        subsidiary_id="api-sentinel", question="q", context="c", filed_by="sub_ceo",
+    ))
+    unnotified = holding.read_unnotified_board_questions()
+    assert len(unnotified) == 1
+    holding.mark_board_questions_notified([filed["id"]])
+    assert holding.read_unnotified_board_questions() == []
 
 
 def main():

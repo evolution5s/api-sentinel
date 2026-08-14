@@ -64,15 +64,26 @@ BASE_REQUIRED_HYPOTHESIS_FIELDS = {
     "id", "statement", "category", "landing_page_variant_id",
     "failure_rate", "success_rate", "duration_days", "channel",
     "hypothesis_type",
-    # Bullseye-style ranking signal (four-fixes addendum, point 4) - same
-    # shape as channels.jsonl's impact_score/confidence_score, so competing
-    # hypothesis ideas can be ranked against each other the same way
-    # competing channels already are, instead of as a disconnected pass.
-    "impact_score", "confidence_score",
     # No longer optional (was under the audit addendum) - every hypothesis
     # now declares its own evidence stage from the start, since required-ness
     # of everything else below hinges on it.
     "evidence_stage",
+    # Unified backlog-only pipeline addendum (Part C, item 1): every
+    # hypothesis, without exception - including the very first one after a
+    # reset, including pivot follow-ups - must originate from an already-
+    # scored backlog candidate. No path in this function's creation logic
+    # skips this; see the validation block below. impact_score/
+    # confidence_score (previously required here directly, Bullseye-style
+    # ranking signal, four-fixes addendum point 4) are now AUTO-DERIVED
+    # from that candidate's own already-validated ICE impact/confidence
+    # (see below) rather than independently settable - this is also the
+    # fix for a real scale-mismatch bug (a hypothesis-level score had no
+    # enforced 1-10 range, unlike backlog ICE sub-scores, which do) found
+    # while building an earlier one-off hypothesis-to-backlog conversion;
+    # inheriting an already-validated number makes that mismatch
+    # structurally impossible instead of trusting a conversion step to get
+    # it right.
+    "backlog_candidate_id",
 }
 # Only required once evidence_stage crosses into landing_page/build - see
 # the module-level comment above. AI-native economics addendum: the
@@ -158,6 +169,13 @@ PAYMENT_PROPENSITY_STALENESS_DAYS = 90
 # hypothesis (not per channel, since competition is about the specific
 # problem/solution being tested, not the community it's discussed in).
 COMPETITOR_SCAN_STALENESS_DAYS = 90
+# Unified backlog-only pipeline addendum (Part C, item 3): same
+# cache-freshness reasoning as the two constants above, reused rather than
+# inventing a new number - how long a backlog candidate's ICE score stands
+# unquestioned before it's flagged worth reconsidering if it comes up for
+# promotion, distinct from the direction-change and new-research triggers
+# (which fire regardless of age).
+SCORE_STALENESS_DAYS = 90
 # A community_engagement-stage artifact must be one of these post_types
 # (section 4) - an actual thread reply or a genuine question post, not
 # passive lurking.
@@ -421,6 +439,30 @@ def _backlog_grounding_exists(grounding: str) -> bool:
     ids |= {c.get("id") for c in _read_jsonl("channels.jsonl")}
     ids |= {a.get("id") for a in _read_global_jsonl("approval_queue.jsonl")}
     return grounding in ids
+
+
+def _new_research_since(grounding: str, since_iso: str) -> bool:
+    """Lazy re-scoring addendum (Part C, item 3), trigger (b): has genuinely
+    NEW, directly-relevant research shown up since a candidate's score was
+    last set? Deliberately narrow/mechanical rather than a fuzzy topic-
+    similarity guess (this codebase's existing discipline: never claim
+    something mechanically that isn't actually checkable) - "directly
+    relevant" is defined as "logged against the same hypothesis_id as the
+    research_finding this candidate's own grounding already points to".
+    grounding may be any backlog-grounding id (research_finding/
+    knowledge_base/channel/approval, see _backlog_grounding_exists) - only
+    a research_finding id can trigger this, everything else returns False.
+    """
+    if not grounding or not since_iso:
+        return False
+    findings = _read_jsonl("research_findings.jsonl")
+    source = next((f for f in findings if f.get("id") == grounding), None)
+    if source is None or not source.get("hypothesis_id"):
+        return False
+    return any(
+        f.get("hypothesis_id") == source["hypothesis_id"] and (f.get("created_at") or "") > since_iso
+        for f in findings
+    )
 
 
 def _scored_backlog_count(exclude_id: str = None) -> int:
@@ -773,13 +815,17 @@ def build_top_hypotheses_block(limit: int = 4) -> dict:
     "is_new"} - never fabricated, every field traces to a real backlog/
     hypothesis record.
     """
-    backlog_promoted_hyp_ids = {
-        c.get("promoted_to_hypothesis_id")
-        for c in json.loads(read_backlog.run(status="promoted"))
-    }
+    # No longer excludes hypotheses whose id appears in a promoted backlog
+    # candidate's promoted_to_hypothesis_id (unified backlog-only pipeline
+    # addendum, Part C): that exclusion made sense only while
+    # backlog_candidate_id was optional and rare - now that EVERY
+    # hypothesis is backlog-promoted (item 1, no exceptions), it silently
+    # emptied "active" entirely. top_backlog already only shows
+    # status='candidate' entries, so a promoted candidate was never at
+    # real risk of double-listing there either.
     active_hyps = []
     for h in _read_jsonl("hypotheses.jsonl"):
-        if h.get("status") != "active" or h.get("id") in backlog_promoted_hyp_ids:
+        if h.get("status") != "active":
             continue
         impact = h.get("impact_score")
         confidence = h.get("confidence_score")
@@ -1353,10 +1399,26 @@ def write_hypothesis(hypothesis: str) -> str:
     hypothesis, or re-activating an existing one) requires at least
     MIN_BACKLOG_BEFORE_ACTIVE_PROMOTION scored, grounded candidates in
     read_backlog(status="candidate") first - not counting the one being
-    promoted (pass backlog_candidate_id so it's excluded from its own
-    count). An already-active hypothesis being updated is unaffected. Use
+    promoted (backlog_candidate_id is excluded from its own count). An
+    already-active hypothesis being updated is unaffected. Use
     write_backlog_candidate to grow the backlog before attempting a
     promotion that's currently blocked by this.
+
+    backlog_candidate_id is REQUIRED on every new hypothesis (unified
+    backlog-only pipeline addendum, Part C item 1) - no exceptions, not
+    even for the very first hypothesis ever created, not even for a pivot
+    follow-up. It must reference a real, still-unpromoted, fully
+    ICE-scored (impact/confidence/ease all set) hypothesis_backlog.jsonl
+    entry - write_backlog_candidate it and score it first if it doesn't
+    exist yet. This call then marks that candidate status='promoted' as
+    part of the same write (no separate write_backlog_candidate call
+    needed afterward) and copies its own already-validated impact/
+    confidence directly onto this hypothesis's impact_score/
+    confidence_score - those two fields are no longer independently
+    settable here, whatever is passed for them is ignored in favor of the
+    candidate's real numbers, closing a real scale-mismatch risk (a
+    hypothesis-level score previously had no enforced 1-10 range, unlike
+    backlog ICE sub-scores).
     """
     try:
         patch = json.loads(hypothesis)
@@ -1584,6 +1646,48 @@ def write_hypothesis(hypothesis: str) -> str:
             missing = BASE_REQUIRED_HYPOTHESIS_FIELDS - patch.keys()
             if missing:
                 return json.dumps({"error": f"new hypothesis missing required fields: {sorted(missing)}"})
+
+            # Unified backlog-only pipeline addendum (Part C, item 1) - no
+            # exceptions, checked before anything else in this branch: the
+            # candidate must be real, still unpromoted, and genuinely
+            # scored. Only VALIDATES and reads here, deliberately - the
+            # candidate is not marked 'promoted' until this whole
+            # hypothesis is actually about to be persisted (further down,
+            # after every other creation check below has also passed) -
+            # marking it here would leave a candidate falsely flagged
+            # 'promoted' pointing at a hypothesis that was never actually
+            # created if a later check in this same call fails.
+            _backlog_snapshot = _read_jsonl("hypothesis_backlog.jsonl")
+            _candidate = next(
+                (c for c in _backlog_snapshot if c.get("id") == patch.get("backlog_candidate_id")), None
+            )
+            if _candidate is None:
+                return json.dumps({
+                    "error": f"backlog_candidate_id '{patch.get('backlog_candidate_id')}' does not exist in "
+                             "hypothesis_backlog.jsonl - write_backlog_candidate it first, no hypothesis can "
+                             "be created without a real backlog candidate behind it (no exceptions)"
+                })
+            if _candidate.get("status") != "candidate":
+                return json.dumps({
+                    "error": f"backlog_candidate_id '{patch['backlog_candidate_id']}' has status "
+                             f"'{_candidate.get('status')}', not 'candidate' - it's either already promoted "
+                             "to another hypothesis or shelved, pick a different one"
+                })
+            if _candidate.get("impact") is None or _candidate.get("confidence") is None or _candidate.get("ease") is None:
+                return json.dumps({
+                    "error": f"backlog_candidate_id '{patch['backlog_candidate_id']}' is not fully ICE-scored "
+                             "yet (impact/confidence/ease) - score it first via write_backlog_candidate, "
+                             "never promote an unscored candidate"
+                })
+            # Auto-derived, not independently settable (see
+            # BASE_REQUIRED_HYPOTHESIS_FIELDS comment) - overrides anything
+            # the caller passed for these two fields, so the hypothesis's
+            # ranking score always traces to the same already-validated
+            # 1-10 ICE number the candidate itself was promoted on, never
+            # a re-typed, differently-scaled one.
+            patch["impact_score"] = _candidate["impact"]
+            patch["confidence_score"] = _candidate["confidence"]
+
             prior_id = patch.get("prior_hypothesis_id")
             if prior_id:
                 prior = next((h for h in hyps if h.get("id") == prior_id), None)
@@ -1676,6 +1780,29 @@ def write_hypothesis(hypothesis: str) -> str:
                 **patch,
             }
             hyps.append(record)
+            # Only now, with every creation check above having actually
+            # passed, mark the candidate as promoted - single mechanical
+            # step, not a second call the caller has to remember (the
+            # earlier two-step "call write_hypothesis, then call
+            # write_backlog_candidate again with status='promoted'" pattern
+            # relied on the agent doing both, which is exactly the kind of
+            # forgettable step this codebase has repeatedly had to make
+            # mechanical elsewhere). Lock ordering: hypotheses.jsonl (this
+            # function's own, already held) is always the outer lock,
+            # hypothesis_backlog.jsonl the inner one - keep this order
+            # everywhere the two are ever nested, to avoid a deadlock.
+            with _jsonl_lock("hypothesis_backlog.jsonl"):
+                _backlog_now = _read_jsonl("hypothesis_backlog.jsonl")
+                _candidate_idx = next(
+                    (i for i, c in enumerate(_backlog_now) if c.get("id") == patch["backlog_candidate_id"]), None
+                )
+                if _candidate_idx is not None:
+                    _backlog_now[_candidate_idx] = {
+                        **_backlog_now[_candidate_idx],
+                        "status": "promoted",
+                        "promoted_to_hypothesis_id": patch["id"],
+                    }
+                    _write_jsonl("hypothesis_backlog.jsonl", _backlog_now)
         else:
             merged = dict(hyps[existing_index])
             for key, value in patch.items():
@@ -1948,12 +2075,19 @@ def write_backlog_candidate(candidate: str) -> str:
     documented basis for your own ease number, not something this tool
     checks mechanically.
 
-    Promotion to active testing is two steps, same pattern as route_idea:
-    call write_hypothesis to actually create the new active hypothesis
-    (optionally citing backlog_candidate_id on it), then call this tool
-    again with status='promoted' and promoted_to_hypothesis_id set. Never
-    promote past MAX_ACTIVE_HYPOTHESES - write_hypothesis enforces that cap
-    itself, this tool doesn't duplicate the check.
+    Promotion to active testing is now ONE mechanical step (unified
+    backlog-only pipeline addendum, Part C item 1 - previously two, which
+    relied on remembering a second call): call write_hypothesis with
+    backlog_candidate_id set to this candidate's id - REQUIRED on every
+    new hypothesis now, no exceptions, not just an option. write_hypothesis
+    itself marks this candidate status='promoted'/promoted_to_hypothesis_id
+    as part of that same call once every other creation check has passed;
+    calling this tool again afterward with status='promoted' is no longer
+    necessary and will simply find the candidate already in that state.
+    Never promote past MAX_ACTIVE_HYPOTHESES - write_hypothesis enforces
+    that cap itself, this tool doesn't duplicate the check. Also requires
+    the candidate to be genuinely, fully ICE-scored (impact/confidence/
+    ease all set) first - write_hypothesis refuses an unscored candidate.
     """
     try:
         patch = json.loads(candidate)
@@ -2042,6 +2176,17 @@ def write_backlog_candidate(candidate: str) -> str:
         if "impact" in patch or "impact_grounding" in patch:
             patch["impact_scored_under_direction_id"] = _current_strategic_direction_id()
 
+        # Lazy re-scoring addendum (Part C, item 3): scoring is cached, not
+        # eagerly recomputed - a score stands until a real triggering
+        # reason exists, generalized from the existing impact-vs-direction
+        # staleness pattern above to the WHOLE score. `scored_at` timestamps
+        # any write that actually changes a score/grounding field, so
+        # read_backlog can compute a broader `score_stale` (see there) from
+        # direction changes, age, and newly-superseded grounding - never a
+        # blanket periodic re-scoring sweep.
+        if any(f in patch for f in ("impact", "confidence", "ease", "impact_grounding", "confidence_grounding", "ease_grounding")):
+            patch["scored_at"] = datetime.now(timezone.utc).isoformat()
+
         if existing_index is None:
             record = {
                 "created_at": datetime.now(timezone.utc).isoformat(),
@@ -2051,6 +2196,7 @@ def write_backlog_candidate(candidate: str) -> str:
                 "promoted_to_hypothesis_id": None,
                 "shelved_reasoning": None,
                 "impact_scored_under_direction_id": _current_strategic_direction_id(),
+                "scored_at": None,
                 **patch,
             }
             backlog.append(record)
@@ -2068,11 +2214,23 @@ def read_backlog(status: str = "") -> str:
     """Return hypothesis-backlog candidates as JSON, each annotated with a
     computed ice_score (scoring.compute_ice_score(impact, confidence,
     ease) - the same formula used in the cycle report's top-4 block, one
-    source of truth) and impact_stale (true if impact was last scored
-    under a strategic direction that isn't this subsidiary's current one
-    anymore - a signal to re-score before relying on it for ranking/
-    promotion, not something this tool recomputes on its own; only the
-    agent's own judgment can produce a real new impact number).
+    source of truth), impact_stale (true if impact specifically was last
+    scored under a strategic direction that isn't this subsidiary's
+    current one anymore), and the broader score_stale/stale_reasons pair
+    (unified backlog-only pipeline addendum, Part C item 3 - lazy
+    re-scoring: a score is cached and stands until a real triggering
+    reason exists, never a blanket periodic re-scoring sweep). score_stale
+    is true, with stale_reasons listing which of these actually fired,
+    when: (a) the strategic direction changed since scoring (same signal
+    as impact_stale, generalized to the whole score, not just impact -
+    audience/problem framing can affect confidence/ease too), (b) new
+    research has been logged against the same hypothesis_id as this
+    candidate's own grounding source since it was last scored, or (c) it's
+    been at least SCORE_STALENESS_DAYS since scored_at (plausibly stale by
+    age alone, worth a fresh look before promoting on it). None of this
+    recomputes a score on its own - only the agent's own judgment can
+    produce a real new number; this is a signal to re-score before relying
+    on it for ranking/promotion, not an automatic correction.
     Pass status='candidate'/'promoted'/'shelved' to filter, or '' for all.
     Sorted by ice_score descending (candidates without a complete ICE score
     yet sort last, not zero - an incomplete entry isn't "worthless", just
@@ -2082,6 +2240,7 @@ def read_backlog(status: str = "") -> str:
     if status:
         backlog = [c for c in backlog if c.get("status") == status]
     current_direction = _current_strategic_direction_id()
+    now_iso = datetime.now(timezone.utc).isoformat()
     annotated = []
     for c in backlog:
         entry = dict(c)
@@ -2092,6 +2251,23 @@ def read_backlog(status: str = "") -> str:
         entry["impact_stale"] = (
             c.get("impact") is not None and c.get("impact_scored_under_direction_id") != current_direction
         )
+
+        stale_reasons = []
+        scored_at = c.get("scored_at")
+        if scored_at:
+            if entry["impact_stale"]:
+                stale_reasons.append("strategic_direction_changed")
+            if _new_research_since(c.get("impact_grounding"), scored_at):
+                stale_reasons.append("new_research_since_scored")
+            try:
+                age_days = (datetime.fromisoformat(now_iso) - datetime.fromisoformat(scored_at)).days
+            except ValueError:
+                age_days = None
+            if age_days is not None and age_days >= SCORE_STALENESS_DAYS:
+                stale_reasons.append("score_older_than_staleness_window")
+        entry["stale_reasons"] = stale_reasons
+        entry["score_stale"] = bool(stale_reasons)
+
         annotated.append(entry)
     annotated.sort(key=lambda e: (e["ice_score"] is None, -(e["ice_score"] or 0)))
     return json.dumps(annotated, ensure_ascii=False)
@@ -3349,6 +3525,14 @@ _WIPE_SUBSIDIARY_JSONL_FILES = (
     "hypotheses.jsonl", "hypothesis_backlog.jsonl", "content_drafts.jsonl",
     "task_orders.jsonl", "knowledge_base.jsonl", "research_findings.jsonl",
     "business_reports.jsonl", "channels.jsonl",
+    # 2026-08-14 (self-development addendum, Part A/F): usage_history.jsonl
+    # was NOT in this list originally, meaning a wipe left token/cost
+    # history in place while clearing everything else it's about - a real
+    # gap found while building build_self_assessment (Part F item 1), which
+    # reports "tokens/cost invested since the last reset" and would
+    # otherwise silently include pre-reset spend. "A genuine clean start"
+    # (Part A's own framing) should reset this too.
+    "usage_history.jsonl",
 )
 
 
@@ -3515,114 +3699,6 @@ def execute_confirmed_wipe(subsidiary_id: str) -> dict:
     counts = pending.get("counts")
     _clear_pending_wipe()
     return {"ok": True, "subsidiary_id": subsidiary_id, "archive_dir": archive_dir, "counts": counts}
-
-
-# --------------------------------------------------------------------------
-# One-time retroactive migration (Part B addendum, item 2): hyp_research_001
-# was exempted from the 10-backlog-rule gate under a grandfather clause that
-# has since been removed entirely and retroactively - Jan's original rule
-# was unambiguous, at least 10 scored backlog candidates before any
-# validation happens, full stop, no exception. This converts hyp_research_
-# 001's real gathered evidence into a properly ICE-scored backlog candidate,
-# halts its special-cased active status so it goes through the same ranking
-# as every other candidate, and withdraws its own still-pending publish
-# approvals - the cleanup the addendum called for.
-#
-# Deliberately named after this one hypothesis, and deliberately NOT an
-# @tool: this is a one-time, human-triggered migration in the same tier as
-# wipe_state:/fix_resolved: (only reachable via _apply_telegram_commands),
-# not ongoing agent-facing logic - the "no single-hypothesis hardcoding"
-# principle (competitor-research addendum) is about business logic/prompts
-# an agent acts on every cycle, not an auditable one-off cleanup a human
-# explicitly triggers once. Idempotent: checked against real live state
-# (hyp_research_001's actual current status), not a one-shot flag, so it's
-# harmless to trigger more than once by mistake.
-# --------------------------------------------------------------------------
-
-def migrate_hyp_research_001_to_backlog(subsidiary_id: str) -> dict:
-    """Telegram command 'migrate_hyp_research_001: <subsidiary_id>' - see
-    module comment above for why this exists and why it's scoped to this
-    one hypothesis id.
-    """
-    previous_subsidiary = _active_subsidiary_id
-    set_active_subsidiary(subsidiary_id)
-    try:
-        hyp = next((h for h in _read_jsonl("hypotheses.jsonl") if h.get("id") == "hyp_research_001"), None)
-        if hyp is None:
-            return {"skipped": f"no hypothesis 'hyp_research_001' found for subsidiary '{subsidiary_id}'"}
-        if hyp.get("status") != "active":
-            return {
-                "skipped": f"hyp_research_001 status is already '{hyp.get('status')}', not 'active' - "
-                           "already migrated (or never was active), nothing to do"
-            }
-
-        findings = [f for f in _read_jsonl("research_findings.jsonl") if f.get("hypothesis_id") == "hyp_research_001"]
-        if not findings:
-            return {"error": "hyp_research_001 has no research_findings.jsonl entries to ground a backlog candidate in - cannot migrate without real grounding"}
-        grounding_id = findings[0]["id"]
-
-        impact = hyp.get("impact_score") or 5
-        confidence = hyp.get("confidence_score") or 5
-        candidate_result = json.loads(write_backlog_candidate.run(candidate=json.dumps({
-            "id": "backlog_from_hyp_research_001",
-            "statement": (
-                f"Retroactive migration of hyp_research_001 under the Part B addendum's removed "
-                f"grandfather clause. Original statement: {(hyp.get('statement') or hyp.get('id'))[:300]} "
-                f"Real gathered evidence: {len(findings)} logged research finding(s) for this "
-                f"hypothesis, first grounded in {grounding_id}. Halted from status='active' so it is "
-                "ranked here like every other backlog candidate instead of staying specially active "
-                "outside the 10-candidate gate."
-            ),
-            "source": "system: hyp_research_001 migration (Part B addendum, item 2)",
-            "fits_subsidiary_scope": "yes",
-            "impact": impact, "impact_grounding": grounding_id,
-            "confidence": confidence, "confidence_grounding": grounding_id,
-            "ease": 5, "ease_grounding": grounding_id,
-        })))
-        if "error" in candidate_result:
-            return {"error": f"backlog candidate write failed: {candidate_result['error']}"}
-
-        hyp_result = json.loads(write_hypothesis.run(hypothesis=json.dumps({
-            "id": "hyp_research_001",
-            "status": "evaluated",
-            "next_step": (
-                "Paused per the Part B addendum (10-backlog-rule, grandfather exception removed "
-                "retroactively) - its real evidence now lives as backlog_from_hyp_research_001, "
-                "ranked against every other candidate. Re-promote via the normal backlog process "
-                "if it wins that ranking."
-            ),
-        })))
-        if "error" in hyp_result:
-            return {
-                "error": f"halting hyp_research_001 failed: {hyp_result['error']}",
-                "backlog_candidate_id": "backlog_from_hyp_research_001",
-            }
-
-        withdrawn = []
-        for approval_id in ("appr_52dbb9d5", "appr_018963dc"):
-            record = next((a for a in _read_global_jsonl("approval_queue.jsonl") if a.get("id") == approval_id), None)
-            if record is None:
-                continue
-            if record.get("status") != "pending":
-                continue
-            w = json.loads(withdraw_approval.run(
-                approval_id=approval_id,
-                reason=(
-                    "paused pending 10-candidate backlog comparison per governance rule (Part B "
-                    "addendum) - hyp_research_001's grandfather exemption was removed retroactively"
-                ),
-            ))
-            if w.get("ok"):
-                withdrawn.append(approval_id)
-
-        return {
-            "ok": True,
-            "backlog_candidate_id": "backlog_from_hyp_research_001",
-            "hypothesis_halted": True,
-            "approvals_withdrawn": withdrawn,
-        }
-    finally:
-        set_active_subsidiary(previous_subsidiary)
 
 
 def is_system_paused() -> tuple[bool, str]:
@@ -3879,11 +3955,16 @@ def _classify_command(text: str, reply_to_text: str):
         subsidiary_id = text.split(":", 1)[1].strip()
         return ("wipe_confirm", subsidiary_id) if subsidiary_id else None
 
-    # One-time hyp_research_001 migration (Part B addendum, item 2) - same
-    # tier as wipe_state:/wipe_confirm:, see migrate_hyp_research_001_to_backlog.
-    if normalized.startswith("migrate_hyp_research_001:"):
-        subsidiary_id = text.split(":", 1)[1].strip()
-        return ("migrate_hyp_research_001", subsidiary_id) if subsidiary_id else None
+    # Board-question channel (self-development addendum, Part F item 2) -
+    # "board_answer: <id> <answer text>", same tier as wipe_state:/
+    # fix_resolved:, human-only via _apply_telegram_commands.
+    if normalized.startswith("board_answer:"):
+        rest = text.split(":", 1)[1].strip()
+        parts = rest.split(None, 1)
+        if len(parts) == 2:
+            question_id, answer = parts
+            return ("board_answer", (question_id, answer)) if answer.strip() else None
+        return None
 
     return None
 
@@ -4084,21 +4165,15 @@ def _apply_telegram_commands(messages: list) -> list:
             )
             continue
 
-        if action == "migrate_hyp_research_001":
-            subsidiary_id = target_id
-            result = migrate_hyp_research_001_to_backlog(subsidiary_id)
+        if action == "board_answer":
+            question_id, answer = target_id
+            import holding  # local import: avoids a circular import (holding.py imports from tools)
+            result = holding.answer_board_question(question_id, answer)
             if "error" in result:
-                send_telegram_message(f"hyp_research_001-Migration fuer '{subsidiary_id}' fehlgeschlagen: {result['error']}")
+                send_telegram_message(f"Antwort auf '{question_id}' fehlgeschlagen: {result['error']}")
                 continue
-            if "skipped" in result:
-                send_telegram_message(f"hyp_research_001-Migration fuer '{subsidiary_id}': {result['skipped']}")
-                continue
-            log.append(f"{subsidiary_id}: hyp_research_001 migriert (Telegram)")
-            send_telegram_message(
-                f"hyp_research_001 migriert: als Backlog-Kandidat '{result['backlog_candidate_id']}' "
-                f"angelegt, Hypothese pausiert (status='evaluated'), Approvals zurueckgezogen: "
-                f"{', '.join(result['approvals_withdrawn']) or '(keine mehr pending)'}."
-            )
+            log.append(f"{question_id}: Board-Frage beantwortet (Telegram)")
+            send_telegram_message(f"{question_id}: Antwort erfasst - wird naechsten Zyklus gelesen.")
             continue
 
         # action in ("approve", "reject") from here - reject's payload is
