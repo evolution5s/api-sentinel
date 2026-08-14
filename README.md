@@ -1094,20 +1094,32 @@ drei zu einem Score 1-1000 (Standard-ICE-Konvention, ein Produkt, keine
 gewichtete Summe) - dieselbe Formel für `read_backlog`s Ranking und den
 Top-4-Block im Zyklus-Report, kein zweiter, paralleler Scoring-Pfad.
 
-**Harte Regel, direkt von Jan vorgegeben (nicht nur ein
-Governance-Vorschlag zur Bestätigung):** `MIN_BACKLOG_BEFORE_ACTIVE_
-PROMOTION = 10` - `write_hypothesis` verweigert jede Beförderung einer
-Hypothese auf `status='active'` (neu angelegt, oder eine bestehende
-reaktiviert), solange nicht mindestens 10 echte, bewertete
-Backlog-Kandidaten existieren (die zu befördernde Hypothese selbst zählt
-nicht mit). Grund: ein Backlog mit weniger als 10 echten Kandidaten ist
-nicht breit genug, um zu vertrauen, dass die beförderte Idee tatsächlich
-die beste verfügbare ist, statt einfach die einzige, die je aufgeschrieben
-wurde. Gilt nur für den Übergang IN `status='active'` - eine bereits aktive
-Hypothese, die aktiv bleibt, löst die Prüfung bei einem unrelated Update
-nicht erneut aus. Die eine Hypothese, die bereits aktiv war, bevor diese
-Regel existierte (`hyp_research_001`), läuft unter Bestandsschutz weiter;
-erst die *nächste* Beförderung wird gegen die Regel geprüft.
+**Harte Regel, direkt von Jan vorgegeben, ohne Ausnahme (10-Backlog-
+Regel-Addendum, **korrigiert 2026-08-14**):** `MIN_BACKLOG_BEFORE_ACTIVE_
+PROMOTION = 10` - mindestens 10 echte, bewertete Backlog-Kandidaten müssen
+existieren, sonst darf **keine** Hypothese in einem aktiven
+Validierungszustand sein, egal ob neu befördert oder bereits aktiv. Eine
+frühere Fassung dieser Regel enthielt eine Bestandsschutz-Ausnahme für
+`hyp_research_001` (aktiv bevor die Regel existierte) - das war ein
+Missverständnis von Jans ursprünglicher, eindeutiger Anweisung und wurde
+vollständig und rückwirkend entfernt: **keine Sonderbehandlung für keine
+Hypothese.** Der Gate-Check ist jetzt nicht mehr nur an den Übergang IN
+`status='active'` gebunden, sondern greift bei **jedem** `write_hypothesis`-
+Update, das eine Hypothese aktiv hält (`tools._backlog_gate_satisfied`,
+geteilt mit zwei weiteren Prüfstellen unten) - einzig eine echt auflösende
+Änderung (`status='evaluated'`/`'buried'`) kommt noch durch, alles andere
+wird abgelehnt.
+
+**Dieselbe Prüfung gilt jetzt auch für `file_task_order`** (jeder Aufruf
+mit gesetzter `hypothesis_id`) **und `request_approval(category='publish')`**
+(wenn das Template eine `hypothesis_id` trägt) - nicht mehr nur für den
+Statusübergang selbst. Solange das Gate geschlossen ist, bleibt nur
+erlaubt: Backlog-Kandidaten lesen/bewerten/schreiben, sowie echte
+administrative Aufräumarbeit - eine bestehende Hypothese auflösen
+(`status='evaluated'`/`'buried'`) und ihre noch offenen Freigaben über
+das neue `withdraw_approval`-Tool zurückziehen (unterscheidet sich von
+`reject`: "nicht mehr relevant", nicht "abgelehnt"; braucht einen echten
+Grund, rührt nie einen bereits entschiedenen Eintrag an).
 
 **Anti-Stagnation, jetzt mit echtem mechanischem Fallback statt nur
 Erkennung:** `scoring.spare_capacity_produced_nothing` erkennt bereits
@@ -1381,6 +1393,17 @@ genau das Fehlermuster, das das restliche Systemdesign (organisch-only,
 menschlich klingender Content, 90/10-Regel, `hypothesis_type=value`)
 vermeiden soll:
 
+- **Veraltete Richtung wird jetzt mechanisch korrigiert, nicht mehr dem
+  Main-CEO-Urteil überlassen** (Stale-Strategic-Direction-Addendum,
+  2026-08-14): zweimal in echten, unabhängigen Zyklen hat der Main-CEO
+  eine sichtbar veraltete, noch von der begrabenen `hyp_bootstrap_001`
+  geerbte Richtung (fest eingebaute Dollarbeträge/Conversion-Zahlen) als
+  "passt schon" durchgehen lassen. `crew.py`s `__main__` prüft jetzt vor
+  jedem `crew.kickoff()` per reinem Regex (`holding.
+  is_stale_strategic_direction`, keine LLM-Bewertung) die aktuelle
+  Richtung auf genau diese bekannten Muster und ersetzt sie bei Treffer
+  mechanisch (`crew.maybe_correct_stale_strategic_direction`) - der
+  Main-CEO bekommt die korrigierte Fassung nie anders zu Gesicht.
 - **Verpflichtende Erstausrichtung:** Für jede aktive Subsidiary prüft der
   Main-CEO `read_strategic_direction(subsidiary_id=...)`. Kommt
   `direction=null` zurück - diese Subsidiary hatte noch **nie** eine

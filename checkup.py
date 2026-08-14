@@ -3954,7 +3954,7 @@ def test_ceo_agent_tools_match_spec():
         "file_pivot_proposal", "file_cross_subsidiary_request", "search_research_archive",
         "read_subsidiary_policies", "read_content_drafts", "log_research_finding", "read_research_findings",
         "read_knowledge_base", "write_knowledge_entry", "propose_idea", "file_stage_skip_request",
-        "write_backlog_candidate", "read_backlog", "set_next_step",
+        "write_backlog_candidate", "read_backlog", "set_next_step", "withdraw_approval",
         "search_web", "read_webpage",
     }, tool_names
 
@@ -5699,6 +5699,219 @@ def test_apply_telegram_commands_wipe_confirm_without_prior_state_is_a_no_op():
             os.environ["TELEGRAM_BOT_TOKEN"] = had_token
         if had_chat is not None:
             os.environ["TELEGRAM_CHAT_ID"] = had_chat
+
+
+# --------------------------------------------------------------------------
+# Stale-strategic-direction addendum, Part A - mechanical detection +
+# forced correction, confirmed necessary after the Main-CEO's own live
+# judgment twice decided a known-stale direction was fine as-is.
+# --------------------------------------------------------------------------
+
+def test_is_stale_strategic_direction_detects_known_markers():
+    assert holding.is_stale_strategic_direction("target users who'd pay $49/mo, need 51+ conversions") is True
+    assert holding.is_stale_strategic_direction("need at least 20 conversions to validate") is True
+    assert holding.is_stale_strategic_direction("a $5 price point works for this niche") is True
+    assert holding.is_stale_strategic_direction(
+        "validate a real problem worth solving for the target audience"
+    ) is False
+    assert holding.is_stale_strategic_direction("") is False
+    assert holding.is_stale_strategic_direction(None) is False
+
+
+def test_corrected_strategic_direction_focus_area_is_itself_never_flagged_stale():
+    # The replacement text must not immediately re-trigger its own check -
+    # otherwise every cycle would "correct" a direction that was already
+    # corrected, forever.
+    corrected = holding.corrected_strategic_direction_focus_area("api-sentinel")
+    assert "api-sentinel" in corrected
+    assert holding.is_stale_strategic_direction(corrected) is False
+
+
+def test_maybe_correct_stale_strategic_direction_forces_a_real_replacement():
+    # This is the actual regression test for the failure mode: simulates a
+    # real stale direction existing (matching the exact live pattern
+    # confirmed on dir_ccfb394d), runs the real review logic
+    # (crew.maybe_correct_stale_strategic_direction), and asserts a NEW
+    # direction was actually written with corrected content - not just
+    # that the detection function alone returns True in isolation.
+    reset_state()
+    holding.read_subsidiaries.run()
+    stale = json.loads(holding.set_strategic_direction.run(
+        subsidiary_id="api-sentinel",
+        focus_area="Validate willingness to pay $49/mo, targeting 51+ conversions before committing to build.",
+        reasoning="initial direction",
+    ))
+    stale_id = stale["filed"]
+
+    new_id = crew.maybe_correct_stale_strategic_direction("api-sentinel")
+    assert new_id is not None and new_id != stale_id
+
+    current = json.loads(holding.read_strategic_direction.run(subsidiary_id="api-sentinel"))["direction"]
+    assert current["id"] == new_id
+    assert holding.is_stale_strategic_direction(current["focus_area"]) is False
+    assert "api-sentinel" in current["focus_area"]
+    assert stale_id in current["reasoning"]
+    assert "auto-corrected" in current["reasoning"].lower()
+
+    # A second call on the now-corrected direction must be a genuine no-op
+    # - never re-corrects an already-clean direction.
+    assert crew.maybe_correct_stale_strategic_direction("api-sentinel") is None
+    still_current = json.loads(holding.read_strategic_direction.run(subsidiary_id="api-sentinel"))["direction"]
+    assert still_current["id"] == new_id
+
+
+def test_maybe_correct_stale_strategic_direction_leaves_clean_direction_alone():
+    reset_state()
+    holding.read_subsidiaries.run()
+    clean = json.loads(holding.set_strategic_direction.run(
+        subsidiary_id="api-sentinel",
+        focus_area="Validate a real problem worth solving for this subsidiary's target users.",
+        reasoning="initial direction",
+    ))
+    assert crew.maybe_correct_stale_strategic_direction("api-sentinel") is None
+    current = json.loads(holding.read_strategic_direction.run(subsidiary_id="api-sentinel"))["direction"]
+    assert current["id"] == clean["filed"], "a genuinely clean direction must never be replaced"
+
+
+def test_maybe_correct_stale_strategic_direction_no_direction_set_is_a_noop():
+    reset_state()
+    holding.read_subsidiaries.run()
+    assert crew.maybe_correct_stale_strategic_direction("api-sentinel") is None
+    assert json.loads(holding.read_strategic_direction.run(subsidiary_id="api-sentinel"))["direction"] is None
+
+
+# --------------------------------------------------------------------------
+# 10-backlog-rule addendum, Part B - the grandfather clause is removed
+# entirely: an already-active hypothesis gets no exception either while
+# the backlog gate is unsatisfied. Regression test for the exact failure
+# this addendum fixes: an already-active hypothesis, an empty backlog,
+# confirming (a) further work on it is blocked, (b) it can be scored and
+# written as a backlog candidate itself, (c) its pending approvals get
+# withdrawn, (d) the gate correctly reopens only once 10 real candidates
+# exist.
+# --------------------------------------------------------------------------
+
+def test_write_hypothesis_active_hypothesis_blocked_when_backlog_drops_below_ten():
+    reset_state()  # seeds 10 scored candidates
+    tools.write_hypothesis.run(hypothesis=json.dumps(SAMPLE_HYP))  # active while backlog is satisfied
+    tools._write_jsonl("hypothesis_backlog.jsonl", [])  # backlog now empty - no grandfather clause anymore
+
+    # (a) Any further update that keeps it active is blocked - no exception
+    # for a hypothesis that was already active before the backlog emptied.
+    result = json.loads(tools.write_hypothesis.run(
+        hypothesis=json.dumps({"id": SAMPLE_HYP["id"], "impact_score": 7})
+    ))
+    assert "error" in result
+    assert "no exception" in result["error"] or "10-backlog-rule" in result["error"]
+
+    # A genuinely resolving update (bury) is still allowed - the gate only
+    # blocks further progress, never the exit.
+    resolved = json.loads(tools.write_hypothesis.run(hypothesis=json.dumps({
+        "id": SAMPLE_HYP["id"], "status": "buried",
+        "bury_reasoning": "paused pending 10-candidate backlog comparison per governance rule",
+    })))
+    assert "error" not in resolved, resolved
+
+
+def test_file_task_order_blocked_for_hypothesis_when_backlog_below_ten():
+    reset_state()
+    tools.write_hypothesis.run(hypothesis=json.dumps(SAMPLE_HYP))
+    tools._write_jsonl("hypothesis_backlog.jsonl", [])
+
+    blocked = json.loads(tools.file_task_order.run(
+        to_role="growth", task_description="do x", context="c", hypothesis_id=SAMPLE_HYP["id"],
+    ))
+    assert "error" in blocked
+
+    # A task order with NO hypothesis_id (genuinely unrelated admin work) is unaffected.
+    allowed = json.loads(tools.file_task_order.run(
+        to_role="growth", task_description="unrelated admin work", context="c", hypothesis_id="",
+    ))
+    assert "error" not in allowed, allowed
+
+
+def test_request_approval_publish_blocked_for_hypothesis_when_backlog_below_ten():
+    reset_state()
+    tools.write_hypothesis.run(hypothesis=json.dumps(SAMPLE_HYP))
+    tools._write_jsonl("hypothesis_backlog.jsonl", [])
+
+    template = {**_PUBLISH_TEMPLATE, "hypothesis_id": SAMPLE_HYP["id"]}
+    result = json.loads(tools.request_approval.run(category="publish", proposal=json.dumps(template), reasoning="r"))
+    assert "error" in result
+    assert "10-backlog-rule" in result["error"]
+
+
+def test_hypothesis_can_still_be_scored_as_its_own_backlog_candidate_while_gate_closed():
+    reset_state()
+    tools.write_hypothesis.run(hypothesis=json.dumps(SAMPLE_HYP))
+    tools._write_jsonl("hypothesis_backlog.jsonl", [])
+    finding_id = _real_research_finding_id(SAMPLE_HYP["id"])
+
+    result = json.loads(tools.write_backlog_candidate.run(candidate=json.dumps({
+        "id": "bl_from_hyp_research_001", "statement": BACKLOG_STATEMENT,
+        "source": f"converted from {SAMPLE_HYP['id']}'s own real findings", "fits_subsidiary_scope": "yes",
+        "impact": 8, "impact_grounding": finding_id,
+        "confidence": 7, "confidence_grounding": finding_id,
+        "ease": 6, "ease_grounding": finding_id,
+    })))
+    assert "error" not in result, result
+    backlog = json.loads(tools.read_backlog.run(status="candidate"))
+    assert any(c["id"] == "bl_from_hyp_research_001" for c in backlog)
+
+
+def test_withdraw_approval_clears_pending_approval_with_reason():
+    reset_state()
+    appr_id = json.loads(tools.request_approval.run(category="deploy", proposal="p", reasoning="r"))["queued"]
+    result = json.loads(tools.withdraw_approval.run(
+        approval_id=appr_id, reason="paused pending 10-candidate backlog comparison per governance rule",
+    ))
+    assert result == {"ok": True, "id": appr_id, "status": "withdrawn"}
+    stored = next(a for a in tools._read_global_jsonl("approval_queue.jsonl") if a["id"] == appr_id)
+    assert stored["status"] == "withdrawn"
+    assert "governance rule" in stored["decision_reason"]
+
+
+def test_withdraw_approval_requires_reason_and_only_touches_pending():
+    reset_state()
+    appr_id = json.loads(tools.request_approval.run(category="deploy", proposal="p", reasoning="r"))["queued"]
+    empty_reason = json.loads(tools.withdraw_approval.run(approval_id=appr_id, reason="  "))
+    assert "error" in empty_reason
+
+    records = tools._read_global_jsonl("approval_queue.jsonl")
+    records = approve.decide(records, appr_id, "approved", "looks fine")
+    tools._write_global_jsonl("approval_queue.jsonl", records)
+    already_decided = json.loads(tools.withdraw_approval.run(approval_id=appr_id, reason="no longer relevant"))
+    assert "error" in already_decided
+    stored = next(a for a in tools._read_global_jsonl("approval_queue.jsonl") if a["id"] == appr_id)
+    assert stored["status"] == "approved", "withdraw must never override an already-decided approval"
+
+
+def test_backlog_gate_reopens_once_ten_real_candidates_exist():
+    reset_state()
+    tools.write_hypothesis.run(hypothesis=json.dumps(SAMPLE_HYP))
+    tools._write_jsonl("hypothesis_backlog.jsonl", [])
+    blocked = json.loads(tools.file_task_order.run(
+        to_role="growth", task_description="do x", context="c", hypothesis_id=SAMPLE_HYP["id"],
+    ))
+    assert "error" in blocked
+
+    finding_id = _real_research_finding_id(SAMPLE_HYP["id"])
+    for i in range(10):
+        tools.write_backlog_candidate.run(candidate=json.dumps({
+            "id": f"bl_reopen_{i:02d}",
+            "statement": f"candidate {i} - a real, distinct angle worth testing separately, per real research",
+            "source": "growth", "fits_subsidiary_scope": "yes",
+            "impact": 5, "impact_grounding": finding_id,
+            "confidence": 5, "confidence_grounding": finding_id,
+            "ease": 5, "ease_grounding": finding_id,
+        }))
+    # Still below 10 until the loop above actually finishes - check exactly at the boundary.
+    assert len(json.loads(tools.read_backlog.run(status="candidate"))) == 10
+
+    reopened = json.loads(tools.file_task_order.run(
+        to_role="growth", task_description="do x", context="c", hypothesis_id=SAMPLE_HYP["id"],
+    ))
+    assert "error" not in reopened, reopened
 
 
 def main():

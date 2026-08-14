@@ -413,6 +413,27 @@ def _backlog_grounding_exists(grounding: str) -> bool:
     return grounding in ids
 
 
+def _scored_backlog_count(exclude_id: str = None) -> int:
+    """How many hypothesis_backlog.jsonl candidates are genuinely scored
+    (impact/confidence/ease all set - write_backlog_candidate already
+    enforces grounding on every score field) right now, optionally
+    excluding one (the candidate being promoted, so it doesn't count
+    toward its own threshold). Shared by every MIN_BACKLOG_BEFORE_ACTIVE_
+    PROMOTION check (write_hypothesis, file_task_order,
+    request_approval(category='publish')) - one source of truth.
+    """
+    return sum(
+        1 for c in _read_jsonl("hypothesis_backlog.jsonl")
+        if c.get("status") == "candidate"
+        and c.get("id") != exclude_id
+        and c.get("impact") is not None and c.get("confidence") is not None and c.get("ease") is not None
+    )
+
+
+def _backlog_gate_satisfied(exclude_id: str = None) -> bool:
+    return _scored_backlog_count(exclude_id) >= MIN_BACKLOG_BEFORE_ACTIVE_PROMOTION
+
+
 def _current_strategic_direction_id(subsidiary_id: str = None) -> str:
     """Reads STATE_DIR/_holding/strategic_directions.jsonl directly, same
     reasoning as _read_own_policies/_has_approved_stage_skip above -
@@ -1009,6 +1030,13 @@ def request_approval(category: str, proposal: str, reasoning: str) -> str:
                 return json.dumps({"error": f"publish template field '{_field}' must not be empty"})
         if not isinstance(template.get("is_experiment"), bool):
             return json.dumps({"error": "publish template field 'is_experiment' must be a boolean (true/false)"})
+        if template.get("hypothesis_id") and not _backlog_gate_satisfied():
+            return json.dumps({
+                "error": f"only {_scored_backlog_count()} genuinely scored backlog candidates exist "
+                         f"(need {MIN_BACKLOG_BEFORE_ACTIVE_PROMOTION}) - no publish approval tied to a "
+                         "hypothesis while this gate is unsatisfied (10-backlog-rule addendum, no "
+                         "exception) - write_backlog_candidate more candidates first"
+            })
         duplicate = _find_duplicate_publish_approval(template, _read_global_jsonl("approval_queue.jsonl"))
         if duplicate is not None:
             return json.dumps({
@@ -1069,6 +1097,37 @@ def check_approval_status(approval_id: str) -> str:
         "category": approval.get("category"),
         "payment_link_url": approval.get("payment_link_url"),
     })
+
+
+@tool("withdraw_approval")
+def withdraw_approval(approval_id: str, reason: str) -> str:
+    """Withdraw a still-pending approval request - distinct from
+    reject/approve.decide: withdrawn means circumstances changed (e.g. the
+    hypothesis it was tied to just got paused/buried, often because the
+    10-backlog-rule gate closed on it) and the request is no longer
+    relevant right now, not that a human looked at it and said no. Part of
+    the "genuinely necessary administrative cleanup" still allowed while
+    the backlog gate is closed (10-backlog-rule addendum, item 4) - use
+    this to withdraw a hypothesis's own pending publish/spend/etc.
+    approvals as part of pausing it, rather than leaving them dangling.
+    Only touches status='pending' entries - already-decided ones are left
+    alone, same discipline as approve.decide.
+    """
+    if not reason.strip():
+        return json.dumps({"error": "reason must not be empty - explain why this is no longer relevant right now"})
+    approvals = _read_global_jsonl("approval_queue.jsonl")
+    idx = next((i for i, a in enumerate(approvals) if a.get("id") == approval_id), None)
+    if idx is None:
+        return json.dumps({"error": f"no approval request with id '{approval_id}'"})
+    if approvals[idx].get("status") != "pending":
+        return json.dumps({
+            "error": f"'{approval_id}' is already '{approvals[idx].get('status')}', not touching it"
+        })
+    approvals[idx]["status"] = "withdrawn"
+    approvals[idx]["decided_at"] = datetime.now(timezone.utc).isoformat()
+    approvals[idx]["decision_reason"] = reason
+    _write_global_jsonl("approval_queue.jsonl", approvals)
+    return json.dumps({"ok": True, "id": approval_id, "status": "withdrawn"})
 
 
 def list_pending_approval_ids(subsidiary_id: str = "") -> list:
@@ -1319,27 +1378,36 @@ def write_hypothesis(hypothesis: str) -> str:
     prior_status = existing_record.get("status")
     effective_status = patch.get("status", prior_status if existing_index is not None else "active")
 
-    # Item 3 (Jan's explicit mandate): promoting INTO active status requires
-    # a backlog of at least MIN_BACKLOG_BEFORE_ACTIVE_PROMOTION genuinely
-    # scored (impact/confidence/ease all set - write_backlog_candidate
-    # already enforces grounding on every score field) candidates at that
-    # moment, not counting the one being promoted here via
-    # backlog_candidate_id. A hypothesis that's already active and stays
-    # active on this update is exempt - this only gates NEW promotions.
-    if effective_status == "active" and prior_status != "active":
+    # Item 3 (Jan's explicit mandate), extended by the 10-backlog-rule
+    # addendum item 1: at least MIN_BACKLOG_BEFORE_ACTIVE_PROMOTION
+    # genuinely scored backlog candidates must exist, full stop, no
+    # exception - not counting the one being promoted here via
+    # backlog_candidate_id. The earlier grandfather clause exempting a
+    # hypothesis already active before this rule existed was a misreading
+    # of Jan's original, unambiguous instruction and is removed entirely,
+    # retroactively: an already-active hypothesis staying active on this
+    # update is gated exactly the same as a brand-new promotion - the only
+    # way through while the gate is unsatisfied is a genuinely resolving
+    # update (status='evaluated'/'buried', which makes effective_status
+    # something other than 'active' and skips this block entirely).
+    if effective_status == "active":
         _promoting_candidate_id = patch.get("backlog_candidate_id", existing_record.get("backlog_candidate_id"))
-        _scored_backlog_count = sum(
-            1 for c in _read_jsonl("hypothesis_backlog.jsonl")
-            if c.get("status") == "candidate"
-            and c.get("id") != _promoting_candidate_id
-            and c.get("impact") is not None and c.get("confidence") is not None and c.get("ease") is not None
-        )
-        if _scored_backlog_count < MIN_BACKLOG_BEFORE_ACTIVE_PROMOTION:
+        _count = _scored_backlog_count(exclude_id=_promoting_candidate_id)
+        if _count < MIN_BACKLOG_BEFORE_ACTIVE_PROMOTION:
+            if prior_status != "active":
+                return json.dumps({
+                    "error": f"only {_count} genuinely scored backlog candidates exist "
+                             f"(need {MIN_BACKLOG_BEFORE_ACTIVE_PROMOTION} before promoting any hypothesis to "
+                             "status='active') - write_backlog_candidate more candidates with real impact/"
+                             "confidence/ease scores and grounding first, per Jan's explicit instruction"
+                })
             return json.dumps({
-                "error": f"only {_scored_backlog_count} genuinely scored backlog candidates exist "
-                         f"(need {MIN_BACKLOG_BEFORE_ACTIVE_PROMOTION} before promoting any hypothesis to "
-                         "status='active') - write_backlog_candidate more candidates with real impact/"
-                         "confidence/ease scores and grounding first, per Jan's explicit instruction"
+                "error": f"only {_count} genuinely scored backlog candidates exist "
+                         f"(need {MIN_BACKLOG_BEFORE_ACTIVE_PROMOTION}) - no further progress on an "
+                         "already-active hypothesis is allowed either while this gate is unsatisfied "
+                         "(10-backlog-rule addendum: the earlier grandfather clause is removed, no "
+                         "exception) - resolve it now (status='evaluated'/'buried') or build more scored "
+                         "backlog candidates first"
             })
 
     # Section 5: reasoning fields must be this hypothesis's own, not reused
@@ -2129,6 +2197,14 @@ def file_task_order(to_role: str, task_description: str, context: str, hypothesi
     """
     if to_role not in TASK_ORDER_ROLES:
         return json.dumps({"error": f"invalid to_role '{to_role}', must be one of {sorted(TASK_ORDER_ROLES)}"})
+    if hypothesis_id and not _backlog_gate_satisfied():
+        return json.dumps({
+            "error": f"only {_scored_backlog_count()} genuinely scored backlog candidates exist "
+                     f"(need {MIN_BACKLOG_BEFORE_ACTIVE_PROMOTION}) - no task order tied to a hypothesis "
+                     "while this gate is unsatisfied (10-backlog-rule addendum, no exception) - "
+                     "write_backlog_candidate more candidates first, or file this order with no "
+                     "hypothesis_id if it's genuinely unrelated administrative work"
+        })
     if to_role == "dev" and hypothesis_id:
         hyp = next((h for h in _read_jsonl("hypotheses.jsonl") if h.get("id") == hypothesis_id), None)
         stage = hyp.get("evidence_stage") if hyp else None

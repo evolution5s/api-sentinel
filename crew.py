@@ -67,6 +67,7 @@ from tools import (
     send_telegram_message,
     set_next_step,
     snapshot_state_counts,
+    withdraw_approval,
     write_backlog_candidate,
     write_channel,
     write_hypothesis,
@@ -467,6 +468,37 @@ ceo_agent = Agent(
         "outside this subsidiary's own focus - not a variation on the "
         "current hypothesis - propose_idea hands it to the Main-CEO instead "
         "of chasing it here unasked.\n\n"
+        "10-backlog-rule gate (Jan's explicit mandate, no exception - check "
+        "this FIRST, before anything else below): call read_backlog(status="
+        "'candidate') at the start of every cycle. If fewer than "
+        "MIN_BACKLOG_BEFORE_ACTIVE_PROMOTION (10) candidates are genuinely "
+        "scored (impact/confidence/ease all set with real grounding), "
+        "building the rest is THIS CYCLE'S PRIMARY TASK, not a side "
+        "activity to fit in if there's time - write_hypothesis, "
+        "file_task_order, and request_approval(category='publish') tied to "
+        "a hypothesis all mechanically refuse to proceed while this gate is "
+        "unsatisfied, active hypothesis or not, no exception (a prior "
+        "grandfather clause for a hypothesis already active before this "
+        "rule existed was a misreading of Jan's original instruction and "
+        "has been removed entirely). Use the substantial real research "
+        "already gathered as raw material - a competitor scan or "
+        "payment-propensity finding alone plausibly suggests more than one "
+        "candidate angle; don't invent thin candidates just to hit the "
+        "number, but do look harder at what's already been found before "
+        "concluding there's nothing more to score. If an existing active "
+        "hypothesis can't progress because of this gate, resolve it now "
+        "(write_hypothesis status='evaluated'/'buried' with real "
+        "reasoning) rather than leaving it stalled, and use "
+        "withdraw_approval (with a real reason) on any of its still-pending "
+        "publish/spend/etc. approvals that no longer make sense while it's "
+        "paused - genuinely necessary administrative cleanup, still allowed "
+        "while this gate is closed. Once genuinely 10 real candidates "
+        "exist: produce an explicit, visible ranking of all of them by ICE "
+        "score in your own report, and a genuine, reasoned decision on "
+        "which one(s) to promote (up to MAX_ACTIVE_HYPOTHESES) - a real "
+        "comparison outcome, never an assumption that whichever hypothesis "
+        "was active before automatically resumes by default, even if it "
+        "does end up scoring highest.\n\n"
         "Hypothesis backlog + ICE scoring (backlog addendum, Part 2): "
         "MAX_ACTIVE_HYPOTHESES is a genuine work-in-progress limit on how "
         "many hypotheses are being actively TESTED at once - it is not a "
@@ -539,7 +571,7 @@ ceo_agent = Agent(
         file_pivot_proposal, file_cross_subsidiary_request, search_research_archive,
         read_subsidiary_policies, read_content_drafts, log_research_finding, read_research_findings,
         read_knowledge_base, write_knowledge_entry, propose_idea, file_stage_skip_request,
-        write_backlog_candidate, read_backlog, set_next_step,
+        write_backlog_candidate, read_backlog, set_next_step, withdraw_approval,
         search_web, read_webpage,
     ],
     max_iter=AGENT_PROFILE["agents"]["sub_ceo"]["max_iter"],
@@ -1675,7 +1707,18 @@ task_main_ceo_review = ConditionalTask(
         "exists for it yet (see register_subsidiary's own docstring) - say "
         "so plainly if you route toward one rather than implying it can "
         "start running hypotheses immediately. An empty list is a normal, "
-        "valid outcome; don't invent an idea to route.\n"
+        "valid outcome; don't invent an idea to route. If your reasoning for "
+        "a decision here cites a system constant or capacity limit (e.g. "
+        "MAX_ACTIVE_HYPOTHESES, a channel/backlog cap), that number must "
+        "come from a real tool call's actual output this cycle - never "
+        "stated from memory. Confirmed real regression: a real cycle's "
+        "rejection reasoning for an idea once stated 'MAX_ACTIVE_HYPOTHESES "
+        "= 1' - the real value is 3 (tools.py), a fabricated number with no "
+        "textual source anywhere in these instructions, exactly the "
+        "unsupported-number failure mode this system's own ground-truth "
+        "discipline exists to prevent. If a capacity/count claim can't be "
+        "traced to a real tool result from this cycle, don't state it as a "
+        "specific number at all.\n"
         "1) Call read_status_reports(subsidiary_id='{subsidiary_id}', "
         "needs_decision_only=true) first - these are the Sub-CEO's fixed "
         "reports for anything that actually needs your attention this "
@@ -1994,6 +2037,36 @@ def generate_fix_diagnosis(check_type: str, subsidiary_id: str, evidence: dict, 
     problem_match = re.search(r"PROBLEM:\s*(.+)", response)
     headline = problem_match.group(1).strip()[:120] if problem_match else f"{check_type} ({subsidiary_id})"
     return {"category": category, "headline": headline, "body": response}
+
+
+def maybe_correct_stale_strategic_direction(subsidiary_id: str) -> str | None:
+    """Stale-strategic-direction addendum, Part A, items 1-2: reads the
+    real current strategic direction and, if its focus_area matches
+    holding.is_stale_strategic_direction's known-stale pattern (hardcoded
+    economics figures from the buried hyp_bootstrap_001 era), mechanically
+    replaces it via set_strategic_direction - never left to an agent's own
+    judgment call, confirmed twice in real cycles that judgment alone
+    missed this. Called from __main__ before crew.kickoff(), so
+    task_main_ceo_review's own LLM call never even sees the stale version.
+    Returns the newly-filed direction id, or None if nothing was stale.
+    """
+    current_direction = json.loads(read_strategic_direction.run(subsidiary_id=subsidiary_id)).get("direction")
+    if not current_direction or not holding.is_stale_strategic_direction(current_direction.get("focus_area", "")):
+        return None
+    correction = json.loads(set_strategic_direction.run(
+        subsidiary_id=subsidiary_id,
+        focus_area=holding.corrected_strategic_direction_focus_area(subsidiary_id),
+        reasoning=(
+            f"Auto-corrected: prior direction ({current_direction.get('id')}) matched a known-stale "
+            "pattern from the hyp_bootstrap_001 era (hardcoded economics figures) - mechanically "
+            "replaced per Jan's explicit instruction, not left to Main-CEO judgment (confirmed twice "
+            "live that judgment alone missed this)."
+        ),
+    ))
+    new_id = correction.get("filed")
+    print(f"[api-sentinel] strategic direction auto-corrected for '{subsidiary_id}': "
+          f"{current_direction.get('id')} -> {new_id}")
+    return new_id
 
 
 def run_fix_checks_for_subsidiary(subsidiary_id: str) -> None:
@@ -2463,6 +2536,13 @@ if __name__ == "__main__":
             # back) - tracked separately here so a cycle that DID escalate
             # via propose_idea itself isn't double-escalated below.
             pre_pending_idea_count = len(json.loads(read_ideas.run(status="pending")))
+
+            # Stale-strategic-direction addendum, Part A: mechanical check
+            # + forced correction, run in plain Python before crew.kickoff()
+            # so task_main_ceo_review's own LLM call never even sees a
+            # stale direction - confirmed twice in real cycles that leaving
+            # this to the Main-CEO's own judgment doesn't work.
+            maybe_correct_stale_strategic_direction(sub_id)
 
             def _finish_cycle(kickoff_exc: Exception = None):
                 run_fix_checks_for_subsidiary(sub_id)

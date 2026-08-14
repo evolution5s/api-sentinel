@@ -14,6 +14,7 @@ stays the single source of truth for Aufsichtsrat sign-off - this module
 never adds a second approval mechanism, only reads/reuses that one.
 """
 import json
+import re
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -1411,6 +1412,56 @@ def acknowledge_status_report(report_id: str) -> str:
 # came up to it. A genuinely new capability for main_ceo_agent, not an
 # extension of an existing one.
 # --------------------------------------------------------------------------
+
+# --------------------------------------------------------------------------
+# Mechanical stale-direction detection (stale-strategic-direction addendum,
+# Part A). Confirmed twice now, in two separate real cycles: an instruction
+# telling the Main-CEO to recognize and replace a stale direction (one
+# still carrying hardcoded economics figures from the buried
+# hyp_bootstrap_001 era) was implemented in prompt text, and twice the
+# Main-CEO's own live judgment decided the existing direction was fine as
+# it stood. Stop trying to fix this through better instructions - this is
+# a deterministic, regex-only check with no LLM judgment involved, run in
+# crew.py's plain Python __main__ loop BEFORE task_main_ceo_review's own
+# LLM call ever runs, so the agent never even sees the stale version.
+# --------------------------------------------------------------------------
+
+_STALE_STRATEGIC_DIRECTION_PATTERNS = (
+    re.compile(r"\$\d+(?:\.\d+)?(?:\s*/\s*mo(?:nth)?)?"),  # hardcoded dollar figures, e.g. $49, $49/mo
+    re.compile(r"\b\d+\+?\s*conversions?\b", re.IGNORECASE),  # "51+ conversions"/"51 conversions"
+)
+
+
+def is_stale_strategic_direction(focus_area: str) -> bool:
+    """True if focus_area contains one of the known-stale content markers
+    (a hardcoded dollar figure or conversion count) left over from the
+    buried hyp_bootstrap_001 era - a specific, known string pattern, never
+    a model judging whether a direction "seems" stale.
+    """
+    text = focus_area or ""
+    return any(pattern.search(text) for pattern in _STALE_STRATEGIC_DIRECTION_PATTERNS)
+
+
+def corrected_strategic_direction_focus_area(subsidiary_id: str) -> str:
+    """The replacement content forced in when is_stale_strategic_direction
+    fires: problem-first, no specific hardcoded numbers, monetization
+    stated as the eventual required filter every hypothesis must clear -
+    never a stated precondition or a specific figure baked into the
+    direction itself. Parametrized by subsidiary_id rather than hardcoding
+    any one subsidiary's business specifics (competitor-research addendum,
+    item 3 - the same discipline applied here for a new piece of text).
+    """
+    return (
+        f"Validate a real problem worth solving for {subsidiary_id}'s actual "
+        "target users - problem-first, not economics-first. Monetization "
+        "(break-even economics, defensibility, pricing) stays the required "
+        "filter every hypothesis must clear before it can reach build, but "
+        "it is evaluated per-hypothesis once real evidence exists, never "
+        "assumed or fixed in advance as a specific number in this "
+        "direction itself. Chasing revenue directly over solving the "
+        "actual problem is not the goal."
+    )
+
 
 @tool("set_strategic_direction")
 def set_strategic_direction(subsidiary_id: str, focus_area: str, reasoning: str) -> str:
