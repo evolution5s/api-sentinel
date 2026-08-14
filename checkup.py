@@ -473,6 +473,34 @@ def test_jsonl_subsidiary_scoping_isolates_data_between_subsidiaries():
     assert tools._read_jsonl("scratch3.jsonl") == [{"a": 1, "subsidiary_id": "api-sentinel"}]
 
 
+def test_jsonl_write_leaves_no_leftover_tmp_file():
+    # jsonl_store.write_jsonl writes to a .tmp file and os.replace()s it into
+    # place for atomicity/durability (2026-08-14 backlog persistence fix) -
+    # the temp file must never be left behind after a normal write.
+    reset_state()
+    tools._write_jsonl("scratch_atomic.jsonl", [{"x": 1}])
+    directory = tools._subsidiary_dir()
+    leftovers = [p for p in directory.glob(".scratch_atomic.jsonl.tmp*")]
+    assert leftovers == []
+    assert (directory / "scratch_atomic.jsonl").exists()
+
+
+def test_jsonl_rapid_successive_full_rewrites_all_persist():
+    # Regression test for the live-discovered bug (2026-08-14): a burst of
+    # write_backlog_candidate calls in one cycle (each doing a full
+    # read-modify-write of hypothesis_backlog.jsonl) had some of its
+    # successful writes go missing from a read_backlog() call moments
+    # later. Simulate the same read-full -> append-one -> write-full burst
+    # pattern here and confirm every record survives to the final read.
+    reset_state()
+    for i in range(11):
+        current = tools._read_jsonl("scratch_burst.jsonl")
+        current.append({"seq": i})
+        tools._write_jsonl("scratch_burst.jsonl", current)
+    stored = tools._read_jsonl("scratch_burst.jsonl")
+    assert [r["seq"] for r in stored] == list(range(11))
+
+
 # --- tools.py: request_approval / read_state -------------------------------
 
 def test_request_approval_valid():
