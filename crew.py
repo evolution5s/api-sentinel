@@ -2474,7 +2474,7 @@ def send_cycle_summary(
         print(f"[api-sentinel] cycle summary failed (crew run itself was unaffected): {exc}")
 
 
-if __name__ == "__main__":
+def run_crew():
     print("[api-sentinel] Autonomous Loop Started (Anthropic Claude)...")
     # Checked first, before anything else - a warning needs to reach
     # Telegram even if everything after this fails or gets skipped.
@@ -2571,3 +2571,7 @@ if __name__ == "__main__":
             except Exception as exc:
                 print(f"[api-sentinel] crew.kickoff() failed for '{sub_id}': {exc}")
                 _finish_cycle(exc)
+
+
+if __name__ == "__main__":
+    run_crew()
